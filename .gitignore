@@ -9,4 +9,4 @@ tools/XenonRecomp/
 tools/xex_dump/xex_dump
 build/
 .DS_Store
-analysis/recomp_log.txt
+analysis/*_log.txt
