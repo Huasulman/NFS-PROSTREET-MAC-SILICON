@@ -55,8 +55,8 @@ tests/run_vmx_tests.sh
 - [x] Juego extraído y XEX analizado (XDK 2.0.6132, sin RTTI)
 - [x] Funciones save/rest de registros localizadas
 - [x] Límites de funciones con switch: 156 → 12 con errores (14 casos para revisión manual)
-- [x] Todas las instrucciones reconocidas (12 tipos añadidos, probados)
-- [ ] 38 casos de `vcmpbfp` / `vupkd3d128` con operandos no soportados (`__builtin_debugtrap`)
+- [x] Todas las instrucciones reconocidas (12 tipos añadidos, probados: 580.000 casos)
+- [x] Sin `__builtin_debugtrap`: `vcmpbfp(128)` implementada; `vupkd3d128` tipos 3 y 5 y `vpkd3d128` tipo 3 (half floats)
 - [ ] Localizar `setjmp` / `longjmp`
 - [ ] Runtime: memoria, kernel (`xboxkrnl.exe`), `xam.xex`
 - [ ] Gráficos, audio, input
