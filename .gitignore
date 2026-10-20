@@ -12,3 +12,4 @@ build/
 analysis/ghidra/
 analysis/*.tsv
 analysis/*.txt
+tools/disasm/disasm

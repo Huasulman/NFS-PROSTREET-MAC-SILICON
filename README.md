@@ -48,6 +48,7 @@ tests/run_vmx_tests.sh
 | `tools/xex_dump/` | Vuelca la imagen descifrada y busca las funciones save/rest de registros |
 | `tools/fix_switch_bounds.py` | Corrige los límites de funciones que contienen tablas de saltos (+ `config/manual_functions.tsv`) |
 | `tools/ghidra/` | Crea el proyecto de Ghidra con funciones, imports y marcadores |
+| `tools/disasm/` | Desensambla un rango con contexto (inicios de función, `.pdata`, saltos, switch) |
 | `tests/gen_vmx_tests.py` | Prueba fragmentos reales del código generado contra una referencia |
 | `patches/xenonrecomp-prostreet.patch` | Instrucciones añadidas a XenonRecomp |
 
@@ -55,11 +56,11 @@ tests/run_vmx_tests.sh
 
 - [x] Juego extraído y XEX analizado (XDK 2.0.6132, sin RTTI)
 - [x] Funciones save/rest de registros localizadas
-- [x] Límites de funciones con switch: 156 → 12 con errores
+- [x] Límites de funciones con switch: 156 → 0 con errores
 - [x] Todas las instrucciones reconocidas (12 tipos añadidos, probados: 580.000 casos)
 - [x] Sin `__builtin_debugtrap`: `vcmpbfp(128)` implementada; `vupkd3d128` tipos 3 y 5 y `vpkd3d128` tipo 3 (half floats)
 - [x] `setjmp` (`0x82A28DB0`) y `longjmp` (`0x82A26C50`) localizados
 - [x] Proyecto de Ghidra automático (`tools/ghidra/create_project.sh`, ver `docs/GUIA_GHIDRA.md`)
-- [ ] 12 switch con destinos fuera de su función (revisión manual en Ghidra)
+- [ ] 102 funciones generadas que se solapan con la siguiente (58 por datos de excepciones antes de la función)
 - [ ] Runtime: memoria, kernel (`xboxkrnl.exe`), `xam.xex`
 - [ ] Gráficos, audio, input

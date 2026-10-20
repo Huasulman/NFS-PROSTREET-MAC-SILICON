@@ -56,30 +56,29 @@ valen para la recompilación son los de XenonRecomp; los de Ghidra son solo una 
 
 ## 3. Los casos a revisar
 
+**Estado actual: no queda ninguno.** Los 12 switch con error se resolvieron analizando el
+ensamblador (ver la tabla de abajo), y casi todo quedó automatizado en
+`tools/fix_switch_bounds.py`. Si cambias la configuración y aparecen casos nuevos, se marcan
+aquí al recrear el proyecto.
+
 En la ventana **Bookmarks** Ghidra muestra también miles de marcadores propios del análisis.
 Ordena por la columna **Category** (o usa el filtro) y quédate con las dos nuestras:
 
-- **Switch con error** (12): XenonRecomp avisa que un destino del switch cae fuera de la
+- **Switch con error**: XenonRecomp avisa que un destino del switch cae fuera de la
   función. **Estos son los que importan**: en el C++ generado, ese caso del switch hace
   `return` en lugar de saltar, así que el juego se comportaría mal si llega ahí.
-- **Revisar límites** (14): lo que el script dejó sin resolver. Casi todos coinciden con los
-  anteriores; 3 de ellos (`sub_8233DC58`, `sub_823B50A0`, `sub_82447C30`) ya no dan error y
-  solo hay que confirmar que están bien.
+- **Revisar límites**: lo que el script no pudo resolver solo.
 
-| Switch (bctr) | Función actual | Diagnóstico del script |
+### Patrones encontrados en ProStreet
+
+Todos los casos fueron variantes de cuatro patrones, que el script ya reconoce:
+
+| Patrón | Ejemplo | Cómo se ve |
 |---|---|---|
-| `0x82373414` | `sub_823733F0` | El switch está en la continuación de la función anterior |
-| `0x823C3814` | `sub_823C37D8` | Límite calculado por el script, pero aún queda un destino fuera |
-| `0x8244190C` | `sub_824418F8` | Un destino (`0x824418EC`) está antes del inicio |
-| `0x824BBE28` | `sub_824BBCB8` | Extenderla absorbería la función real `sub_824BC4F8` |
-| `0x824BC058` | `sub_824BC024` | Continuación de la función anterior |
-| `0x824BC23C` | `sub_824BC214` | Continuación de la función anterior |
-| `0x8257E5C0` | `sub_8257E590` | Continuación de la función anterior |
-| `0x825ED1E0` | `sub_825ED1C0` | Continuación de la función anterior |
-| `0x8262245C` | `sub_82622440` | Continuación de la función anterior |
-| `0x82622D94` | `sub_82622D80` | Continuación de la función anterior |
-| `0x82723C90` | `sub_82723C60` | Continuación de la función anterior |
-| `0x827277F4` | `sub_827277D8` | Continuación de la función anterior |
+| **Función hoja cortada en el `bctr`** | `sub_823733F0` → `0x200` | Sin prólogo; justo después del `bctr` va la tabla incrustada (palabras `8237xxxx` que se desensamblan como `lwz`) y luego los destinos. Termina donde empieza la siguiente función real |
+| **"Cae" en la siguiente con `b +4`/`b +8`** | `sub_824BBC90` → `0x28` | La función termina con un `b` a la instrucción siguiente (o saltando relleno `0x00000000`). El analizador sigue ese salto y se traga la siguiente función, incluidos sus switch. Arreglo: cortarla justo después del `b` |
+| **Termina en una llamada que no vuelve** | `sub_825ED1C0` → `0x140` | La anterior acaba con `bl` (a un `abort`/error fatal) en vez de `blr`; su tamaño en `.pdata` confirma dónde termina |
+| **`default` falso** | `sub_82622D80` → `0x48` | No hay `cmplwi` + `bgt` antes del switch, pero XenonAnalyse puso como `default` un bloque de la función anterior. XenonRecomp lo ignora, así que el `default` no cuenta |
 
 ## 4. Cómo revisar un caso
 

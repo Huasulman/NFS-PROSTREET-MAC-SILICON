@@ -13,6 +13,7 @@ Las funciones que no se pueden resolver con seguridad se listan para revisión m
 Las correcciones hechas a mano van en config/manual_functions.tsv y tienen prioridad.
 """
 import bisect
+import glob
 import os
 import re
 import struct
@@ -46,13 +47,18 @@ def sext(value, bits):
     return value - (1 << bits) if value & (1 << (bits - 1)) else value
 
 
-def pdata_starts(image):
-    starts = set()
+def pdata_functions(image):
+    """Inicio -> tamaño de las funciones con entrada en .pdata."""
+    functions = {}
     for off in range(0, PDATA_SIZE, 8):
-        begin = struct.unpack_from(">I", image, PDATA_START - IMAGE_BASE + off)[0]
+        begin, data = struct.unpack_from(">II", image, PDATA_START - IMAGE_BASE + off)
         if begin:
-            starts.add(begin)
-    return starts
+            functions[begin] = ((data >> 8) & 0x3FFFFF) * 4
+    return functions
+
+
+def pdata_starts(image):
+    return set(pdata_functions(image))
 
 
 def bl_targets(word):
@@ -88,14 +94,34 @@ def branch_target(insn, addr):
 
 
 def parse_switches(text):
-    switches = {}
+    """Devuelve (base -> destinos, base -> default). default = 0: sin caso por defecto."""
+    switches, defaults = {}, {}
     for block in text.split("[[switch]]")[1:]:
         base = int(re.search(r"base = (0x[0-9A-Fa-f]+)", block).group(1), 16)
         default = int(re.search(r"default = (0x[0-9A-Fa-f]+)", block).group(1), 16)
         labels_text = re.search(r"labels = \[(.*?)\]", block, re.S).group(1)
         labels = [int(x, 16) for x in re.findall(r"0x[0-9A-Fa-f]+", labels_text)]
-        switches[base] = labels + ([default] if default else [])  # default = 0: sin caso por defecto
-    return switches
+        switches[base] = labels
+        if default:
+            defaults[base] = default
+    return switches, defaults
+
+
+def generated_sizes(ppc_dir):
+    """Tamaño con que XenonRecomp generó cada función: una línea `// instrucción` por cada 4 bytes."""
+    sizes = {}
+    for path in glob.glob(os.path.join(ppc_dir, "ppc_recomp.*.cpp")):
+        current, count = None, 0
+        for line in open(path):
+            match = re.match(r"PPC_FUNC_IMPL\(__imp__sub_([0-9A-F]+)\)", line)
+            if match:
+                current, count = int(match.group(1), 16), 0
+            elif current is not None and line.startswith("\t// ") and not line.startswith("\t// ERROR"):
+                count += 1
+            elif current is not None and line.startswith("}"):
+                sizes[current] = count * 4
+                current = None
+    return sizes
 
 
 def main():
@@ -104,11 +130,13 @@ def main():
     image = open(sys.argv[1], "rb").read()
     word = load_words(image)
     starts = sorted(int(x, 16) for x in re.findall(r"\{ (0x[0-9A-F]+), sub_", open(sys.argv[2]).read()))
-    switches = parse_switches(open(sys.argv[3]).read())
+    switches, defaults = parse_switches(open(sys.argv[3]).read())
     switch_bases = sorted(switches)
 
-    real = pdata_starts(image) | bl_targets(word) | data_pointers(image, word, set(starts))
+    pdata = pdata_functions(image)
+    real = set(pdata) | bl_targets(word) | data_pointers(image, word, set(starts))
     real -= {t for targets in switches.values() for t in targets}  # destinos de switch: no son funciones
+    real -= set(defaults.values())
 
     def next_start(addr):
         """Inicio de la siguiente función detectada después de addr (= fin del fragmento)."""
@@ -120,6 +148,35 @@ def main():
 
     def containing(addr):
         return starts[bisect.bisect_right(starts, addr) - 1]
+
+    def switch_targets(base, fn):
+        """Destinos del switch. XenonRecomp ignora el default (lo trata como inalcanzable): solo
+        cuenta si la comprobación de rango de la propia función salta ahí. Si no la hay,
+        XenonAnalyse lo tomó de otra función."""
+        default = defaults.get(base)
+        uses_default = default and any(branch_target(word(a), a) == default
+                                       for a in range(max(fn, base - 0x40), base + 0x18, 4))
+        return switches[base] + ([default] if uses_default else [])
+
+    # Funciones que terminan en un `b` hacia la función siguiente, con solo relleno entre
+    # medio ("b +4", o "b +8" saltando una palabra a 0): caen en la siguiente, y el analizador
+    # sigue ese salto y se traga su código (incluidos sus switch). La función termina justo
+    # después del salto, y el destino es una función propia.
+    sizes = generated_sizes(os.path.dirname(sys.argv[2]))
+    fallthroughs = {}
+    for addr in range(TEXT_START, TEXT_END, 4):
+        target = branch_target(word(addr), addr)
+        if word(addr) >> 26 != 18 or target is None or not addr < target <= addr + 0x20:
+            continue
+        if any(word(a) != 0 for a in range(addr + 4, target, 4)):
+            continue
+        # Con relleno de por medio ya hay un límite de función; un "b +4" pegado solo cuenta
+        # si el destino es una función real conocida.
+        if target in real or (target > addr + 4 and target in starts):
+            fn = containing(addr)
+            if sizes.get(fn, 0) > addr + 4 - fn:
+                fallthroughs[fn] = addr + 4 - fn
+                real.add(target)
 
     # Conservar lo generado en ejecuciones anteriores: con esas funciones ya aplicadas,
     # sus fragmentos desaparecen del mapping y no se volverían a detectar.
@@ -136,7 +193,7 @@ def main():
     for sw_base in switch_bases:
         fn = containing(sw_base)
         end = fn + results[fn] if fn in results else next_start(fn)
-        pending = [t for t in switches[sw_base] if not fn <= t < end]
+        pending = [t for t in switch_targets(sw_base, fn) if not fn <= t < end]
         if not pending:
             continue
         if fn not in real:
@@ -147,7 +204,12 @@ def main():
             while last > prev and word(last) == 0:
                 last -= 4
             ends_cleanly = word(last) == 0x4E800020 or (word(last) >> 26 == 18 and word(last) & 3 == 0)
-            jumps_in = any(t is not None and t >= fn
+            # .pdata dice que la anterior termina justo aquí (p. ej. acaba en un bl que no vuelve).
+            ends_cleanly = ends_cleanly or (prev in pdata and prev + pdata[prev] == last + 4)
+            # Solo cuentan los saltos que caen dentro del fragmento: un salto de cola más
+            # lejos (p. ej. `b __restgprlr_14`) o al propio inicio no lo convierte en continuación.
+            fragment_end = next_start(fn)
+            jumps_in = any(t is not None and fn < t < fragment_end
                            for t in (branch_target(word(a), a) for a in range(prev, fn, 4)))
             if not ends_cleanly or jumps_in:
                 manual.append((fn, sw_base, "el switch está en la continuación de la función anterior"))
@@ -175,13 +237,16 @@ def main():
                 if t is not None and end <= t < TEXT_END and t not in real:
                     pending.append(t)
             for b in switch_bases[bisect.bisect_left(switch_bases, scanned):bisect.bisect_left(switch_bases, end)]:
-                pending.extend(t for t in switches[b] if not fn <= t < end)
+                pending.extend(t for t in switch_targets(b, fn) if not fn <= t < end)
             scanned = end
 
         if problem:
             manual.append((fn, sw_base, problem))
         else:
             results[fn] = end - fn
+
+    results.update(fallthroughs)
+    fallthrough = len(fallthroughs)
 
     # Correcciones a mano (revisadas en Ghidra): tienen prioridad y reemplazan cualquier
     # función automática que se solape con ellas.
@@ -205,7 +270,7 @@ def main():
     open(config_path, "w").write(config)
 
     print(f"{len(results)} funciones con límites explícitos en {config_path} "
-          f"({len(results) - previous_count} nuevas)")
+          f"({len(results) - previous_count} nuevas; {fallthrough} recortadas por caer en la siguiente)")
     if manual:
         print(f"\n{len(manual)} para revisión manual:")
         for fn, sw_base, why in manual:
