@@ -178,6 +178,28 @@ def main():
                 fallthroughs[fn] = addr + 4 - fn
                 real.add(target)
 
+    # Funciones sin .pdata con un salto de cola (`b`, a menudo tras un `beq`) al inicio de la
+    # función real siguiente en mitad de su código: el analizador sigue ese salto y se traga la
+    # siguiente. Se recortan en esa función si el código anterior termina en blr/b y ningún
+    # salto propio entra en ella más allá de su inicio.
+    for fn, size in sizes.items():
+        if fn in pdata or fn in fallthroughs:
+            continue
+        inner = [s for s in starts[bisect.bisect_right(starts, fn):bisect.bisect_left(starts, fn + size)]
+                 if s in real]
+        if not inner:
+            continue
+        target = inner[0]
+        last = target - 4
+        while last > fn and word(last) == 0:
+            last -= 4
+        if not (word(last) == 0x4E800020 or (word(last) >> 26 == 18 and word(last) & 3 == 0)):
+            continue  # cae en la siguiente: es una segunda entrada, no un salto de cola
+        if any(t is not None and target < t < fn + size
+               for t in (branch_target(word(a), a) for a in range(fn, target, 4))):
+            continue
+        fallthroughs[fn] = last + 4 - fn
+
     # Conservar lo generado en ejecuciones anteriores: con esas funciones ya aplicadas,
     # sus fragmentos desaparecen del mapping y no se volverían a detectar.
     config_path = sys.argv[4]
@@ -270,7 +292,7 @@ def main():
     open(config_path, "w").write(config)
 
     print(f"{len(results)} funciones con límites explícitos en {config_path} "
-          f"({len(results) - previous_count} nuevas; {fallthrough} recortadas por caer en la siguiente)")
+          f"({len(results) - previous_count} nuevas; {fallthrough} recortadas antes de la función siguiente)")
     if manual:
         print(f"\n{len(manual)} para revisión manual:")
         for fn, sw_base, why in manual:

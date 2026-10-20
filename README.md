@@ -37,6 +37,9 @@ tools/XenonRecomp/build/XenonRecomp/XenonRecomp config/ProStreet.toml tools/Xeno
 
 # 3. Probar las instrucciones VMX añadidas
 tests/run_vmx_tests.sh
+
+# 4. Comprobar que los solapamientos entre funciones son solo los esperados
+python3 -I tools/check_overlaps.py
 ```
 
 ## Herramientas
@@ -46,7 +49,8 @@ tests/run_vmx_tests.sh
 | `tools/xiso_extract.py` | Lista o extrae el sistema de archivos XDVDFS de la ISO |
 | `tools/xex_info.py` | Muestra la cabecera del XEX (cifrado, XDK, imports) |
 | `tools/xex_dump/` | Vuelca la imagen descifrada y busca las funciones save/rest de registros |
-| `tools/fix_switch_bounds.py` | Corrige los límites de funciones que contienen tablas de saltos (+ `config/manual_functions.tsv`) |
+| `tools/fix_switch_bounds.py` | Corrige los límites de funciones con tablas de saltos o saltos de cola a la siguiente (+ `config/manual_functions.tsv`) |
+| `tools/check_overlaps.py` | Lista las funciones generadas que se solapan con la siguiente y las clasifica |
 | `tools/ghidra/` | Crea el proyecto de Ghidra con funciones, imports y marcadores |
 | `tools/disasm/` | Desensambla un rango con contexto (inicios de función, `.pdata`, saltos, switch) |
 | `tests/gen_vmx_tests.py` | Prueba fragmentos reales del código generado contra una referencia |
@@ -61,6 +65,12 @@ tests/run_vmx_tests.sh
 - [x] Sin `__builtin_debugtrap`: `vcmpbfp(128)` implementada; `vupkd3d128` tipos 3 y 5 y `vpkd3d128` tipo 3 (half floats)
 - [x] `setjmp` (`0x82A28DB0`) y `longjmp` (`0x82A26C50`) localizados
 - [x] Proyecto de Ghidra automático (`tools/ghidra/create_project.sh`, ver `docs/GUIA_GHIDRA.md`)
-- [ ] 102 funciones generadas que se solapan con la siguiente (58 por datos de excepciones antes de la función)
+- [x] Funciones generadas que se solapan con la siguiente: 102 → 34, todas explicadas (`tools/check_overlaps.py`)
+  - 58 eran el handler (`__C_specific_handler`, `0x82ADBA14`) y la tabla de scopes que hay delante
+    de cada función con `__try/__except`: se saltan con `invalid_instructions`
+  - 2 seguían un salto de cola condicional a la función siguiente: recortados por `fix_switch_bounds.py`
+  - 33 restantes son manejadores `__finally` con dos entradas (la de `.pdata`, usada al desenrollar,
+    salta al cuerpo de la otra, que la función padre llama con `bl`) y 1 es `neg r12,r3` que cae en
+    `__chkstk`: el código compartido se duplica en las dos funciones, lo cual es correcto
 - [ ] Runtime: memoria, kernel (`xboxkrnl.exe`), `xam.xex`
 - [ ] Gráficos, audio, input

@@ -33,6 +33,11 @@ setjmp_address = 0x82A28DB0
 
 invalid_instructions = [
     { data = 0x00000000, size = 4 }, # Relleno
+    # Datos de excepción delante de las 59 funciones con __try/__except: puntero al handler
+    # (__C_specific_handler, 0x82ADBA14) y a su tabla de scopes en .rdata. Se saltan las dos
+    # palabras para que no se desensamblen como código. 0x82ADBA14 solo aparece en .text en
+    # esas 59 posiciones (8 bytes antes de una entrada de .pdata con ExceptionFlag).
+    { data = 0x82ADBA14, size = 8 },
 ]
 
 # BEGIN functions (generado por tools/fix_switch_bounds.py)
@@ -183,6 +188,7 @@ functions = [
     { address = 0x8276D538, size = 0x10 },
     { address = 0x827725B0, size = 0x130 },
     { address = 0x82772998, size = 0xB0 },
+    { address = 0x8277A528, size = 0x28 },
     { address = 0x8277BE28, size = 0x200 },
     { address = 0x8277C708, size = 0x354 },
     { address = 0x82780D28, size = 0xD8 },
@@ -190,6 +196,7 @@ functions = [
     { address = 0x8279DDE0, size = 0x78 },
     { address = 0x827C5510, size = 0x84 },
     { address = 0x827D8DA0, size = 0x11C },
+    { address = 0x82823B50, size = 0x60 },
     { address = 0x82826048, size = 0x10 },
     { address = 0x82855860, size = 0xEC },
     { address = 0x82896F10, size = 0x10 },
