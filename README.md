@@ -42,6 +42,18 @@ tests/run_vmx_tests.sh
 python3 -I tools/check_overlaps.py
 ```
 
+## Ejecutar (runtime)
+
+```sh
+runtime/build.sh                       # genera los imports y compila (≈1,5 min la primera vez)
+runtime/build/prostreet                # desde la raíz del proyecto
+PROSTREET_TRACE=1 runtime/build/prostreet   # muestra también las llamadas implementadas
+```
+
+El runtime (`runtime/`) reserva los 4 GB del invitado, carga `analysis/default_image.bin`,
+rellena la tabla de funciones y los imports, y llama al punto de entrada. Cada import que aún no
+está implementado aparece como `[falta] Nombre r3=... lr=...` y devuelve 0.
+
 ## Herramientas
 
 | Archivo | Uso |
@@ -55,6 +67,7 @@ python3 -I tools/check_overlaps.py
 | `tools/disasm/` | Desensambla un rango con contexto (inicios de función, `.pdata`, saltos, switch) |
 | `tests/gen_vmx_tests.py` | Prueba fragmentos reales del código generado contra una referencia |
 | `patches/xenonrecomp-prostreet.patch` | Instrucciones añadidas a XenonRecomp |
+| `tools/gen_imports.py` | Genera los stubs de los 334 imports y la tabla de slots (`runtime/generated/`) |
 
 ## Estado
 
@@ -72,5 +85,7 @@ python3 -I tools/check_overlaps.py
   - 33 restantes son manejadores `__finally` con dos entradas (la de `.pdata`, usada al desenrollar,
     salta al cuerpo de la otra, que la función padre llama con `bl`) y 1 es `neg r12,r3` que cae en
     `__chkstk`: el código compartido se duplica en las dos funciones, lo cual es correcto
-- [ ] Runtime: memoria, kernel (`xboxkrnl.exe`), `xam.xex`
+- [x] Runtime mínimo: arranca la CRT, reserva memoria (montón y 334 MB físicos), TLS dinámico
+- [ ] Hilos (`ExCreateThread`), objetos de sincronización y esperas: el juego se queda esperando aquí
+- [ ] Resto del kernel (`xboxkrnl.exe`) y `xam.xex`
 - [ ] Gráficos, audio, input
