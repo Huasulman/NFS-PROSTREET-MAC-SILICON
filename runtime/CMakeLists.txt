@@ -28,6 +28,9 @@ add_executable(prostreet
     main.cpp
     memory.cpp
     kernel/imports.cpp
+    kernel/objects.cpp
+    kernel/sync.cpp
+    kernel/threads.cpp
     kernel/xboxkrnl.cpp
     kernel/xex.cpp
     generated/imports.cpp

@@ -1,6 +1,6 @@
 // Runtime mínimo de ProStreet Recomp: carga la imagen del juego en la memoria del invitado,
-// rellena la tabla de funciones y los imports, prepara el hilo principal y llama al punto
-// de entrada del XEX.
+// rellena la tabla de funciones y los imports, y arranca el hilo principal del juego en el
+// punto de entrada del XEX.
 //
 // Uso: prostreet [imagen] [xex]
 //   imagen: por defecto analysis/default_image.bin (generada por tools/xex_dump)
@@ -19,24 +19,14 @@
 #include <ppc_context.h>
 
 #include "kernel/imports.h"
+#include "kernel/threads.h"
 #include "kernel/xex.h"
 #include "memory.h"
 
 namespace
 {
     constexpr uint32_t kEntryPoint = 0x82A679C8;
-    constexpr uint32_t kTlsTemplate = 0x8309CA00; // sección .tls
-    constexpr uint32_t kTlsTemplateSize = 0x8;
-    constexpr uint32_t kTlsDynamicSlots = 64;
-    constexpr uint32_t kGuestStackSize = 1024 * 1024;
-    constexpr size_t kHostStackSize = 64 * 1024 * 1024;
-
-    // Desplazamientos del KPCR al que apunta r13 (según Xenia, X_KPCR).
-    constexpr uint32_t kPcrTlsPtr = 0x00;
-    constexpr uint32_t kPcrSelfPtr = 0x30;
-    constexpr uint32_t kPcrStackBase = 0x70;
-    constexpr uint32_t kPcrStackEnd = 0x74;
-    constexpr uint32_t kPcrCurrentThread = 0x100;
+    constexpr uint32_t kMainStackSize = 1024 * 1024;
 
     const char* gImagePath = "analysis/default_image.bin";
     const char* gXexPath = "game/default.xex";
@@ -99,56 +89,19 @@ namespace
         std::printf("Imports:    %zu slots (%zu variables del kernel)\n", kImportSlotCount, variables);
     }
 
-    void* GameThread(void*)
-    {
-        // Pila propia para el manejador de errores: si se desborda la pila del hilo, el
-        // manejador necesita otra para poder ejecutarse.
-        stack_t signalStack{};
-        signalStack.ss_size = 1024 * 1024;
-        signalStack.ss_sp = std::malloc(signalStack.ss_size);
-        sigaltstack(&signalStack, nullptr);
-
-        uint8_t* base = memory::Base();
-        alignas(64) static PPCContext ctx{};
-
-        // Pila del invitado (crece hacia abajo).
-        const uint32_t stackEnd = memory::AllocateKernel(kGuestStackSize, 0x1000);
-        const uint32_t stackBase = stackEnd + kGuestStackSize;
-
-        // TLS: slots dinámicos (KeTlsAlloc) seguidos de la copia de la plantilla .tls.
-        const uint32_t tls = memory::AllocateKernel(kTlsDynamicSlots * 4 + 0x100, 0x10);
-        const uint32_t tlsStatic = tls + kTlsDynamicSlots * 4;
-        std::memcpy(memory::Translate(tlsStatic), memory::Translate(kTlsTemplate), kTlsTemplateSize);
-
-        const uint32_t thread = memory::AllocateKernel(0x1000, 0x10); // KTHREAD (vacío por ahora)
-        const uint32_t pcr = memory::AllocateKernel(0x1000, 0x1000);
-        memory::Write32(pcr + kPcrTlsPtr, tlsStatic);
-        memory::Write32(pcr + kPcrSelfPtr, pcr);
-        memory::Write32(pcr + kPcrStackBase, stackBase);
-        memory::Write32(pcr + kPcrStackEnd, stackEnd);
-        memory::Write32(pcr + kPcrCurrentThread, thread);
-
-        ctx.r1.u64 = stackBase - 0x100;
-        ctx.r13.u64 = pcr;
-        ctx.fpscr.loadFromHost();
-
-        std::printf("Arrancando: punto de entrada 0x%08X (pila 0x%08X, KPCR 0x%08X)\n\n", kEntryPoint, stackBase, pcr);
-        (PPC_LOOKUP_FUNC(base, kEntryPoint))(ctx, base);
-        std::printf("\nEl punto de entrada terminó (r3 = 0x%08X)\n", ctx.r3.u32);
-        return nullptr;
-    }
-
     void OnCrash(int signal, siginfo_t* info, void*)
     {
         const auto* address = static_cast<const uint8_t*>(info->si_addr);
         char message[256];
         int length;
+        const kernel::Thread* thread = kernel::CurrentThread();
+        const unsigned id = thread ? thread->id : 0;
         if (memory::Contains(address))
-            length = std::snprintf(message, sizeof(message), "\n*** %s en la dirección del invitado 0x%08X (último import: %s)\n",
-                strsignal(signal), uint32_t(address - memory::Base()), gLastImport ? gLastImport : "ninguno");
+            length = std::snprintf(message, sizeof(message), "\n*** %s en la dirección del invitado 0x%08X (hilo %u, último import: %s)\n",
+                strsignal(signal), uint32_t(address - memory::Base()), id, gLastImport ? gLastImport : "ninguno");
         else
-            length = std::snprintf(message, sizeof(message), "\n*** %s en la dirección del anfitrión %p (último import: %s)\n",
-                strsignal(signal), info->si_addr, gLastImport ? gLastImport : "ninguno");
+            length = std::snprintf(message, sizeof(message), "\n*** %s en la dirección del anfitrión %p (hilo %u, último import: %s)\n",
+                strsignal(signal), info->si_addr, id, gLastImport ? gLastImport : "ninguno");
         write(STDERR_FILENO, message, length);
         _exit(128 + signal);
     }
@@ -177,11 +130,10 @@ int main(int argc, char** argv)
     FillImports();
     xex::Load(gXexPath);
 
-    pthread_attr_t attributes;
-    pthread_attr_init(&attributes);
-    pthread_attr_setstacksize(&attributes, kHostStackSize);
-    pthread_t thread;
-    pthread_create(&thread, &attributes, GameThread, nullptr);
-    pthread_join(thread, nullptr);
+    // El hilo principal del juego es un hilo más del kernel; el programa termina cuando termina él.
+    std::printf("Arrancando: punto de entrada 0x%08X\n\n", kEntryPoint);
+    auto mainThread = kernel::CreateThread(kEntryPoint, 0, 0, kMainStackSize, false);
+    pthread_join(mainThread->host, nullptr);
+    std::printf("\nEl hilo principal terminó (código 0x%08X)\n", mainThread->exitCode);
     return 0;
 }

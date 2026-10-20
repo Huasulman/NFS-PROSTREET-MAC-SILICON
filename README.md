@@ -86,6 +86,8 @@ está implementado aparece como `[falta] Nombre r3=... lr=...` y devuelve 0.
     salta al cuerpo de la otra, que la función padre llama con `bl`) y 1 es `neg r12,r3` que cae en
     `__chkstk`: el código compartido se duplica en las dos funciones, lo cual es correcto
 - [x] Runtime mínimo: arranca la CRT, reserva memoria (montón y 334 MB físicos), TLS dinámico
-- [ ] Hilos (`ExCreateThread`), objetos de sincronización y esperas: el juego se queda esperando aquí
+- [x] Hilos reales (8: `RenderThread`, 4 × `Job Manager - Job Thread`, ...), eventos, semáforos,
+  mutantes, temporizadores, esperas, secciones críticas, spinlocks y tiempo
+- [ ] Sistema de archivos (`D:\` → `game/`): el juego pide `D:\NFS\ZDIR.BIN` y se detiene aquí
 - [ ] Resto del kernel (`xboxkrnl.exe`) y `xam.xex`
 - [ ] Gráficos, audio, input

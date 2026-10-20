@@ -25,5 +25,5 @@ extern const size_t kImportSlotCount;
 // registra la llamada y devuelve 0 en r3.
 void ImportStub(PPCContext& ctx, uint8_t* base, const char* name);
 
-// Último import llamado, para los mensajes de error.
-extern const char* gLastImport;
+// Último import llamado en este hilo, para los mensajes de error.
+extern thread_local const char* gLastImport;

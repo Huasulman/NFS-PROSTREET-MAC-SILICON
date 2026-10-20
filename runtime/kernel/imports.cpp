@@ -1,10 +1,11 @@
 #include "imports.h"
 
 #include <cstdio>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 
-const char* gLastImport = nullptr;
+thread_local const char* gLastImport = nullptr;
 
 void ImportStub(PPCContext& ctx, uint8_t* base, const char* name)
 {
@@ -12,7 +13,9 @@ void ImportStub(PPCContext& ctx, uint8_t* base, const char* name)
     gLastImport = name;
 
     // Las primeras llamadas a cada import se muestran con sus argumentos; después solo se cuentan.
+    static std::mutex lock;
     static std::unordered_map<std::string, uint32_t> calls;
+    std::unique_lock guard(lock);
     const uint32_t count = ++calls[name];
     if (count <= 3)
     {

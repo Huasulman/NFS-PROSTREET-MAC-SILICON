@@ -5,8 +5,10 @@
 #include <cstdlib>
 #include <algorithm>
 #include <cstring>
+#include <string>
 #include <strings.h>
 #include <fstream>
+#include <mutex>
 #include <vector>
 
 #include "imports.h"
@@ -84,7 +86,8 @@ namespace
 {
     constexpr uint32_t kTlsSlots = 64;
     constexpr uint32_t kTlsOutOfIndexes = 0xFFFFFFFF;
-    uint64_t gTlsUsed = 0; // bit i = slot i reservado
+    std::mutex gTlsLock;
+    uint64_t gTlsUsed = 0; // bit i = slot i reservado (protegido por gTlsLock)
 
     uint32_t TlsSlotAddress(const PPCContext& ctx, uint32_t index)
     {
@@ -96,6 +99,7 @@ namespace
 PPC_FUNC(__imp__KeTlsAlloc)
 {
     (void)base;
+    std::lock_guard lock(gTlsLock);
     for (uint32_t i = 0; i < kTlsSlots; i++)
     {
         if (!(gTlsUsed & (1ull << i)))
@@ -114,6 +118,7 @@ PPC_FUNC(__imp__KeTlsFree)
 {
     (void)base;
     const uint32_t index = ctx.r3.u32;
+    std::lock_guard lock(gTlsLock);
     const bool valid = index < kTlsSlots && (gTlsUsed & (1ull << index));
     if (valid)
         gTlsUsed &= ~(1ull << index);
@@ -229,4 +234,79 @@ PPC_FUNC(__imp__XexGetProcedureAddress)
             ctx.r3.u32 == 0xF0000000 ? "xam.xex" : "xboxkrnl.exe", ctx.r4.u32);
     memory::Write32(ctx.r5.u32, 0);
     ctx.r3.u64 = kStatusEntrypointNotFound;
+}
+
+// --- Cadenas y excepciones -------------------------------------------------------------------
+
+// void RtlInitAnsiString(ANSI_STRING* destination, const char* source)
+// ANSI_STRING: uint16_t Length, uint16_t MaximumLength, char* Buffer.
+PPC_FUNC(__imp__RtlInitAnsiString)
+{
+    (void)base;
+    const uint32_t destination = ctx.r3.u32, source = ctx.r4.u32;
+    const size_t length = source ? std::strlen(static_cast<const char*>(memory::Translate(source))) : 0;
+    memory::Write16(destination + 0, uint16_t(length));
+    memory::Write16(destination + 2, uint16_t(source ? length + 1 : 0));
+    memory::Write32(destination + 4, source);
+}
+
+// void RtlRaiseException(EXCEPTION_RECORD* record)
+// El código recompilado no admite excepciones. La única que se trata es el truco de Visual Studio
+// para nombrar hilos (0x406D1388), que se ignora tras mostrar el nombre.
+PPC_FUNC(__imp__RtlRaiseException)
+{
+    (void)base;
+    constexpr uint32_t kSetThreadName = 0x406D1388;
+    const uint32_t record = ctx.r3.u32;
+    const uint32_t code = memory::Read32(record);
+    if (code == kSetThreadName)
+    {
+        // ExceptionInformation (+0x14): tipo 0x1000, nombre, id del hilo (-1 = el actual).
+        const uint32_t name = memory::Read32(record + 0x18);
+        const uint32_t id = memory::Read32(record + 0x1C);
+        std::fprintf(stderr, "[kernel] nombre de hilo: %s \"%s\"\n",
+            id == 0xFFFFFFFF ? "(actual)" : std::to_string(id).c_str(), static_cast<const char*>(memory::Translate(name)));
+        return;
+    }
+    std::fprintf(stderr, "[kernel] RtlRaiseException 0x%08X en 0x%08X: no soportada, se ignora\n",
+        code, memory::Read32(record + 0x0C));
+}
+
+// --- Archivos (provisional) ------------------------------------------------------------------
+
+namespace
+{
+    constexpr uint32_t kStatusObjectNameNotFound = 0xC0000034;
+
+    // OBJECT_ATTRIBUTES: RootDirectory, ObjectName (ANSI_STRING*), Attributes.
+    std::string ObjectName(uint32_t attributes)
+    {
+        const uint32_t name = memory::Read32(attributes + 4);
+        const uint16_t length = uint16_t(memory::Read32(name) >> 16);
+        return std::string(static_cast<const char*>(memory::Translate(memory::Read32(name + 4))), length);
+    }
+}
+
+// NTSTATUS NtCreateFile(uint32_t* handle, uint32_t access, OBJECT_ATTRIBUTES* attributes, IO_STATUS_BLOCK* io,
+//                       uint64_t* allocationSize, uint32_t fileAttributes, uint32_t share, uint32_t disposition,
+//                       uint32_t options)
+// Provisional: registra la ruta y responde que no existe.
+PPC_FUNC(__imp__NtCreateFile)
+{
+    (void)base;
+    std::fprintf(stderr, "[archivo] NtCreateFile \"%s\" (acceso 0x%08X): sin sistema de archivos todavía\n",
+        ObjectName(ctx.r5.u32).c_str(), ctx.r4.u32);
+    memory::Write32(ctx.r3.u32, 0);
+    ctx.r3.u64 = kStatusObjectNameNotFound;
+}
+
+// NTSTATUS NtOpenFile(uint32_t* handle, uint32_t access, OBJECT_ATTRIBUTES* attributes,
+//                     IO_STATUS_BLOCK* io, uint32_t share, uint32_t options)
+PPC_FUNC(__imp__NtOpenFile)
+{
+    (void)base;
+    std::fprintf(stderr, "[archivo] NtOpenFile \"%s\" (acceso 0x%08X): sin sistema de archivos todavía\n",
+        ObjectName(ctx.r5.u32).c_str(), ctx.r4.u32);
+    memory::Write32(ctx.r3.u32, 0);
+    ctx.r3.u64 = kStatusObjectNameNotFound;
 }

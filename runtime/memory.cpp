@@ -3,11 +3,13 @@
 #include <cstdio>
 #include <cstdlib>
 #include <map>
+#include <mutex>
 #include <sys/mman.h>
 
 namespace memory
 {
     static uint8_t* gBase = nullptr;
+    static std::mutex gLock;
     static std::map<uint32_t, uint32_t> gNext; // inicio de región -> siguiente dirección libre
 
     uint8_t* Reserve()
@@ -30,12 +32,14 @@ namespace memory
 
     uint32_t Used(uint32_t regionBase)
     {
+        std::lock_guard lock(gLock);
         auto it = gNext.find(regionBase);
         return it == gNext.end() ? 0 : it->second - regionBase;
     }
 
     uint32_t Allocate(uint32_t regionBase, uint32_t regionEnd, uint32_t size, uint32_t alignment)
     {
+        std::lock_guard lock(gLock);
         uint32_t& next = gNext.try_emplace(regionBase, regionBase).first->second;
         const uint64_t start = (uint64_t(next) + alignment - 1) & ~uint64_t(alignment - 1);
         if (start + size > regionEnd)
