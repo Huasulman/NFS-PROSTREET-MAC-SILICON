@@ -59,6 +59,17 @@ public class ProStreetSetup extends GhidraScript {
             sections++;
         }
 
+        // Lo que no es una sección (cabecera del PE y relleno entre secciones): solo lectura.
+        for (MemoryBlock block : memory.getBlocks()) {
+            if (!block.getName().startsWith(".")) {
+                boolean header = block.getStart().equals(memory.getMinAddress());
+                block.setName(header ? "header" : "pad_" + block.getStart());
+                block.setRead(true);
+                block.setWrite(false);
+                block.setExecute(false);
+            }
+        }
+
         // Disassemble every known entry point first, then create the functions.
         AddressSet entries = new AddressSet();
         for (String[] row : rows) {

@@ -45,12 +45,19 @@ Ventanas útiles:
 
 Ghidra no conoce las instrucciones vectoriales propias de la Xbox 360 (VMX128: `lvx128`,
 `vsel128`, `vupkd3d128`...). Donde aparezcan, el código se verá como `??` o datos sueltos y
-el decompilador puede cortar la función. Para estos casos manda el código generado en `ppc/`,
-que sí las tiene: cada instrucción aparece allí como comentario (`// vsel128 v43,v8,v7,v43`).
+Ghidra corta ahí la función. Por ejemplo, `__setjmp` aparece terminando en `0x82A28E63`,
+justo antes de su primera `stvlx128`, aunque en realidad sigue hasta `0x82A2907F`.
+Para estos casos manda el código generado en `ppc/`, que sí las tiene: cada instrucción
+aparece allí como comentario (`// vsel128 v43,v8,v7,v43`).
+
+Por lo mismo, después del análisis automático Ghidra muestra unas **81.000 funciones**, no las
+84.514 que le pasamos: une o descarta algunas que quedan cortadas por VMX128. Los límites que
+valen para la recompilación son los de XenonRecomp; los de Ghidra son solo una ayuda visual.
 
 ## 3. Los casos a revisar
 
-En la ventana **Bookmarks** hay dos categorías:
+En la ventana **Bookmarks** Ghidra muestra también miles de marcadores propios del análisis.
+Ordena por la columna **Category** (o usa el filtro) y quédate con las dos nuestras:
 
 - **Switch con error** (12): XenonRecomp avisa que un destino del switch cae fuera de la
   función. **Estos son los que importan**: en el C++ generado, ese caso del switch hace
