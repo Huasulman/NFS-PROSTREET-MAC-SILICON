@@ -9,4 +9,6 @@ tools/XenonRecomp/
 tools/xex_dump/xex_dump
 build/
 .DS_Store
-analysis/*_log.txt
+analysis/ghidra/
+analysis/*.tsv
+analysis/*.txt

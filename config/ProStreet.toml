@@ -26,9 +26,10 @@ savevmx_14_address = 0x82A2A2A0
 restvmx_64_address = 0x82A2A5CC
 savevmx_64_address = 0x82A2A334
 
-# TODO: localizar en Ghidra (buscar llamadas a RtlUnwind para longjmp; setjmp suele estar justo después).
-# longjmp_address = 0x00000000
-# setjmp_address = 0x00000000
+# longjmp: llama a RtlUnwind y restaura f14-f31, r13-r31, v64-v127, CR y LR desde el búfer.
+# setjmp: guarda esos mismos registros (f14 en +0, r31 en +296, CR en +304, LR en +308) y devuelve 0.
+longjmp_address = 0x82A26C50
+setjmp_address = 0x82A28DB0
 
 invalid_instructions = [
     { data = 0x00000000, size = 4 }, # Relleno

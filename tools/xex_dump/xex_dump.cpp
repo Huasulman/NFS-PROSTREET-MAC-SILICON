@@ -2,7 +2,10 @@
 // lista sus secciones y busca las funciones de guardado/restauración de
 // registros que necesita el TOML de XenonRecomp.
 //
-// Uso: xex_dump <default.xex> <imagen_salida.bin>
+// Uso: xex_dump <default.xex> <imagen_salida.bin> [simbolos_salida.tsv]
+//
+// El archivo de símbolos opcional lista los imports del kernel y de XAM
+// (dirección, tamaño, nombre) con los nombres que resuelve XenonUtils.
 
 #include <cstdio>
 #include <cstring>
@@ -32,9 +35,9 @@ static const Pattern kPatterns[] = {
 
 int main(int argc, char** argv)
 {
-    if (argc != 3)
+    if (argc != 3 && argc != 4)
     {
-        std::fprintf(stderr, "Uso: %s <default.xex> <imagen_salida.bin>\n", argv[0]);
+        std::fprintf(stderr, "Uso: %s <default.xex> <imagen_salida.bin> [simbolos_salida.tsv]\n", argv[0]);
         return 1;
     }
 
@@ -67,6 +70,21 @@ int main(int argc, char** argv)
         const char* kind = (section.flags & SectionFlags_Code) ? "código" : "datos";
         std::printf("  %-10s 0x%08zX - 0x%08zX  (0x%08X)  %s\n",
             section.name.c_str(), section.base, section.base + section.size, section.size, kind);
+    }
+
+    if (argc == 4)
+    {
+        std::ofstream symbols(argv[3]);
+        size_t count = 0;
+        for (const auto& symbol : image.symbols)
+        {
+            if (symbol.type != Symbol_Function)
+                continue;
+            symbols << "0x" << std::hex << std::uppercase << symbol.address << '\t'
+                    << std::dec << symbol.size << '\t' << symbol.name << '\n';
+            count++;
+        }
+        std::printf("\nSímbolos:     %zu imports en %s\n", count, argv[3]);
     }
 
     std::printf("\n# Direcciones para el TOML de XenonRecomp\n");

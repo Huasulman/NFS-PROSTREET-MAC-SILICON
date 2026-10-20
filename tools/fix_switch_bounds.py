@@ -10,8 +10,10 @@ Uso:
         <switch_tables.toml> <config.toml>
 
 Las funciones que no se pueden resolver con seguridad se listan para revisión manual.
+Las correcciones hechas a mano van en config/manual_functions.tsv y tienen prioridad.
 """
 import bisect
+import os
 import re
 import struct
 import sys
@@ -22,6 +24,18 @@ PDATA_START, PDATA_SIZE = 0x820F1400, 0x430C0
 DATA_SECTIONS = [(0x82000400, 0x820F1354), (0x82AE0000, 0x8309C790)]  # .rdata, .data
 BEGIN_MARK = "# BEGIN functions (generado por tools/fix_switch_bounds.py)"
 END_MARK = "# END functions"
+MANUAL_FILE = "manual_functions.tsv"  # junto al TOML principal
+
+
+def load_manual(path):
+    """Lee `dirección<TAB>tamaño<TAB>comentario`; las líneas con # se ignoran."""
+    overrides = {}
+    if os.path.exists(path):
+        for line in open(path).read().splitlines():
+            fields = line.split("#", 1)[0].split()
+            if len(fields) >= 2:
+                overrides[int(fields[0], 16)] = int(fields[1], 16)
+    return overrides
 
 
 def load_words(image):
@@ -169,8 +183,18 @@ def main():
         else:
             results[fn] = end - fn
 
+    # Correcciones a mano (revisadas en Ghidra): tienen prioridad y reemplazan cualquier
+    # función automática que se solape con ellas.
+    overrides = load_manual(os.path.join(os.path.dirname(config_path), MANUAL_FILE))
+    for a, s in overrides.items():
+        for k in [k for k, ks in results.items() if k < a + s and a < k + ks]:
+            del results[k]
+        results[a] = s
+    manual = [m for m in manual if not any(a <= m[1] < a + s for a, s in overrides.items())]
+
     lines = [BEGIN_MARK, "functions = ["]
-    lines += [f"    {{ address = 0x{a:08X}, size = 0x{s:X} }}," for a, s in sorted(results.items())]
+    lines += [f"    {{ address = 0x{a:08X}, size = 0x{s:X} }},{' # manual' if a in overrides else ''}"
+              for a, s in sorted(results.items())]
     lines += ["]", END_MARK]
     block = "\n".join(lines)
 

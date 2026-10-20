@@ -1,0 +1,5 @@
+# Límites de funciones corregidos a mano tras revisarlos en Ghidra.
+# Formato: dirección  tamaño  # comentario
+# Tienen prioridad sobre lo que calcula tools/fix_switch_bounds.py y reemplazan
+# cualquier función automática que se solape. Ejemplo:
+# 0x8233DC20  0x1A0  # sub_8233DC58 empieza antes; el switch salta a 0x8233DC20
