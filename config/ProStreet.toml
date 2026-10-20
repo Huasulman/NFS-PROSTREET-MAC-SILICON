@@ -1,0 +1,35 @@
+# Configuración de XenonRecomp para Need for Speed ProStreet (Xbox 360, USA)
+# Title ID 45410822, XDK 2.0.6132. Las rutas son relativas a esta carpeta.
+
+[main]
+file_path = "../game/default.xex"
+out_directory_path = "../ppc"
+switch_table_file_path = "ProStreet_switch_tables.toml"
+
+# Optimizaciones: dejarlas desactivadas hasta tener una recompilación que funcione.
+skip_lr = false
+skip_msr = false
+ctr_as_local = false
+xer_as_local = false
+reserved_as_local = false
+cr_as_local = false
+non_argument_as_local = false
+non_volatile_as_local = false
+
+# Funciones de guardado/restauración de registros (halladas con tools/xex_dump).
+restgprlr_14_address = 0x82A280F0
+savegprlr_14_address = 0x82A280A0
+restfpr_14_address = 0x82A2876C
+savefpr_14_address = 0x82A28720
+restvmx_14_address = 0x82A2A538
+savevmx_14_address = 0x82A2A2A0
+restvmx_64_address = 0x82A2A5CC
+savevmx_64_address = 0x82A2A334
+
+# TODO: localizar en Ghidra (buscar llamadas a RtlUnwind para longjmp; setjmp suele estar justo después).
+# longjmp_address = 0x00000000
+# setjmp_address = 0x00000000
+
+invalid_instructions = [
+    { data = 0x00000000, size = 4 }, # Relleno
+]
