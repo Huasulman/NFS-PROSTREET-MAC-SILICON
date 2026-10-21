@@ -1,5 +1,5 @@
 diff --git a/XenonRecomp/recompiler.cpp b/XenonRecomp/recompiler.cpp
-index fa91527..39cf663 100644
+index fa91527..7035240 100644
 --- a/XenonRecomp/recompiler.cpp
 +++ b/XenonRecomp/recompiler.cpp
 @@ -663,10 +663,15 @@ bool Recompiler::Recompile(
@@ -31,20 +31,34 @@ index fa91527..39cf663 100644
      case PPC_INST_DCBT:
          // no op
          break;
-@@ -852,6 +861,12 @@ bool Recompiler::Recompile(
-         // no op
+@@ -849,7 +858,14 @@ bool Recompiler::Recompile(
          break;
  
+     case PPC_INST_EIEIO:
+-        // no op
++        // Orders stores: needed on weakly ordered hosts (ARM64), a no-op instruction on x86.
++        println("\t__atomic_thread_fence(__ATOMIC_RELEASE);");
++        break;
++
 +    case PPC_INST_EQV:
 +        println("\t{}.u64 = ~({}.u64 ^ {}.u64);", r(insn.operands[0]), r(insn.operands[1]), r(insn.operands[2]));
 +        if (strchr(insn.opcode->name, '.'))
 +            println("\t{}.compare<int32_t>({}.s32, 0, {});", cr(0), r(insn.operands[0]), xer());
-+        break;
-+
+         break;
+ 
      case PPC_INST_EXTSB:
-         println("\t{}.s64 = {}.s8;", r(insn.operands[0]), r(insn.operands[1]));
-         if (strchr(insn.opcode->name, '.'))
-@@ -1556,6 +1571,14 @@ bool Recompiler::Recompile(
+@@ -1209,7 +1225,9 @@ bool Recompiler::Recompile(
+         break;
+ 
+     case PPC_INST_LWSYNC:
+-        // no op
++        // Memory barrier: PowerPC and ARM64 are both weakly ordered, so this must be a real fence
++        // (e.g. the lwsync before releasing a lock). On x86 it only stops compiler reordering.
++        println("\t__atomic_thread_fence(__ATOMIC_SEQ_CST);");
+         break;
+ 
+     case PPC_INST_LWZ:
+@@ -1556,6 +1574,14 @@ bool Recompiler::Recompile(
          println("{}, {}.u32);", int32_t(insn.operands[1]), temp());
          break;
  
@@ -59,7 +73,16 @@ index fa91527..39cf663 100644
      case PPC_INST_STFSX:
          printSetFlushMode(false);
          println("\t{}.f32 = float({}.f64);", temp(), f(insn.operands[0]));
-@@ -1769,6 +1792,16 @@ bool Recompiler::Recompile(
+@@ -1711,7 +1737,7 @@ bool Recompiler::Recompile(
+         break;
+ 
+     case PPC_INST_SYNC:
+-        // no op
++        println("\t__atomic_thread_fence(__ATOMIC_SEQ_CST);");
+         break;
+ 
+     case PPC_INST_TDLGEI:
+@@ -1769,6 +1795,16 @@ bool Recompiler::Recompile(
          println("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_and_si128(simde_mm_load_si128((simde__m128i*){}.u8), simde_mm_load_si128((simde__m128i*){}.u8)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
          break;
  
@@ -76,7 +99,7 @@ index fa91527..39cf663 100644
      case PPC_INST_VANDC128:
          println("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_andnot_si128(simde_mm_load_si128((simde__m128i*){}.u8), simde_mm_load_si128((simde__m128i*){}.u8)));", v(insn.operands[0]), v(insn.operands[2]), v(insn.operands[1]));
          break;
-@@ -1795,6 +1828,18 @@ bool Recompiler::Recompile(
+@@ -1795,6 +1831,18 @@ bool Recompiler::Recompile(
              println("simde_mm_load_ps({}.f32)));", v(insn.operands[1]));
          break;
  
@@ -95,7 +118,7 @@ index fa91527..39cf663 100644
      case PPC_INST_VCFSX:
      case PPC_INST_VCSXWFP128:
      {
-@@ -1831,7 +1876,20 @@ bool Recompiler::Recompile(
+@@ -1831,7 +1879,20 @@ bool Recompiler::Recompile(
  
      case PPC_INST_VCMPBFP:
      case PPC_INST_VCMPBFP128:
@@ -117,7 +140,7 @@ index fa91527..39cf663 100644
          break;
  
      case PPC_INST_VCMPEQFP:
-@@ -1879,6 +1937,16 @@ bool Recompiler::Recompile(
+@@ -1879,6 +1940,16 @@ bool Recompiler::Recompile(
          println("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_cmpgt_epu16(simde_mm_load_si128((simde__m128i*){}.u16), simde_mm_load_si128((simde__m128i*){}.u16)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
          break;
  
@@ -134,7 +157,7 @@ index fa91527..39cf663 100644
      case PPC_INST_VEXPTEFP:
      case PPC_INST_VEXPTEFP128:
          // TODO: vectorize
-@@ -1995,9 +2063,33 @@ bool Recompiler::Recompile(
+@@ -1995,9 +2066,33 @@ bool Recompiler::Recompile(
      }
  
      case PPC_INST_VPKD3D128:
@@ -168,7 +191,7 @@ index fa91527..39cf663 100644
          switch (insn.operands[2])
          {
          case 0: // D3D color
-@@ -2019,21 +2111,17 @@ bool Recompiler::Recompile(
+@@ -2019,21 +2114,17 @@ bool Recompiler::Recompile(
                  fmt::println("Unexpected float16_4 pack instruction at {:X}", base);
  
              for (size_t i = 0; i < 4; i++)
@@ -201,7 +224,7 @@ index fa91527..39cf663 100644
              break;
  
          default:
-@@ -2041,12 +2129,28 @@ bool Recompiler::Recompile(
+@@ -2041,12 +2132,28 @@ bool Recompiler::Recompile(
              break;
          }
          break;
@@ -230,7 +253,7 @@ index fa91527..39cf663 100644
      case PPC_INST_VREFP:
      case PPC_INST_VREFP128:
          // TODO: see if we can use rcp safely
-@@ -2088,6 +2192,7 @@ bool Recompiler::Recompile(
+@@ -2088,6 +2195,7 @@ bool Recompiler::Recompile(
          break;
  
      case PPC_INST_VSEL:
@@ -238,7 +261,7 @@ index fa91527..39cf663 100644
          println("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_or_si128(simde_mm_andnot_si128(simde_mm_load_si128((simde__m128i*){}.u8), simde_mm_load_si128((simde__m128i*){}.u8)), simde_mm_and_si128(simde_mm_load_si128((simde__m128i*){}.u8), simde_mm_load_si128((simde__m128i*){}.u8))));", v(insn.operands[0]), v(insn.operands[3]), v(insn.operands[1]), v(insn.operands[3]), v(insn.operands[2]));
          break;
  
-@@ -2097,6 +2202,17 @@ bool Recompiler::Recompile(
+@@ -2097,6 +2205,17 @@ bool Recompiler::Recompile(
              println("\t{}.u8[{}] = {}.u8[{}] << ({}.u8[{}] & 0x7);", v(insn.operands[0]), i, v(insn.operands[1]), i, v(insn.operands[2]), i);
          break;
  
@@ -256,7 +279,7 @@ index fa91527..39cf663 100644
      case PPC_INST_VSLDOI:
      case PPC_INST_VSLDOI128:
          println("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_alignr_epi8(simde_mm_load_si128((simde__m128i*){}.u8), simde_mm_load_si128((simde__m128i*){}.u8), {}));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]), 16 - insn.operands[3]);
-@@ -2212,6 +2328,20 @@ bool Recompiler::Recompile(
+@@ -2212,6 +2331,20 @@ bool Recompiler::Recompile(
              println("\t{} = {};", v(insn.operands[0]), vTemp());
              break;
  

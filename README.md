@@ -49,6 +49,7 @@ python3 -I tools/check_overlaps.py
 runtime/build.sh                       # genera los imports y compila (≈1,5 min la primera vez)
 runtime/build/prostreet                # desde la raíz del proyecto
 PROSTREET_TRACE=1 runtime/build/prostreet   # muestra también las llamadas implementadas
+PROSTREET_GPU_TRACE=1 runtime/build/prostreet   # muestra cada paquete PM4 que procesa la GPU
 ```
 
 El runtime (`runtime/`) reserva los 4 GB del invitado, carga `analysis/default_image.bin`,
@@ -94,7 +95,13 @@ está implementado aparece como `[falta] Nombre r3=... lr=...` y devuelve 0.
   lee `ZDIR.BIN`, `NAMES.HOO` y todos los `.BIN`
 - [x] 34 tablas de saltos que XenonAnalyse no detectaba (`tools/find_missing_switches.py`)
 - [x] Notificaciones de XAM, registro del cliente de audio, nombres de hilo (15 hilos, con `RWAudioCore Dac`)
-- [ ] **GPU**: el juego inicializa D3D (`VdInitializeEngines`, ring buffer, EDRAM) y espera a que la
-  GPU procese comandos: aquí empieza la fase de gráficos
+- [x] Barreras de memoria (`sync`, `lwsync`, `eieio`) como barreras reales: necesarias en ARM64
+- [x] Memoria física vista en `0xA0000000` y `0xC0000000` a la vez (mismo bloque compartido)
+- [x] Pila por defecto del XEX (256 KB) con página de guarda en cada hilo
+- [x] **GPU sin dibujo** (`runtime/gpu/`): procesador de comandos PM4 (vallas, scratch, esperas,
+  interrupciones, búferes indirectos), VSync a 60 Hz en su propio hilo, `VdSwap`. El juego carga
+  sus datos y **presenta 60 fotogramas por segundo** (aún sin imagen)
+- [ ] Mando (`XamInputGetState`...): el juego consulta la entrada en bucle
+- [ ] Renderer: interpretar los comandos de dibujo y llevarlos a Metal
 - [ ] Resto del kernel (`xboxkrnl.exe`) y `xam.xex`
 - [ ] Gráficos, audio, input

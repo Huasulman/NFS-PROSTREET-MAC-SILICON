@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <pthread.h>
 
@@ -26,6 +27,7 @@ namespace kernel
         uint32_t affinity = 0;
         pthread_t host{};
         PPCContext* ctx = nullptr;
+        std::function<void(PPCContext&, uint8_t*)> hostBody; // hilos del runtime (p. ej. la GPU)
 
         Thread() : Object(ObjectType::Thread) {}
         ~Thread() override;
@@ -46,6 +48,13 @@ namespace kernel
     // como hace el kernel de la Xbox; si no, start(context).
     std::shared_ptr<Thread> CreateThread(uint32_t startAddress, uint32_t startContext, uint32_t xapiStartup,
         uint32_t stackSize, bool suspended);
+
+    // Crea un hilo del runtime que ejecuta `body` en el anfitrión, con un contexto de invitado
+    // completo (pila, KPCR, TLS) para poder llamar a funciones del juego.
+    std::shared_ptr<Thread> CreateHostThread(std::function<void(PPCContext&, uint8_t*)> body);
+
+    // Llama a una función del juego desde un hilo del runtime, con la pila reiniciada.
+    void CallGuest(Thread& thread, uint32_t function);
 
     // Reanuda un hilo; devuelve el contador de suspensión anterior.
     uint32_t ResumeThread(Thread& thread);

@@ -107,13 +107,31 @@ namespace
         int length;
         const kernel::Thread* thread = kernel::CurrentThread();
         const unsigned id = thread ? thread->id : 0;
-        if (memory::Contains(address))
+        const uint32_t guest = memory::Contains(address) ? uint32_t(address - memory::Base()) : 0;
+        if (thread && guest >= thread->stackEnd - 0x10000 && guest < thread->stackEnd)
+            length = std::snprintf(message, sizeof(message), "\n*** Desbordamiento de la pila del invitado (hilo %u, pila de 0x%X bytes)\n",
+                id, thread->stackBase - thread->stackEnd);
+        else if (memory::Contains(address))
             length = std::snprintf(message, sizeof(message), "\n*** %s en la dirección del invitado 0x%08X (hilo %u, último import: %s)\n",
-                strsignal(signal), uint32_t(address - memory::Base()), id, gLastImport ? gLastImport : "ninguno");
+                strsignal(signal), guest, id, gLastImport ? gLastImport : "ninguno");
         else
             length = std::snprintf(message, sizeof(message), "\n*** %s en la dirección del anfitrión %p (hilo %u, último import: %s)\n",
                 strsignal(signal), info->si_addr, id, gLastImport ? gLastImport : "ninguno");
         write(STDERR_FILENO, message, length);
+
+        // Registros del invitado del hilo que falló (los últimos guardados en su contexto).
+        if (thread && thread->ctx)
+        {
+            const PPCContext& c = *thread->ctx;
+            const uint32_t regs[] = { c.r1.u32, c.r3.u32, c.r4.u32, c.r5.u32, c.r11.u32, c.r30.u32, c.r31.u32,
+                                      uint32_t(c.lr), c.ctr.u32 };
+            static const char* const names[] = { "r1", "r3", "r4", "r5", "r11", "r30", "r31", "lr", "ctr" };
+            for (size_t i = 0; i < sizeof(regs) / sizeof(regs[0]); i++)
+            {
+                length = std::snprintf(message, sizeof(message), "    %-3s = 0x%08X\n", names[i], regs[i]);
+                write(STDERR_FILENO, message, length);
+            }
+        }
         _exit(128 + signal);
     }
 }

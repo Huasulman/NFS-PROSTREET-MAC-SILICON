@@ -272,12 +272,11 @@ PPC_FUNC(__imp__RtlRaiseException)
         code, memory::Read32(record + 0x0C));
 }
 
-// --- Vídeo (provisional, hasta tener GPU) ----------------------------------------------------
-
-// BOOL VdIsHSIOTrainingSucceeded(): el enlace con la GPU se calibró bien. Si devuelve 0, D3D
-// avisa "GPU initialization (HSIO training) has failed so no graphics will render".
-PPC_FUNC(__imp__VdIsHSIOTrainingSucceeded)
+// void RtlFillMemoryUlong(void* destination, uint32_t length, uint32_t pattern)
+PPC_FUNC(__imp__RtlFillMemoryUlong)
 {
     (void)base;
-    ctx.r3.u64 = 1;
+    const uint32_t destination = ctx.r3.u32, length = ctx.r4.u32, pattern = ctx.r5.u32;
+    for (uint32_t offset = 0; offset + 4 <= length; offset += 4)
+        memory::Write32(destination + offset, pattern);
 }

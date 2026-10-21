@@ -32,7 +32,9 @@ add_executable(prostreet
     kernel/objects.cpp
     kernel/sync.cpp
     kernel/threads.cpp
+    kernel/video.cpp
     kernel/xam.cpp
+    gpu/command_processor.cpp
     kernel/xboxkrnl.cpp
     kernel/xex.cpp
     generated/imports.cpp

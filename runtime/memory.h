@@ -14,6 +14,8 @@ namespace memory
     constexpr uint32_t kKernelEnd = 0x80000000;
     constexpr uint32_t kPhysicalBase = 0xA0000000; // memoria física (MmAllocatePhysicalMemoryEx)
     constexpr uint32_t kPhysicalEnd = 0xC0000000;
+    constexpr uint32_t kPhysicalMirror = 0xC0000000; // la misma memoria física, otra vista
+    constexpr uint32_t kPhysicalSize = 0x20000000;   // 512 MB
 
     uint8_t* Reserve();
     uint8_t* Base();

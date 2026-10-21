@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <sched.h>
+#include <sys/mman.h>
 #include <thread>
 #include <unordered_map>
 
@@ -22,6 +23,8 @@ namespace kernel
         constexpr uint32_t kTlsTemplateSize = 0x8;
         constexpr uint32_t kTlsDynamicSlots = 64;     // ver KeTls* en xboxkrnl.cpp
         constexpr uint32_t kMinStackSize = 64 * 1024;
+        constexpr uint32_t kStackGuardSize = 0x10000;            // múltiplo de la página del Mac (16 KB)
+        constexpr uint32_t kXexDefaultStackSize = 0x00020200;    // campo DEFAULT_STACK_SIZE de la cabecera
         constexpr uint32_t kKThreadSize = 0x1000;
         constexpr size_t kHostStackSize = 64 * 1024 * 1024;
         constexpr uint32_t kCreateSuspended = 0x1;
@@ -67,6 +70,13 @@ namespace kernel
 
             PPCContext& ctx = *self->ctx;
             uint8_t* base = memory::Base();
+            if (self->hostBody)
+            {
+                self->hostBody(ctx, base);
+                std::lock_guard lock(DispatcherLock());
+                self->exited = true;
+                return nullptr;
+            }
             uint32_t function;
             if (self->xapiStartup != 0)
             {
@@ -81,7 +91,8 @@ namespace kernel
             }
 
             if (std::getenv("PROSTREET_TRACE"))
-                std::fprintf(stderr, "[kernel] hilo %u arranca en 0x%08X\n", self->id, function);
+                std::fprintf(stderr, "[kernel] hilo %u arranca en 0x%08X (pila 0x%08X-0x%08X)\n", self->id, function,
+                    self->stackEnd, self->stackBase);
             try
             {
                 (PPC_LOOKUP_FUNC(base, function))(ctx, base);
@@ -136,9 +147,15 @@ namespace kernel
         thread->guest = memory::AllocateKernel(kKThreadSize, 0x10);
         Register(thread);
 
-        // Pila del invitado (crece hacia abajo).
-        stackSize = std::max(kMinStackSize, (stackSize + 0xFFF) & ~0xFFFu);
-        thread->stackEnd = memory::AllocateKernel(stackSize, 0x1000);
+        // Pila del invitado (crece hacia abajo). Tamaño 0 = el por defecto del XEX, como en la
+        // consola. Debajo queda una guarda sin acceso: si el hilo se sale de su pila, falla en el
+        // acto en lugar de pisar en silencio lo que hubiera al lado.
+        if (stackSize == 0)
+            stackSize = xex::HeaderField(kXexDefaultStackSize);
+        stackSize = std::max(kMinStackSize, (stackSize + kStackGuardSize - 1) & ~(kStackGuardSize - 1));
+        const uint32_t guard = memory::AllocateKernel(kStackGuardSize + stackSize, kStackGuardSize);
+        mprotect(memory::Translate(guard), kStackGuardSize, PROT_NONE);
+        thread->stackEnd = guard + kStackGuardSize;
         thread->stackBase = thread->stackEnd + stackSize;
 
         // TLS: slots dinámicos (KeTlsAlloc) seguidos de la copia de la plantilla .tls.
@@ -175,6 +192,22 @@ namespace kernel
         }
         pthread_attr_destroy(&attributes);
         return thread;
+    }
+
+    std::shared_ptr<Thread> CreateHostThread(std::function<void(PPCContext&, uint8_t*)> body)
+    {
+        // Se crea suspendido para fijar el cuerpo antes de que arranque.
+        auto thread = CreateThread(0, 0, 0, 256 * 1024, true);
+        thread->hostBody = std::move(body);
+        ResumeThread(*thread);
+        return thread;
+    }
+
+    void CallGuest(Thread& thread, uint32_t function)
+    {
+        PPCContext& ctx = *thread.ctx;
+        ctx.r1.u64 = thread.stackBase - 0x100;
+        (PPC_LOOKUP_FUNC(memory::Base(), function))(ctx, memory::Base());
     }
 
     uint32_t ResumeThread(Thread& thread)
@@ -216,6 +249,9 @@ PPC_FUNC(__imp__ExCreateThread)
 {
     (void)base;
     const uint32_t handlePtr = ctx.r3.u32, threadIdPtr = ctx.r5.u32;
+    if (std::getenv("PROSTREET_TRACE"))
+        std::fprintf(stderr, "[kernel] ExCreateThread(pila 0x%X, inicio 0x%08X, contexto 0x%08X, flags 0x%08X)\n",
+            ctx.r4.u32, ctx.r7.u32, ctx.r8.u32, ctx.r9.u32);
     auto thread = CreateThread(ctx.r7.u32, ctx.r8.u32, ctx.r6.u32, ctx.r4.u32, (ctx.r9.u32 & kCreateSuspended) != 0);
     if (!thread)
     {
