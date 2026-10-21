@@ -27,10 +27,12 @@ target_compile_options(ppc_recomp PRIVATE -w -g0)
 add_executable(prostreet
     main.cpp
     memory.cpp
+    kernel/filesystem.cpp
     kernel/imports.cpp
     kernel/objects.cpp
     kernel/sync.cpp
     kernel/threads.cpp
+    kernel/xam.cpp
     kernel/xboxkrnl.cpp
     kernel/xex.cpp
     generated/imports.cpp

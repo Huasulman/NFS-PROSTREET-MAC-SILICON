@@ -272,41 +272,12 @@ PPC_FUNC(__imp__RtlRaiseException)
         code, memory::Read32(record + 0x0C));
 }
 
-// --- Archivos (provisional) ------------------------------------------------------------------
+// --- Vídeo (provisional, hasta tener GPU) ----------------------------------------------------
 
-namespace
-{
-    constexpr uint32_t kStatusObjectNameNotFound = 0xC0000034;
-
-    // OBJECT_ATTRIBUTES: RootDirectory, ObjectName (ANSI_STRING*), Attributes.
-    std::string ObjectName(uint32_t attributes)
-    {
-        const uint32_t name = memory::Read32(attributes + 4);
-        const uint16_t length = uint16_t(memory::Read32(name) >> 16);
-        return std::string(static_cast<const char*>(memory::Translate(memory::Read32(name + 4))), length);
-    }
-}
-
-// NTSTATUS NtCreateFile(uint32_t* handle, uint32_t access, OBJECT_ATTRIBUTES* attributes, IO_STATUS_BLOCK* io,
-//                       uint64_t* allocationSize, uint32_t fileAttributes, uint32_t share, uint32_t disposition,
-//                       uint32_t options)
-// Provisional: registra la ruta y responde que no existe.
-PPC_FUNC(__imp__NtCreateFile)
+// BOOL VdIsHSIOTrainingSucceeded(): el enlace con la GPU se calibró bien. Si devuelve 0, D3D
+// avisa "GPU initialization (HSIO training) has failed so no graphics will render".
+PPC_FUNC(__imp__VdIsHSIOTrainingSucceeded)
 {
     (void)base;
-    std::fprintf(stderr, "[archivo] NtCreateFile \"%s\" (acceso 0x%08X): sin sistema de archivos todavía\n",
-        ObjectName(ctx.r5.u32).c_str(), ctx.r4.u32);
-    memory::Write32(ctx.r3.u32, 0);
-    ctx.r3.u64 = kStatusObjectNameNotFound;
-}
-
-// NTSTATUS NtOpenFile(uint32_t* handle, uint32_t access, OBJECT_ATTRIBUTES* attributes,
-//                     IO_STATUS_BLOCK* io, uint32_t share, uint32_t options)
-PPC_FUNC(__imp__NtOpenFile)
-{
-    (void)base;
-    std::fprintf(stderr, "[archivo] NtOpenFile \"%s\" (acceso 0x%08X): sin sistema de archivos todavía\n",
-        ObjectName(ctx.r5.u32).c_str(), ctx.r4.u32);
-    memory::Write32(ctx.r3.u32, 0);
-    ctx.r3.u64 = kStatusObjectNameNotFound;
+    ctx.r3.u64 = 1;
 }

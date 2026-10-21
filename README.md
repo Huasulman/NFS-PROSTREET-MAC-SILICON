@@ -32,6 +32,7 @@ cmake --build tools/XenonRecomp/build
 python3 -I tools/xiso_extract.py extract "<tu ISO>.iso" game
 
 # 2. Recompilar a C++ (salida en ppc/)
+python3 -I tools/find_missing_switches.py analysis/default_image.bin config/ProStreet_switch_tables.toml
 mkdir -p ppc
 tools/XenonRecomp/build/XenonRecomp/XenonRecomp config/ProStreet.toml tools/XenonRecomp/XenonUtils/ppc_context.h
 
@@ -67,6 +68,7 @@ está implementado aparece como `[falta] Nombre r3=... lr=...` y devuelve 0.
 | `tools/disasm/` | Desensambla un rango con contexto (inicios de función, `.pdata`, saltos, switch) |
 | `tests/gen_vmx_tests.py` | Prueba fragmentos reales del código generado contra una referencia |
 | `patches/xenonrecomp-prostreet.patch` | Instrucciones añadidas a XenonRecomp |
+| `tools/find_missing_switches.py` | Añade al TOML las tablas de saltos absolutas que XenonAnalyse no detecta |
 | `tools/gen_imports.py` | Genera los stubs de los 334 imports y la tabla de slots (`runtime/generated/`) |
 
 ## Estado
@@ -88,6 +90,11 @@ está implementado aparece como `[falta] Nombre r3=... lr=...` y devuelve 0.
 - [x] Runtime mínimo: arranca la CRT, reserva memoria (montón y 334 MB físicos), TLS dinámico
 - [x] Hilos reales (8: `RenderThread`, 4 × `Job Manager - Job Thread`, ...), eventos, semáforos,
   mutantes, temporizadores, esperas, secciones críticas, spinlocks y tiempo
-- [ ] Sistema de archivos (`D:\` → `game/`): el juego pide `D:\NFS\ZDIR.BIN` y se detiene aquí
+- [x] Sistema de archivos: `D:\`/`GAME:\` → `game/` (solo lectura), otras unidades → `data/`;
+  lee `ZDIR.BIN`, `NAMES.HOO` y todos los `.BIN`
+- [x] 34 tablas de saltos que XenonAnalyse no detectaba (`tools/find_missing_switches.py`)
+- [x] Notificaciones de XAM, registro del cliente de audio, nombres de hilo (15 hilos, con `RWAudioCore Dac`)
+- [ ] **GPU**: el juego inicializa D3D (`VdInitializeEngines`, ring buffer, EDRAM) y espera a que la
+  GPU procese comandos: aquí empieza la fase de gráficos
 - [ ] Resto del kernel (`xboxkrnl.exe`) y `xam.xex`
 - [ ] Gráficos, audio, input

@@ -25,5 +25,9 @@ extern const size_t kImportSlotCount;
 // registra la llamada y devuelve 0 en r3.
 void ImportStub(PPCContext& ctx, uint8_t* base, const char* name);
 
+// Argumento número `index` (0 = el noveno) de una llamada: a partir del noveno van en la pila
+// del invitado, en ranuras de 8 bytes desde r1 + 0x54 (según Xenia).
+uint32_t StackArgument(const PPCContext& ctx, uint32_t index);
+
 // Último import llamado en este hilo, para los mensajes de error.
 extern thread_local const char* gLastImport;

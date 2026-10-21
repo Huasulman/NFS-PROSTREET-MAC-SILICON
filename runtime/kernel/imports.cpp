@@ -1,4 +1,5 @@
 #include "imports.h"
+#include "../memory.h"
 
 #include <cstdio>
 #include <mutex>
@@ -6,6 +7,12 @@
 #include <unordered_map>
 
 thread_local const char* gLastImport = nullptr;
+
+uint32_t StackArgument(const PPCContext& ctx, uint32_t index)
+{
+    const auto* slot = static_cast<const uint8_t*>(memory::Translate(ctx.r1.u32 + 0x54 + index * 8));
+    return (slot[0] << 24) | (slot[1] << 16) | (slot[2] << 8) | slot[3];
+}
 
 void ImportStub(PPCContext& ctx, uint8_t* base, const char* name)
 {

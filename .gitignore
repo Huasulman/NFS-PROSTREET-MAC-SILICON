@@ -15,3 +15,4 @@ analysis/*.txt
 tools/disasm/disasm
 runtime/build/
 runtime/generated/
+data/

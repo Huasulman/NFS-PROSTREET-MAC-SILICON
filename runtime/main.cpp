@@ -44,8 +44,19 @@ namespace
         std::memcpy(base + PPC_IMAGE_BASE, data.data(), data.size());
     }
 
+    // Llamada indirecta a una dirección que no es el inicio de ninguna función conocida.
+    void MissingFunction(PPCContext& ctx, uint8_t*)
+    {
+        std::fprintf(stderr, "\n*** Llamada indirecta a una función desconocida (r12/ctr=0x%08X, lr=0x%08X, hilo %u)\n",
+            ctx.ctr.u32, uint32_t(ctx.lr), kernel::CurrentThread() ? kernel::CurrentThread()->id : 0);
+        std::_Exit(1);
+    }
+
     void FillFunctionTable(uint8_t* base)
     {
+        // Primero, todas las entradas del rango de código apuntan a la trampa; luego, las reales.
+        for (uint64_t address = PPC_CODE_BASE; address < PPC_CODE_BASE + PPC_CODE_SIZE; address += 4)
+            PPC_LOOKUP_FUNC(base, address) = MissingFunction;
         size_t count = 0;
         for (auto* m = PPCFuncMappings; m->guest != 0; m++, count++)
             PPC_LOOKUP_FUNC(base, m->guest) = m->host;
