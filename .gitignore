@@ -16,3 +16,4 @@ tools/disasm/disasm
 runtime/build/
 runtime/generated/
 data/
+analysis/shaders/

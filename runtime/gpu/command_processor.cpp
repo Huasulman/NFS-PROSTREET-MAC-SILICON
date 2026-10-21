@@ -7,6 +7,8 @@
 #include <cstdlib>
 #include <mutex>
 #include <thread>
+#include <unordered_set>
+#include <vector>
 
 #include "presenter.h"
 #include "../kernel/threads.h"
@@ -153,6 +155,40 @@ namespace gpu
 
         void ExecuteBuffer(uint32_t guest, uint32_t dwords, int depth);
 
+        // Guarda cada shader distinto en PROSTREET_SHADERS/<vs|ps>_<hash>.bin (palabras big-endian),
+        // para analizarlos con tools/xenos_disasm.py. `words` = nullptr: leerlo de `guest`.
+        void CaptureShader(uint32_t type, uint32_t guest, uint32_t dwords, const uint32_t* words)
+        {
+            static const char* directory = std::getenv("PROSTREET_SHADERS");
+            static std::mutex lock;
+            static std::unordered_set<uint64_t> seen;
+            if (!directory || dwords == 0 || dwords > 0x10000)
+                return;
+            std::vector<uint32_t> code(dwords);
+            for (uint32_t n = 0; n < dwords; n++)
+                code[n] = words ? words[n] : memory::Read32(guest + n * 4);
+
+            uint64_t hash = 1469598103934665603ull ^ type; // FNV-1a
+            for (uint32_t word : code)
+                hash = (hash ^ word) * 1099511628211ull;
+            {
+                std::lock_guard guard(lock);
+                if (!seen.insert(hash).second)
+                    return;
+            }
+            char path[512];
+            std::snprintf(path, sizeof(path), "%s/%s_%016llx.bin", directory, type == 1 ? "ps" : "vs", (unsigned long long)hash);
+            if (FILE* file = std::fopen(path, "wb"))
+            {
+                for (uint32_t word : code)
+                {
+                    const uint32_t big = __builtin_bswap32(word);
+                    std::fwrite(&big, 4, 1, file);
+                }
+                std::fclose(file);
+            }
+        }
+
         // Ejecuta un paquete que empieza en `words[i]`; devuelve cuántas palabras ocupa.
         template <typename Read>
         uint32_t ExecutePacket(Read&& read, uint32_t i, int depth)
@@ -262,6 +298,17 @@ namespace gpu
                             (unsigned long long)gState.frames, data(2), data(3), data(1));
                 }
                 break;
+            case 0x27: // IM_LOAD: shader desde memoria (dirección física | tipo, inicio << 16 | tamaño)
+                CaptureShader(data(0) & 3, PhysicalToGuest(data(0) & ~3u), data(1) & 0xFFFF, nullptr);
+                break;
+            case 0x2B: // IM_LOAD_IMMEDIATE: shader dentro del paquete (tipo, inicio << 16 | tamaño, microcódigo)
+            {
+                std::vector<uint32_t> words(data(1) & 0xFFFF);
+                for (uint32_t n = 0; n < words.size(); n++)
+                    words[n] = data(2 + n);
+                CaptureShader(data(0) & 3, 0, uint32_t(words.size()), words.data());
+                break;
+            }
             case 0x22: // DRAW_INDX
             case 0x36: // DRAW_INDX_2
             {

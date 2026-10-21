@@ -53,6 +53,7 @@ PROSTREET_GPU_TRACE=1 runtime/build/prostreet   # muestra cada paquete PM4 que p
 PROSTREET_GPU_DRAWS=1 runtime/build/prostreet   # muestra los registros de cada dibujo / resolve
 PROSTREET_DUMP=carpeta runtime/build/prostreet  # guarda un PNG cada 60 fotogramas (PROSTREET_DUMP_EVERY)
 PROSTREET_NO_WINDOW=1 runtime/build/prostreet   # sin ventana (pruebas automáticas)
+PROSTREET_SHADERS=carpeta runtime/build/prostreet  # guarda cada shader distinto (vs_*.bin / ps_*.bin)
 ```
 
 El runtime (`runtime/`) reserva los 4 GB del invitado, carga `analysis/default_image.bin`,
@@ -73,6 +74,7 @@ está implementado aparece como `[falta] Nombre r3=... lr=...` y devuelve 0.
 | `tests/gen_vmx_tests.py` | Prueba fragmentos reales del código generado contra una referencia |
 | `patches/xenonrecomp-prostreet.patch` | Instrucciones añadidas a XenonRecomp |
 | `tools/find_missing_switches.py` | Añade al TOML las tablas de saltos absolutas que XenonAnalyse no detecta |
+| `tools/xenos_disasm.py` | Desensambla shaders de Xenos capturados con `PROSTREET_SHADERS` |
 | `tools/gen_imports.py` | Genera los stubs de los 334 imports y la tabla de slots (`runtime/generated/`) |
 
 ## Estado
@@ -108,6 +110,8 @@ está implementado aparece como `[falta] Nombre r3=... lr=...` y devuelve 0.
 - [x] Ventana de macOS con Metal que muestra el front buffer de cada `VdSwap` (convertido del
   formato en mosaico de Xenos); captura a PNG con `PROSTREET_DUMP`. De momento, negro: el juego
   borra a negro y aún no se interpretan los dibujos
-- [ ] Renderer: resolves (EDRAM → memoria), shaders de Xenos → Metal, vértices y texturas
+- [x] Captura de shaders (`PROSTREET_SHADERS=carpeta`) y desensamblador de microcódigo de Xenos
+  (`tools/xenos_disasm.py`): 8 shaders en la primera escena, con solo 10 instrucciones distintas
+- [ ] Renderer: traductor de shaders a MSL, vértices, texturas, resolves (EDRAM → memoria)
 - [ ] Resto del kernel (`xboxkrnl.exe`) y `xam.xex`
 - [ ] Gráficos, audio, input
