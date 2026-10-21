@@ -50,6 +50,9 @@ runtime/build.sh                       # genera los imports y compila (≈1,5 mi
 runtime/build/prostreet                # desde la raíz del proyecto
 PROSTREET_TRACE=1 runtime/build/prostreet   # muestra también las llamadas implementadas
 PROSTREET_GPU_TRACE=1 runtime/build/prostreet   # muestra cada paquete PM4 que procesa la GPU
+PROSTREET_GPU_DRAWS=1 runtime/build/prostreet   # muestra los registros de cada dibujo / resolve
+PROSTREET_DUMP=carpeta runtime/build/prostreet  # guarda un PNG cada 60 fotogramas (PROSTREET_DUMP_EVERY)
+PROSTREET_NO_WINDOW=1 runtime/build/prostreet   # sin ventana (pruebas automáticas)
 ```
 
 El runtime (`runtime/`) reserva los 4 GB del invitado, carga `analysis/default_image.bin`,
@@ -102,6 +105,9 @@ está implementado aparece como `[falta] Nombre r3=... lr=...` y devuelve 0.
   interrupciones, búferes indirectos), VSync a 60 Hz en su propio hilo, `VdSwap`. El juego carga
   sus datos y **presenta 60 fotogramas por segundo** (aún sin imagen)
 - [ ] Mando (`XamInputGetState`...): el juego consulta la entrada en bucle
-- [ ] Renderer: interpretar los comandos de dibujo y llevarlos a Metal
+- [x] Ventana de macOS con Metal que muestra el front buffer de cada `VdSwap` (convertido del
+  formato en mosaico de Xenos); captura a PNG con `PROSTREET_DUMP`. De momento, negro: el juego
+  borra a negro y aún no se interpretan los dibujos
+- [ ] Renderer: resolves (EDRAM → memoria), shaders de Xenos → Metal, vértices y texturas
 - [ ] Resto del kernel (`xboxkrnl.exe`) y `xam.xex`
 - [ ] Gráficos, audio, input

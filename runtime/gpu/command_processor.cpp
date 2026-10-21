@@ -8,6 +8,7 @@
 #include <mutex>
 #include <thread>
 
+#include "presenter.h"
 #include "../kernel/threads.h"
 #include "../memory.h"
 
@@ -255,11 +256,26 @@ namespace gpu
                 if (data(0) == kSwapMagic)
                 {
                     gState.frames++;
+                    PresentFrame(data(1), data(2), data(3));
                     if (Trace())
                         std::fprintf(stderr, "[gpu] fotograma %llu presentado (%ux%u, búfer 0x%08X)\n",
                             (unsigned long long)gState.frames, data(2), data(3), data(1));
                 }
                 break;
+            case 0x22: // DRAW_INDX
+            case 0x36: // DRAW_INDX_2
+            {
+                static const bool kTraceDraws = std::getenv("PROSTREET_GPU_DRAWS") != nullptr;
+                if (kTraceDraws)
+                {
+                    const auto& r = gState.registers;
+                    std::fprintf(stderr, "[draw] 0x%02X init=%08X MODECONTROL=%08X SURFACE=%08X COLOR0=%08X DEPTH=%08X | "
+                        "COPY_CONTROL=%08X DEST_BASE=%08X PITCH=%08X INFO=%08X CLEAR=%08X DEPTHCLEAR=%08X\n",
+                        opcode, data(0), r[0x2208], r[0x2000], r[0x2001], r[0x2002],
+                        r[0x2318], r[0x2319], r[0x231A], r[0x231B], r[0x231E], r[0x231D]);
+                }
+                break;
+            }
             default:
                 break; // dibujo, constantes, estado...: aún no se interpretan
             }

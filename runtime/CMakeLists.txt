@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(ProStreetRecomp CXX)
+project(ProStreetRecomp CXX OBJCXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -35,10 +35,15 @@ add_executable(prostreet
     kernel/video.cpp
     kernel/xam.cpp
     gpu/command_processor.cpp
+    gpu/presenter.cpp
+    platform/window.mm
     kernel/xboxkrnl.cpp
     kernel/xex.cpp
     generated/imports.cpp
 )
 target_include_directories(prostreet PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_options(prostreet PRIVATE -g)
-target_link_libraries(prostreet PRIVATE ppc_recomp)
+target_link_libraries(prostreet PRIVATE ppc_recomp
+    "-framework Cocoa" "-framework Metal" "-framework QuartzCore" "-framework ImageIO"
+    "-framework CoreGraphics" "-framework UniformTypeIdentifiers")
+set_source_files_properties(platform/window.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")

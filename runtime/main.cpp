@@ -21,6 +21,7 @@
 #include "kernel/imports.h"
 #include "kernel/threads.h"
 #include "kernel/xex.h"
+#include "platform/window.h"
 #include "memory.h"
 
 namespace
@@ -159,10 +160,17 @@ int main(int argc, char** argv)
     FillImports();
     xex::Load(gXexPath);
 
-    // El hilo principal del juego es un hilo más del kernel; el programa termina cuando termina él.
+    // El hilo principal del juego es un hilo más del kernel. El hilo principal del programa
+    // queda para la ventana (macOS exige que la interfaz vaya en él); al cerrarla, termina todo.
+    // Con PROSTREET_NO_WINDOW=1 no hay ventana y el programa espera al hilo del juego.
     std::printf("Arrancando: punto de entrada 0x%08X\n\n", kEntryPoint);
     auto mainThread = kernel::CreateThread(kEntryPoint, 0, 0, kMainStackSize, false);
-    pthread_join(mainThread->host, nullptr);
-    std::printf("\nEl hilo principal terminó (código 0x%08X)\n", mainThread->exitCode);
-    return 0;
+    if (std::getenv("PROSTREET_NO_WINDOW"))
+    {
+        pthread_join(mainThread->host, nullptr);
+        std::printf("\nEl hilo principal terminó (código 0x%08X)\n", mainThread->exitCode);
+        return 0;
+    }
+    platform::RunWindow();
+    std::_Exit(0);
 }
