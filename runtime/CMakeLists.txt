@@ -22,7 +22,7 @@ target_include_directories(ppc_recomp PUBLIC ${PPC_DIR} ${SIMDE_DIR})
 # -ffp-contract=off: no fusionar mul+add que el juego hace por separado (cambiaría resultados).
 # -fno-strict-aliasing: el código generado accede a la misma memoria con tipos distintos.
 target_compile_options(ppc_recomp PUBLIC -fno-strict-aliasing -ffp-contract=off)
-target_compile_options(ppc_recomp PRIVATE -w -g0)
+target_compile_options(ppc_recomp PRIVATE -w -g0 -include ${CMAKE_CURRENT_SOURCE_DIR}/ppc_overrides.h)
 
 add_executable(prostreet
     main.cpp

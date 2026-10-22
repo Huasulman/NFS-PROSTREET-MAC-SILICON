@@ -45,6 +45,18 @@ namespace
         std::memcpy(base + PPC_IMAGE_BASE, data.data(), data.size());
     }
 
+}
+
+// Llamada indirecta a una dirección fuera del código (ver ppc_overrides.h).
+void PpcInvalidIndirectCall(PPCContext& ctx, uint8_t*, uint32_t target)
+{
+    std::fprintf(stderr, "\n*** Llamada indirecta a 0x%08X, fuera del código del juego (lr=0x%08X, hilo %u)\n",
+        target, uint32_t(ctx.lr), kernel::CurrentThread() ? kernel::CurrentThread()->id : 0);
+    std::_Exit(1);
+}
+
+namespace
+{
     // Llamada indirecta a una dirección que no es el inicio de ninguna función conocida.
     void MissingFunction(PPCContext& ctx, uint8_t*)
     {
