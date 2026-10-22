@@ -7,6 +7,8 @@
 //   xex:    por defecto game/default.xex (para la cabecera)
 
 #include <csignal>
+#include <execinfo.h>
+#include <sys/ucontext.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -113,7 +115,7 @@ namespace
         std::printf("Imports:    %zu slots (%zu variables del kernel)\n", kImportSlotCount, variables);
     }
 
-    void OnCrash(int signal, siginfo_t* info, void*)
+    void OnCrash(int signal, siginfo_t* info, void* context)
     {
         const auto* address = static_cast<const uint8_t*>(info->si_addr);
         char message[256];
@@ -145,6 +147,25 @@ namespace
                 write(STDERR_FILENO, message, length);
             }
         }
+
+        // Dónde estaba el anfitrión: contador de programa, registro de enlace y pila de llamadas.
+#if defined(__aarch64__)
+        const auto* state = &static_cast<ucontext_t*>(context)->uc_mcontext->__ss;
+        void* frames[48];
+        frames[0] = reinterpret_cast<void*>(state->__pc);
+        frames[1] = reinterpret_cast<void*>(state->__lr);
+        int count = 2;
+        // Recorrer los punteros de marco (x29) mientras sean razonables.
+        auto* frame = reinterpret_cast<void**>(state->__fp);
+        while (count < 48 && frame && (reinterpret_cast<uintptr_t>(frame) & 7) == 0 && frame[0] > frame)
+        {
+            frames[count++] = frame[1];
+            frame = static_cast<void**>(frame[0]);
+        }
+        length = std::snprintf(message, sizeof(message), "    pila del anfitrión (pc, lr, ...):\n");
+        write(STDERR_FILENO, message, length);
+        backtrace_symbols_fd(frames, count, STDERR_FILENO);
+#endif
         _exit(128 + signal);
     }
 }
@@ -186,3 +207,4 @@ int main(int argc, char** argv)
     platform::RunWindow();
     std::_Exit(0);
 }
+

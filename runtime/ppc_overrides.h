@@ -21,3 +21,4 @@ void PpcInvalidIndirectCall(PPCContext& ctx, uint8_t* base, uint32_t target);
         else                                                                          \
             PpcInvalidIndirectCall(ctx, base, ppcTarget);                             \
     } while (0)
+
