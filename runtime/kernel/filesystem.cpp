@@ -346,7 +346,9 @@ namespace
                 status = kStatusAccessDenied;
         }
 
-        if (Trace() || status != kStatusSuccess)
+        // Que no exista un archivo es normal (el juego busca primero en su caché, vacía): solo se
+        // muestra en modo de diagnóstico.
+        if (Trace())
             std::fprintf(stderr, "[archivo] abrir \"%s\" -> %s: %s\n", guestPath.c_str(), resolved.host.c_str(),
                 status == kStatusSuccess ? (information == kFileCreated ? "creado" : "ok") : "no se pudo");
 
