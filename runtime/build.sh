@@ -7,5 +7,5 @@ LLVM=/opt/homebrew/opt/llvm
 
 python3 -I tools/gen_imports.py game/default.xex analysis/default_image.bin ppc runtime/generated
 cmake -S runtime -B runtime/build -G Ninja -DCMAKE_BUILD_TYPE="${BUILD_TYPE:-Release}" \
-    -DCMAKE_CXX_COMPILER=$LLVM/bin/clang++ -DCMAKE_CXX_COMPILER_LAUNCHER=ccache > /dev/null
+    -DCMAKE_CXX_COMPILER=$LLVM/bin/clang++ -DCMAKE_OBJCXX_COMPILER=$LLVM/bin/clang++ -DCMAKE_CXX_COMPILER_LAUNCHER=ccache > /dev/null
 cmake --build runtime/build

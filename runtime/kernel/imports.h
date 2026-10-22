@@ -31,3 +31,7 @@ uint32_t StackArgument(const PPCContext& ctx, uint32_t index);
 
 // Último import llamado en este hilo, para los mensajes de error.
 extern thread_local const char* gLastImport;
+
+// Idioma de la consola (XC_LANGUAGE_*): 1 = inglés, 3 = alemán, 4 = francés, 5 = español,
+// 6 = italiano, 11 = polaco, 12 = ruso. Se elige con PROSTREET_LANGUAGE (por defecto español).
+uint32_t ConsoleLanguage();

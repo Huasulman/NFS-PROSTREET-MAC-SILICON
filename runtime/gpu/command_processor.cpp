@@ -5,9 +5,14 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <thread>
+#include <unordered_set>
+#include <vector>
 
+#include "presenter.h"
+#include "renderer.h"
 #include "../kernel/threads.h"
 #include "../memory.h"
 
@@ -49,6 +54,12 @@ namespace gpu
             uint32_t interruptCallback = 0;
             uint32_t interruptUserData = 0;
             std::array<uint32_t, kRegisterCount> registers{};
+
+            // Predicated tiling: cada paquete predicado solo se ejecuta si su franja está activa.
+            uint64_t binMask = ~0ull, binSelect = ~0ull;
+
+            // Shaders activos (microcódigo y huella), cargados con IM_LOAD / IM_LOAD_IMMEDIATE.
+            Shader vertexShader, pixelShader;
 
             std::atomic<uint64_t> frames{0}, packets{0}, interrupts{0}, vsyncs{0};
             std::shared_ptr<kernel::Thread> thread;       // procesador de comandos
@@ -152,6 +163,63 @@ namespace gpu
 
         void ExecuteBuffer(uint32_t guest, uint32_t dwords, int depth);
 
+        // Base de cada tipo de constante en el archivo de registros (según Xenia).
+        uint32_t ConstantBase(uint32_t type)
+        {
+            switch (type)
+            {
+            case 0: return 0x4000; // ALU: 512 float4 (256 de vértices + 256 de píxeles)
+            case 1: return 0x4800; // fetch: vértices y texturas
+            case 2: return 0x4900; // booleanas
+            case 3: return 0x4908; // bucles
+            default: return 0x2000; // registros de estado
+            }
+        }
+
+        void LoadShader(uint32_t type, std::vector<uint32_t> code)
+        {
+            Shader& shader = type == 1 ? gState.pixelShader : gState.vertexShader;
+            uint64_t hash = 1469598103934665603ull ^ type; // FNV-1a
+            for (uint32_t word : code)
+                hash = (hash ^ word) * 1099511628211ull;
+            shader.hash = hash;
+            shader.code = std::move(code);
+        }
+
+        // Guarda cada shader distinto en PROSTREET_SHADERS/<vs|ps>_<hash>.bin (palabras big-endian),
+        // para analizarlos con tools/xenos_disasm.py. `words` = nullptr: leerlo de `guest`.
+        void CaptureShader(uint32_t type, uint32_t guest, uint32_t dwords, const uint32_t* words)
+        {
+            static const char* directory = std::getenv("PROSTREET_SHADERS");
+            static std::mutex lock;
+            static std::unordered_set<uint64_t> seen;
+            if (!directory || dwords == 0 || dwords > 0x10000)
+                return;
+            std::vector<uint32_t> code(dwords);
+            for (uint32_t n = 0; n < dwords; n++)
+                code[n] = words ? words[n] : memory::Read32(guest + n * 4);
+
+            uint64_t hash = 1469598103934665603ull ^ type; // FNV-1a
+            for (uint32_t word : code)
+                hash = (hash ^ word) * 1099511628211ull;
+            {
+                std::lock_guard guard(lock);
+                if (!seen.insert(hash).second)
+                    return;
+            }
+            char path[512];
+            std::snprintf(path, sizeof(path), "%s/%s_%016llx.bin", directory, type == 1 ? "ps" : "vs", (unsigned long long)hash);
+            if (FILE* file = std::fopen(path, "wb"))
+            {
+                for (uint32_t word : code)
+                {
+                    const uint32_t big = __builtin_bswap32(word);
+                    std::fwrite(&big, 4, 1, file);
+                }
+                std::fclose(file);
+            }
+        }
+
         // Ejecuta un paquete que empieza en `words[i]`; devuelve cuántas palabras ocupa.
         template <typename Read>
         uint32_t ExecutePacket(Read&& read, uint32_t i, int depth)
@@ -180,6 +248,10 @@ namespace gpu
 
             const uint32_t opcode = (header >> 8) & 0x7F, count = ((header >> 16) & 0x3FFF) + 1;
             auto data = [&](uint32_t n) { return read(i + 1 + n); };
+
+            // Paquete predicado (bit 0) de una franja que no está activa: se salta.
+            if ((header & 1) && !(gState.binSelect & gState.binMask))
+                return 1 + count;
             static const bool kTracePackets = std::getenv("PROSTREET_GPU_TRACE") != nullptr;
             if (kTracePackets)
                 std::fprintf(stderr, "[pm4] %*s0x%02X x%-4u %08X %08X %08X %08X\n", depth * 2, "", opcode, count,
@@ -255,11 +327,103 @@ namespace gpu
                 if (data(0) == kSwapMagic)
                 {
                     gState.frames++;
+                    PresentFrame(data(1), data(2), data(3));
                     if (Trace())
                         std::fprintf(stderr, "[gpu] fotograma %llu presentado (%ux%u, búfer 0x%08X)\n",
                             (unsigned long long)gState.frames, data(2), data(3), data(1));
                 }
                 break;
+            case 0x27: // IM_LOAD: shader desde memoria (dirección física | tipo, inicio << 16 | tamaño)
+            {
+                std::vector<uint32_t> words(data(1) & 0xFFFF);
+                const uint32_t guest = PhysicalToGuest(data(0) & ~3u);
+                for (uint32_t n = 0; n < words.size(); n++)
+                    words[n] = memory::Read32(guest + n * 4);
+                CaptureShader(data(0) & 3, 0, uint32_t(words.size()), words.data());
+                LoadShader(data(0) & 3, std::move(words));
+                break;
+            }
+            case 0x2B: // IM_LOAD_IMMEDIATE: shader dentro del paquete (tipo, inicio << 16 | tamaño, microcódigo)
+            {
+                std::vector<uint32_t> words(data(1) & 0xFFFF);
+                for (uint32_t n = 0; n < words.size(); n++)
+                    words[n] = data(2 + n);
+                CaptureShader(data(0) & 3, 0, uint32_t(words.size()), words.data());
+                LoadShader(data(0) & 3, std::move(words));
+                break;
+            }
+            case 0x2D: // SET_CONSTANT: (tipo << 16 | índice), valores
+            {
+                const uint32_t index = ConstantBase((data(0) >> 16) & 0xFF) + (data(0) & 0x7FF);
+                for (uint32_t n = 1; n < count; n++)
+                    WriteRegister(index + n - 1, data(n));
+                break;
+            }
+            case 0x2F: // LOAD_ALU_CONSTANT: dirección física, (tipo << 16 | índice), número de palabras
+            {
+                const uint32_t guest = PhysicalToGuest(data(0) & 0x3FFFFFFF);
+                const uint32_t index = ConstantBase((data(1) >> 16) & 0xFF) + (data(1) & 0x7FF);
+                const uint32_t size = data(2) & 0xFFF;
+                for (uint32_t n = 0; n < size; n++)
+                    WriteRegister(index + n, memory::Read32(guest + n * 4));
+                break;
+            }
+            case 0x55: // SET_CONSTANT2: índice de registro absoluto, valores
+            case 0x56: // SET_SHADER_CONSTANTS
+                for (uint32_t n = 1; n < count; n++)
+                    WriteRegister((data(0) & 0xFFFF) + n - 1, data(n));
+                break;
+            case 0x60: gState.binMask = (gState.binMask & ~0xFFFFFFFFull) | data(0); break;            // SET_BIN_MASK_LO
+            case 0x61: gState.binMask = (gState.binMask & 0xFFFFFFFFull) | (uint64_t(data(0)) << 32); break; // SET_BIN_MASK_HI
+            case 0x62: gState.binSelect = (gState.binSelect & ~0xFFFFFFFFull) | data(0); break;        // SET_BIN_SELECT_LO
+            case 0x63: gState.binSelect = (gState.binSelect & 0xFFFFFFFFull) | (uint64_t(data(0)) << 32); break; // SET_BIN_SELECT_HI
+            case 0x22: // DRAW_INDX: [viz], iniciador, [base de índices, tamaño | endian << 30]
+            case 0x36: // DRAW_INDX_2: iniciador, [índices inmediatos]
+            {
+                const uint32_t drawInitiator = opcode == 0x22 ? data(1) : data(0);
+                const uint32_t mode = gState.registers[0x2208] & 7; // RB_MODECONTROL
+                if (mode == 6) // copia: es un resolve
+                {
+                    RendererResolve(gState.registers.data());
+                }
+                else if (mode == 4 || mode == 5)
+                {
+                    DrawCall draw{};
+                    draw.registers = gState.registers.data();
+                    draw.vertexShader = &gState.vertexShader;
+                    draw.pixelShader = &gState.pixelShader;
+                    draw.primitive = drawInitiator & 0x3F;
+                    draw.count = drawInitiator >> 16;
+                    const uint32_t source = (drawInitiator >> 6) & 3; // 0 = índices en memoria, 2 = automáticos
+                    if (source == 0 && opcode == 0x22)
+                    {
+                        draw.indexSize = ((drawInitiator >> 11) & 1) ? 4 : 2;
+                        draw.indexBase = data(2);
+                        draw.indexEndian = data(3) >> 30;
+                    }
+                    if (source != 1) // índices inmediatos: aún no
+                        RendererDraw(draw);
+                }
+                static const bool kTraceDraws = std::getenv("PROSTREET_GPU_DRAWS") != nullptr;
+                if (kTraceDraws)
+                {
+                    const auto& r = gState.registers;
+                    const uint32_t initiator = opcode == 0x22 ? data(1) : data(0);
+                    std::fprintf(stderr, "[draw] prim=%u src=%u n=%u mode=%u vs=%016llx ps=%016llx vf0=%08X:%08X "
+                        "tf0=%08X:%08X:%08X SURFACE=%08X COLOR0=%08X COPY=%08X DEST=%08X BLEND=%08X MASK=%08X\n",
+                        initiator & 0x3F, (initiator >> 6) & 3, initiator >> 16, r[0x2208] & 7,
+                        (unsigned long long)gState.vertexShader.hash, (unsigned long long)gState.pixelShader.hash,
+                        r[0x4800], r[0x4801], r[0x4800], r[0x4801], r[0x4802], r[0x2000], r[0x2001], r[0x2318], r[0x2319], r[0x2201], r[0x2104]);
+                    if ((initiator & 0x3F) == 13)
+                    {
+                        // Constantes de fetch: vértices 95 (2 palabras) y texturas 0 y 1 (6 palabras).
+                        std::fprintf(stderr, "[fetch] vf95=%08X %08X  tf0=%08X %08X %08X %08X %08X %08X  tf1=%08X %08X %08X %08X %08X %08X\n",
+                            r[0x4800 + 190], r[0x4800 + 191], r[0x4800], r[0x4801], r[0x4802], r[0x4803], r[0x4804], r[0x4805],
+                            r[0x4806], r[0x4807], r[0x4808], r[0x4809], r[0x480A], r[0x480B]);
+                    }
+                }
+                break;
+            }
             default:
                 break; // dibujo, constantes, estado...: aún no se interpretan
             }

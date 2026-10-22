@@ -1,7 +1,9 @@
 // Sincronización del kernel: eventos, semáforos, mutantes, temporizadores, esperas, secciones
 // críticas, spinlocks y tiempo. Convención: argumentos en r3..r10, resultado en r3.
 
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
@@ -345,21 +347,74 @@ PPC_FUNC(__imp__NtSignalAndWaitForSingleObjectEx)
 }
 
 // --- Secciones críticas --------------------------------------------------------------------
-// Cada sección crítica del invitado tiene un mutex recursivo del anfitrión, por su dirección.
-// Se crea al primer uso (algunas están inicializadas estáticamente en .data).
+// Cada sección crítica del invitado tiene un lock recursivo del anfitrión, por su dirección. Se
+// crea al primer uso (algunas están inicializadas estáticamente en .data).
+//
+// El lock sabe quién lo tiene: el juego a veces libera una sección que no consiguió tomar (p. ej.
+// tras un intento con tiempo límite que expiró, sin comprobar el resultado). En la consola eso
+// solo descuadra un contador; con un mutex del anfitrión sería comportamiento indefinido.
 
 namespace
 {
-    std::mutex gCriticalSectionsLock;
-    std::unordered_map<uint32_t, std::recursive_mutex*> gCriticalSections;
+    struct CriticalSectionLock
+    {
+        std::mutex mutex;
+        std::condition_variable released;
+        const void* owner = nullptr; // hilo del anfitrión que lo tiene
+        uint32_t recursion = 0;
+    };
 
-    std::recursive_mutex& CriticalSection(uint32_t address)
+    std::mutex gCriticalSectionsLock;
+    std::unordered_map<uint32_t, CriticalSectionLock*> gCriticalSections;
+
+    const void* CurrentOwner()
+    {
+        static thread_local char marker;
+        return &marker;
+    }
+
+    CriticalSectionLock& CriticalSection(uint32_t address)
     {
         std::lock_guard lock(gCriticalSectionsLock);
-        auto& mutex = gCriticalSections[address];
-        if (!mutex)
-            mutex = new std::recursive_mutex(); // vive lo que dure el programa
-        return *mutex;
+        auto& section = gCriticalSections[address];
+        if (!section)
+            section = new CriticalSectionLock(); // vive lo que dure el programa
+        return *section;
+    }
+
+    bool EnterCriticalSection(uint32_t address, bool wait)
+    {
+        CriticalSectionLock& section = CriticalSection(address);
+        std::unique_lock lock(section.mutex);
+        const void* self = CurrentOwner();
+        if (section.owner != self)
+        {
+            if (!wait && section.owner)
+                return false;
+            section.released.wait(lock, [&] { return section.owner == nullptr; });
+            section.owner = self;
+        }
+        section.recursion++;
+        return true;
+    }
+
+    void LeaveCriticalSection(uint32_t address)
+    {
+        CriticalSectionLock& section = CriticalSection(address);
+        std::unique_lock lock(section.mutex);
+        if (section.owner != CurrentOwner() || section.recursion == 0)
+        {
+            static std::atomic<int> reported{0};
+            if (reported++ < 5)
+                std::fprintf(stderr, "[kernel] RtlLeaveCriticalSection(0x%08X) desde un hilo que no la tiene: se ignora\n", address);
+            return;
+        }
+        if (--section.recursion == 0)
+        {
+            section.owner = nullptr;
+            lock.unlock();
+            section.released.notify_one();
+        }
     }
 }
 
@@ -374,21 +429,21 @@ PPC_FUNC(__imp__RtlInitializeCriticalSection)
 PPC_FUNC(__imp__RtlEnterCriticalSection)
 {
     (void)base;
-    CriticalSection(ctx.r3.u32).lock();
+    EnterCriticalSection(ctx.r3.u32, true);
 }
 
 // void RtlLeaveCriticalSection(RTL_CRITICAL_SECTION* cs)
 PPC_FUNC(__imp__RtlLeaveCriticalSection)
 {
     (void)base;
-    CriticalSection(ctx.r3.u32).unlock();
+    LeaveCriticalSection(ctx.r3.u32);
 }
 
 // BOOL RtlTryEnterCriticalSection(RTL_CRITICAL_SECTION* cs)
 PPC_FUNC(__imp__RtlTryEnterCriticalSection)
 {
     (void)base;
-    ctx.r3.u64 = CriticalSection(ctx.r3.u32).try_lock();
+    ctx.r3.u64 = EnterCriticalSection(ctx.r3.u32, false);
 }
 
 // --- Spinlocks e IRQL ----------------------------------------------------------------------

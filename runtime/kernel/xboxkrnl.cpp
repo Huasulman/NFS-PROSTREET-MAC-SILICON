@@ -280,3 +280,44 @@ PPC_FUNC(__imp__RtlFillMemoryUlong)
     for (uint32_t offset = 0; offset + 4 <= length; offset += 4)
         memory::Write32(destination + offset, pattern);
 }
+
+// --- Configuración de la consola -------------------------------------------------------------
+
+uint32_t ConsoleLanguage()
+{
+    const char* language = std::getenv("PROSTREET_LANGUAGE");
+    return language ? std::strtoul(language, nullptr, 10) : 5;
+}
+
+// NTSTATUS ExGetXConfigSetting(uint16_t category, uint16_t setting, void* buffer,
+//                              uint16_t bufferSize, uint16_t* requiredSize)
+// Solo los ajustes de usuario (categoría 3) que pide el juego, con los valores de Xenia.
+PPC_FUNC(__imp__ExGetXConfigSetting)
+{
+    (void)base;
+    const uint32_t category = ctx.r3.u32 & 0xFFFF, setting = ctx.r4.u32 & 0xFFFF;
+    const uint32_t buffer = ctx.r5.u32, bufferSize = ctx.r6.u32 & 0xFFFF, requiredSize = ctx.r7.u32;
+
+    uint32_t value;
+    if (category == 3 && setting == 0x09)       // XCONFIG_USER_LANGUAGE
+        value = ConsoleLanguage();
+    else if (category == 3 && setting == 0x0A)  // XCONFIG_USER_VIDEO_FLAGS: panorámico
+        value = 0x00040000;
+    else
+    {
+        std::fprintf(stderr, "[kernel] ExGetXConfigSetting(%u, 0x%X): ajuste no soportado\n", category, setting);
+        ctx.r3.u64 = 0xC000000D; // STATUS_INVALID_PARAMETER
+        return;
+    }
+
+    if (requiredSize)
+        memory::Write16(requiredSize, 4);
+    if (bufferSize < 4)
+    {
+        ctx.r3.u64 = 0xC0000023; // STATUS_BUFFER_TOO_SMALL
+        return;
+    }
+    if (buffer)
+        memory::Write32(buffer, value);
+    ctx.r3.u64 = 0;
+}

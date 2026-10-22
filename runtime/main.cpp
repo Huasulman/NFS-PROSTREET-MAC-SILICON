@@ -7,6 +7,8 @@
 //   xex:    por defecto game/default.xex (para la cabecera)
 
 #include <csignal>
+#include <execinfo.h>
+#include <sys/ucontext.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -21,6 +23,7 @@
 #include "kernel/imports.h"
 #include "kernel/threads.h"
 #include "kernel/xex.h"
+#include "platform/window.h"
 #include "memory.h"
 
 namespace
@@ -44,6 +47,18 @@ namespace
         std::memcpy(base + PPC_IMAGE_BASE, data.data(), data.size());
     }
 
+}
+
+// Llamada indirecta a una dirección fuera del código (ver ppc_overrides.h).
+void PpcInvalidIndirectCall(PPCContext& ctx, uint8_t*, uint32_t target)
+{
+    std::fprintf(stderr, "\n*** Llamada indirecta a 0x%08X, fuera del código del juego (lr=0x%08X, hilo %u)\n",
+        target, uint32_t(ctx.lr), kernel::CurrentThread() ? kernel::CurrentThread()->id : 0);
+    std::_Exit(1);
+}
+
+namespace
+{
     // Llamada indirecta a una dirección que no es el inicio de ninguna función conocida.
     void MissingFunction(PPCContext& ctx, uint8_t*)
     {
@@ -100,7 +115,7 @@ namespace
         std::printf("Imports:    %zu slots (%zu variables del kernel)\n", kImportSlotCount, variables);
     }
 
-    void OnCrash(int signal, siginfo_t* info, void*)
+    void OnCrash(int signal, siginfo_t* info, void* context)
     {
         const auto* address = static_cast<const uint8_t*>(info->si_addr);
         char message[256];
@@ -132,6 +147,25 @@ namespace
                 write(STDERR_FILENO, message, length);
             }
         }
+
+        // Dónde estaba el anfitrión: contador de programa, registro de enlace y pila de llamadas.
+#if defined(__aarch64__)
+        const auto* state = &static_cast<ucontext_t*>(context)->uc_mcontext->__ss;
+        void* frames[48];
+        frames[0] = reinterpret_cast<void*>(state->__pc);
+        frames[1] = reinterpret_cast<void*>(state->__lr);
+        int count = 2;
+        // Recorrer los punteros de marco (x29) mientras sean razonables.
+        auto* frame = reinterpret_cast<void**>(state->__fp);
+        while (count < 48 && frame && (reinterpret_cast<uintptr_t>(frame) & 7) == 0 && frame[0] > frame)
+        {
+            frames[count++] = frame[1];
+            frame = static_cast<void**>(frame[0]);
+        }
+        length = std::snprintf(message, sizeof(message), "    pila del anfitrión (pc, lr, ...):\n");
+        write(STDERR_FILENO, message, length);
+        backtrace_symbols_fd(frames, count, STDERR_FILENO);
+#endif
         _exit(128 + signal);
     }
 }
@@ -159,10 +193,18 @@ int main(int argc, char** argv)
     FillImports();
     xex::Load(gXexPath);
 
-    // El hilo principal del juego es un hilo más del kernel; el programa termina cuando termina él.
+    // El hilo principal del juego es un hilo más del kernel. El hilo principal del programa
+    // queda para la ventana (macOS exige que la interfaz vaya en él); al cerrarla, termina todo.
+    // Con PROSTREET_NO_WINDOW=1 no hay ventana y el programa espera al hilo del juego.
     std::printf("Arrancando: punto de entrada 0x%08X\n\n", kEntryPoint);
     auto mainThread = kernel::CreateThread(kEntryPoint, 0, 0, kMainStackSize, false);
-    pthread_join(mainThread->host, nullptr);
-    std::printf("\nEl hilo principal terminó (código 0x%08X)\n", mainThread->exitCode);
-    return 0;
+    if (std::getenv("PROSTREET_NO_WINDOW"))
+    {
+        pthread_join(mainThread->host, nullptr);
+        std::printf("\nEl hilo principal terminó (código 0x%08X)\n", mainThread->exitCode);
+        return 0;
+    }
+    platform::RunWindow();
+    std::_Exit(0);
 }
+
