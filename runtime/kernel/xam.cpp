@@ -31,6 +31,15 @@ PPC_FUNC(__imp__XNotifyGetNext)
     ctx.r3.u64 = 0; // no hay notificaciones pendientes
 }
 
+// --- Idioma ----------------------------------------------------------------------------------
+
+// uint32_t XGetLanguage(): idioma de la consola.
+PPC_FUNC(__imp__XGetLanguage)
+{
+    (void)base;
+    ctx.r3.u64 = ConsoleLanguage();
+}
+
 // --- Audio -----------------------------------------------------------------------------------
 
 // NTSTATUS XAudioRegisterRenderDriverClient(XAUDIO_CALLBACK* callback, uint32_t* driver)
