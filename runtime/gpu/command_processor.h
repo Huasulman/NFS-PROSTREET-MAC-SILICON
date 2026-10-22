@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <vector>
 
 // Procesador de comandos de la GPU (Xenos), primera versión: no dibuja nada.
 //
@@ -16,6 +17,12 @@ namespace gpu
     // Direcciones físicas (las que usa la GPU) <-> direcciones del invitado (vista 0xA0000000).
     inline uint32_t PhysicalToGuest(uint32_t physical) { return 0xA0000000 | (physical & 0x1FFFFFFF); }
     inline uint32_t GuestToPhysical(uint32_t guest) { return guest & 0x1FFFFFFF; }
+
+    struct Shader
+    {
+        uint64_t hash = 0;
+        std::vector<uint32_t> code; // microcódigo (palabras en orden del anfitrión)
+    };
 
     void InitializeRingBuffer(uint32_t physical, uint32_t sizeLog2);
     void EnableReadPointerWriteBack(uint32_t physical, uint32_t blockLog2);

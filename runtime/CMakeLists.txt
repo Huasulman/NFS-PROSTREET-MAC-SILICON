@@ -36,6 +36,8 @@ add_executable(prostreet
     kernel/xam.cpp
     gpu/command_processor.cpp
     gpu/presenter.cpp
+    gpu/renderer.mm
+    gpu/shader_translator.cpp
     platform/window.mm
     kernel/xboxkrnl.cpp
     kernel/xex.cpp
@@ -46,4 +48,4 @@ target_compile_options(prostreet PRIVATE -g)
 target_link_libraries(prostreet PRIVATE ppc_recomp
     "-framework Cocoa" "-framework Metal" "-framework QuartzCore" "-framework ImageIO"
     "-framework CoreGraphics" "-framework UniformTypeIdentifiers")
-set_source_files_properties(platform/window.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+set_source_files_properties(platform/window.mm gpu/renderer.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")

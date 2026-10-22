@@ -2,6 +2,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <string>
 
@@ -55,9 +56,11 @@ namespace gpu
             for (uint32_t x = 0; x < width; x++)
             {
                 const uint32_t offset = gLinear ? (y * width + x) * 4 : TiledOffset(x, y, width, 2);
-                // 8_8_8_8 en memoria como A,R,G,B (big-endian): se pasa a BGRA del Mac.
-                const uint8_t* p = source + offset;
-                frame.pixels[size_t(y) * width + x] = uint32_t(p[3]) | (uint32_t(p[2]) << 8) | (uint32_t(p[1]) << 16) | 0xFF000000u;
+                // 8_8_8_8 como palabra little-endian 0xAARRGGBB (como lo escribe el resolve, sin
+                // intercambio de bytes): es directamente un píxel BGRA del Mac.
+                uint32_t value;
+                std::memcpy(&value, source + offset, 4);
+                frame.pixels[size_t(y) * width + x] = value | 0xFF000000u;
             }
         }
 

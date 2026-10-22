@@ -112,6 +112,11 @@ está implementado aparece como `[falta] Nombre r3=... lr=...` y devuelve 0.
   borra a negro y aún no se interpretan los dibujos
 - [x] Captura de shaders (`PROSTREET_SHADERS=carpeta`) y desensamblador de microcódigo de Xenos
   (`tools/xenos_disasm.py`): 8 shaders en la primera escena, con solo 10 instrucciones distintas
-- [ ] Renderer: traductor de shaders a MSL, vértices, texturas, resolves (EDRAM → memoria)
+- [x] **Primera imagen**: traductor de shaders de Xenos a MSL (`runtime/gpu/shader_translator`),
+  renderer en Metal (`runtime/gpu/renderer.mm`) con EDRAM como textura, vértices e índices leídos
+  directamente de la memoria del juego, texturas DXT1/3/5, 8888, 8 y 8_8, mezcla de color y
+  resolves. Se ven el vídeo del logo de EA y el aviso de seguridad con su texto
+- [ ] Renderer: profundidad, MSAA y *predicated tiling*, listas de rectángulos, más formatos de
+  textura (p. ej. 24_8), mipmaps, rendimiento (los resolves hacen lecturas síncronas)
 - [ ] Resto del kernel (`xboxkrnl.exe`) y `xam.xex`
 - [ ] Gráficos, audio, input

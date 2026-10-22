@@ -1,0 +1,488 @@
+#import <Metal/Metal.h>
+
+#include "renderer.h"
+
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <unordered_map>
+#include <vector>
+
+#include "presenter.h"
+#include "shader_translator.h"
+#include "../memory.h"
+
+namespace gpu
+{
+    namespace
+    {
+        // Registros de la GPU que usa el renderer (índices de 32 bits, según Xenia).
+        constexpr uint32_t kRegSurfaceInfo = 0x2000;  // RB_SURFACE_INFO
+        constexpr uint32_t kRegColorMask = 0x2104;    // RB_COLOR_MASK
+        constexpr uint32_t kRegIndexOffset = 0x2102;  // VGT_INDX_OFFSET
+        constexpr uint32_t kRegViewportXScale = 0x210F; // PA_CL_VPORT_XSCALE (y luego XOFFSET, YSCALE...)
+        constexpr uint32_t kRegBlendControl0 = 0x2201; // RB_BLENDCONTROL0
+        constexpr uint32_t kRegVteControl = 0x2206;   // PA_CL_VTE_CNTL
+        constexpr uint32_t kRegCopyControl = 0x2318;  // RB_COPY_CONTROL
+        constexpr uint32_t kRegCopyDestBase = 0x2319;
+        constexpr uint32_t kRegCopyDestPitch = 0x231A;
+        constexpr uint32_t kRegCopyDestInfo = 0x231B;
+        constexpr uint32_t kRegColorClear = 0x231E;   // RB_COLOR_CLEAR
+        constexpr uint32_t kRegAluConstants = 0x4000; // 256 float4 de vértices + 256 de píxeles
+        constexpr uint32_t kRegFetchConstants = 0x4800;
+        constexpr uint32_t kRegBoolConstants = 0x4900;
+
+        constexpr uint32_t kTargetWidth = 1280, kTargetHeight = 720;
+
+        bool Trace() { return std::getenv("PROSTREET_TRACE") != nullptr; }
+
+        float AsFloat(uint32_t bits)
+        {
+            float value;
+            std::memcpy(&value, &bits, 4);
+            return value;
+        }
+
+        struct Texture
+        {
+            id<MTLTexture> texture;
+            uint64_t hash = 0;
+        };
+
+        struct Renderer
+        {
+            id<MTLDevice> device;
+            id<MTLCommandQueue> queue;
+            id<MTLBuffer> memory;      // memoria física del juego, sin copia
+            id<MTLTexture> target;     // la "EDRAM": destino de dibujo
+            id<MTLCommandBuffer> commands;
+            id<MTLRenderCommandEncoder> encoder;
+            bool clearPending = true;
+            MTLClearColor clearColor = MTLClearColorMake(0, 0, 0, 1);
+
+            std::unordered_map<uint64_t, id<MTLFunction>> functions;
+            std::unordered_map<uint64_t, bool> failedShaders;
+            std::unordered_map<uint64_t, std::vector<uint32_t>> textureSlots; // texturas de cada shader
+            std::unordered_map<uint64_t, id<MTLRenderPipelineState>> pipelines;
+            std::unordered_map<uint64_t, Texture> textures;
+            std::unordered_map<uint32_t, id<MTLSamplerState>> samplers;
+            id<MTLTexture> missingTexture;
+
+            uint64_t draws = 0, skipped = 0, resolves = 0;
+
+            bool Initialize()
+            {
+                device = MTLCreateSystemDefaultDevice();
+                if (!device)
+                    return false;
+                queue = [device newCommandQueue];
+                memory = [device newBufferWithBytesNoCopy:memory::Translate(memory::kPhysicalBase) length:memory::kPhysicalSize
+                    options:MTLResourceStorageModeShared deallocator:nil];
+
+                MTLTextureDescriptor* descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                    width:kTargetWidth height:kTargetHeight mipmapped:NO];
+                descriptor.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+                descriptor.storageMode = MTLStorageModeShared;
+                target = [device newTextureWithDescriptor:descriptor];
+
+                // Textura de 1x1 magenta para formatos aún no soportados (se ven enseguida).
+                MTLTextureDescriptor* small = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:1 height:1 mipmapped:NO];
+                missingTexture = [device newTextureWithDescriptor:small];
+                const uint32_t magenta = 0xFFFF00FF;
+                [missingTexture replaceRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:0 withBytes:&magenta bytesPerRow:4];
+                std::fprintf(stderr, "[render] Metal: %s\n", device.name.UTF8String);
+                return memory != nil && target != nil;
+            }
+
+            id<MTLFunction> Function(const Shader& shader, bool pixel, std::vector<uint32_t>* slots)
+            {
+                auto it = functions.find(shader.hash);
+                if (it != functions.end())
+                {
+                    if (slots)
+                        *slots = textureSlots[shader.hash];
+                    return it->second;
+                }
+                if (failedShaders.count(shader.hash))
+                    return nil;
+
+                TranslatedShader translated = TranslateShader(pixel, shader.code, shader.hash);
+                NSError* error = nil;
+                id<MTLLibrary> library = [device newLibraryWithSource:[NSString stringWithUTF8String:translated.source.c_str()] options:nil error:&error];
+                id<MTLFunction> function = [library newFunctionWithName:[NSString stringWithUTF8String:translated.entry.c_str()]];
+                if (!function)
+                {
+                    std::fprintf(stderr, "[render] no compila %s: %s\n", translated.entry.c_str(), error ? error.localizedDescription.UTF8String : "?");
+                    failedShaders[shader.hash] = true;
+                    return nil;
+                }
+                if (!translated.warnings.empty())
+                    std::fprintf(stderr, "[render] %s: %s\n", translated.entry.c_str(), translated.warnings.c_str());
+                functions[shader.hash] = function;
+                textureSlots[shader.hash] = translated.textures;
+                if (slots)
+                    *slots = translated.textures;
+                return function;
+            }
+
+            static MTLBlendFactor BlendFactor(uint32_t value)
+            {
+                switch (value)
+                {
+                case 0: return MTLBlendFactorZero;
+                case 1: return MTLBlendFactorOne;
+                case 4: return MTLBlendFactorSourceColor;
+                case 5: return MTLBlendFactorOneMinusSourceColor;
+                case 6: return MTLBlendFactorSourceAlpha;
+                case 7: return MTLBlendFactorOneMinusSourceAlpha;
+                case 8: return MTLBlendFactorDestinationColor;
+                case 9: return MTLBlendFactorOneMinusDestinationColor;
+                case 10: return MTLBlendFactorDestinationAlpha;
+                case 11: return MTLBlendFactorOneMinusDestinationAlpha;
+                case 12: return MTLBlendFactorBlendColor;
+                case 13: return MTLBlendFactorOneMinusBlendColor;
+                case 14: return MTLBlendFactorBlendAlpha;
+                case 15: return MTLBlendFactorOneMinusBlendAlpha;
+                case 16: return MTLBlendFactorSourceAlphaSaturated;
+                default: return MTLBlendFactorOne;
+                }
+            }
+
+            static MTLBlendOperation BlendOperation(uint32_t value)
+            {
+                switch (value)
+                {
+                case 1: return MTLBlendOperationSubtract;
+                case 2: return MTLBlendOperationMin;
+                case 3: return MTLBlendOperationMax;
+                case 4: return MTLBlendOperationReverseSubtract;
+                default: return MTLBlendOperationAdd;
+                }
+            }
+
+            id<MTLRenderPipelineState> Pipeline(const DrawCall& draw, std::vector<uint32_t>& slots)
+            {
+                const uint32_t blend = draw.registers[kRegBlendControl0];
+                const uint32_t mask = draw.registers[kRegColorMask] & 0xF;
+                uint64_t key = draw.vertexShader->hash * 31 + draw.pixelShader->hash;
+                key = key * 1000003 + blend;
+                key = key * 17 + mask;
+
+                id<MTLFunction> vertex = Function(*draw.vertexShader, false, nullptr);
+                id<MTLFunction> fragment = Function(*draw.pixelShader, true, &slots);
+                if (!vertex || !fragment)
+                    return nil;
+                auto it = pipelines.find(key);
+                if (it != pipelines.end())
+                    return it->second;
+
+                MTLRenderPipelineDescriptor* descriptor = [[MTLRenderPipelineDescriptor alloc] init];
+                descriptor.vertexFunction = vertex;
+                descriptor.fragmentFunction = fragment;
+                MTLRenderPipelineColorAttachmentDescriptor* color = descriptor.colorAttachments[0];
+                color.pixelFormat = target.pixelFormat;
+                color.writeMask = (mask & 1 ? MTLColorWriteMaskRed : 0) | (mask & 2 ? MTLColorWriteMaskGreen : 0) |
+                                  (mask & 4 ? MTLColorWriteMaskBlue : 0) | (mask & 8 ? MTLColorWriteMaskAlpha : 0);
+                // RB_BLENDCONTROL: srcblend 0-4, comb 5-7, destblend 8-12, y lo mismo para alfa desde el bit 16.
+                const bool opaque = (blend & 0x1FFF) == 0x0001 && ((blend >> 16) & 0x1FFF) == 0x0001;
+                color.blendingEnabled = !opaque;
+                color.sourceRGBBlendFactor = BlendFactor(blend & 0x1F);
+                color.rgbBlendOperation = BlendOperation((blend >> 5) & 7);
+                color.destinationRGBBlendFactor = BlendFactor((blend >> 8) & 0x1F);
+                color.sourceAlphaBlendFactor = BlendFactor((blend >> 16) & 0x1F);
+                color.alphaBlendOperation = BlendOperation((blend >> 21) & 7);
+                color.destinationAlphaBlendFactor = BlendFactor((blend >> 24) & 0x1F);
+
+                NSError* error = nil;
+                id<MTLRenderPipelineState> pipeline = [device newRenderPipelineStateWithDescriptor:descriptor error:&error];
+                if (!pipeline)
+                    std::fprintf(stderr, "[render] pipeline: %s\n", error.localizedDescription.UTF8String);
+                pipelines[key] = pipeline;
+                return pipeline;
+            }
+
+            // Textura a partir de una constante de fetch (6 palabras).
+            id<MTLTexture> TextureFor(const uint32_t* fetch)
+            {
+                const bool tiled = fetch[0] >> 31;
+                const uint32_t pitch = ((fetch[0] >> 22) & 0x1FF) * 32;
+                const uint32_t format = fetch[1] & 0x3F, endian = (fetch[1] >> 6) & 3;
+                const uint32_t base = fetch[1] & 0xFFFFF000;
+                const uint32_t width = (fetch[2] & 0x1FFF) + 1, height = ((fetch[2] >> 13) & 0x1FFF) + 1;
+
+                MTLPixelFormat pixelFormat;
+                uint32_t blockSize = 1, bytesPerBlock;
+                switch (format)
+                {
+                case 2: pixelFormat = MTLPixelFormatR8Unorm; bytesPerBlock = 1; break;
+                case 10: pixelFormat = MTLPixelFormatRG8Unorm; bytesPerBlock = 2; break;
+                case 6: pixelFormat = MTLPixelFormatRGBA8Unorm; bytesPerBlock = 4; break;
+                case 18: pixelFormat = MTLPixelFormatBC1_RGBA; blockSize = 4; bytesPerBlock = 8; break;
+                case 19: pixelFormat = MTLPixelFormatBC2_RGBA; blockSize = 4; bytesPerBlock = 16; break;
+                case 20: pixelFormat = MTLPixelFormatBC3_RGBA; blockSize = 4; bytesPerBlock = 16; break;
+                default:
+                {
+                    static std::unordered_map<uint32_t, int> reported;
+                    if (!reported[format]++)
+                        std::fprintf(stderr, "[render] formato de textura %u aún no soportado (se ve magenta)\n", format);
+                    return missingTexture;
+                }
+                }
+                if (base == 0 || width > 8192 || height > 8192)
+                    return missingTexture;
+
+                const uint32_t blocksX = (width + blockSize - 1) / blockSize, blocksY = (height + blockSize - 1) / blockSize;
+                const uint32_t pitchBlocks = std::max(pitch / blockSize, blocksX);
+                uint32_t log2Bytes = 0;
+                while ((1u << log2Bytes) < bytesPerBlock)
+                    log2Bytes++;
+
+                // Lectura (quitando el mosaico) e intercambio de bytes.
+                std::vector<uint8_t> data(size_t(blocksX) * blocksY * bytesPerBlock);
+                const auto* source = static_cast<const uint8_t*>(memory::Translate(0xA0000000 | (base & 0x1FFFFFFF)));
+                for (uint32_t by = 0; by < blocksY; by++)
+                {
+                    for (uint32_t bx = 0; bx < blocksX; bx++)
+                    {
+                        const uint32_t offset = tiled ? TiledOffset(bx, by, pitchBlocks, log2Bytes) : (by * pitchBlocks + bx) * bytesPerBlock;
+                        std::memcpy(&data[(size_t(by) * blocksX + bx) * bytesPerBlock], source + offset, bytesPerBlock);
+                    }
+                }
+                for (size_t i = 0; i + 3 < data.size(); i += 4)
+                {
+                    uint32_t word;
+                    std::memcpy(&word, &data[i], 4);
+                    switch (endian)
+                    {
+                    case 1: word = ((word & 0x00FF00FF) << 8) | ((word >> 8) & 0x00FF00FF); break;
+                    case 2: word = __builtin_bswap32(word); break;
+                    case 3: word = (word << 16) | (word >> 16); break;
+                    default: break;
+                    }
+                    std::memcpy(&data[i], &word, 4);
+                }
+
+                uint64_t hash = 1469598103934665603ull;
+                for (size_t i = 0; i < data.size(); i += 64)
+                    hash = (hash ^ data[i]) * 1099511628211ull ^ (data.size() > i + 32 ? data[i + 32] : 0);
+                const uint64_t key = (uint64_t(base) << 32) ^ (uint64_t(format) << 26) ^ (uint64_t(width) << 13) ^ height;
+                Texture& cached = textures[key];
+                if (cached.texture && cached.hash == hash)
+                    return cached.texture;
+
+                MTLTextureDescriptor* descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pixelFormat
+                    width:width height:height mipmapped:NO];
+                cached.texture = [device newTextureWithDescriptor:descriptor];
+                [cached.texture replaceRegion:MTLRegionMake2D(0, 0, width, height) mipmapLevel:0 withBytes:data.data()
+                    bytesPerRow:blocksX * bytesPerBlock];
+                cached.hash = hash;
+                if (Trace())
+                    std::fprintf(stderr, "[render] textura 0x%08X %ux%u formato %u%s\n", base, width, height, format, tiled ? " (mosaico)" : "");
+                return cached.texture;
+            }
+
+            id<MTLSamplerState> SamplerFor(const uint32_t* fetch)
+            {
+                // clamp_x/y: bits 10-12 y 13-15 de la palabra 0; filtros mag/min: bits 19-20 y 21-22 de la palabra 3.
+                const uint32_t key = ((fetch[0] >> 10) & 0x3F) | (((fetch[3] >> 19) & 0xF) << 6);
+                auto it = samplers.find(key);
+                if (it != samplers.end())
+                    return it->second;
+                auto address = [](uint32_t clamp) {
+                    switch (clamp)
+                    {
+                    case 0: return MTLSamplerAddressModeRepeat;
+                    case 1: return MTLSamplerAddressModeMirrorRepeat;
+                    default: return MTLSamplerAddressModeClampToEdge;
+                    }
+                };
+                MTLSamplerDescriptor* descriptor = [[MTLSamplerDescriptor alloc] init];
+                descriptor.sAddressMode = address((fetch[0] >> 10) & 7);
+                descriptor.tAddressMode = address((fetch[0] >> 13) & 7);
+                descriptor.magFilter = ((fetch[3] >> 19) & 3) ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
+                descriptor.minFilter = ((fetch[3] >> 21) & 3) ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
+                id<MTLSamplerState> sampler = [device newSamplerStateWithDescriptor:descriptor];
+                samplers[key] = sampler;
+                return sampler;
+            }
+
+            void BeginPass()
+            {
+                if (encoder)
+                    return;
+                commands = [queue commandBuffer];
+                MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
+                pass.colorAttachments[0].texture = target;
+                pass.colorAttachments[0].loadAction = clearPending ? MTLLoadActionClear : MTLLoadActionLoad;
+                pass.colorAttachments[0].clearColor = clearColor;
+                pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+                clearPending = false;
+                encoder = [commands renderCommandEncoderWithDescriptor:pass];
+            }
+
+            void EndPass(bool wait)
+            {
+                if (encoder)
+                {
+                    [encoder endEncoding];
+                    encoder = nil;
+                }
+                if (commands)
+                {
+                    [commands commit];
+                    if (wait)
+                        [commands waitUntilCompleted];
+                    commands = nil;
+                }
+            }
+
+            bool Draw(const DrawCall& draw)
+            {
+                // De momento: listas de triángulos, tiras y listas de quads.
+                const uint32_t primitive = draw.primitive;
+                if ((primitive != 4 && primitive != 6 && primitive != 13) || draw.count == 0 ||
+                    draw.vertexShader->code.empty() || draw.pixelShader->code.empty())
+                {
+                    skipped++;
+                    return false;
+                }
+                std::vector<uint32_t> textureSlots;
+                id<MTLRenderPipelineState> pipeline = Pipeline(draw, textureSlots);
+                if (!pipeline)
+                {
+                    skipped++;
+                    return false;
+                }
+
+                BeginPass();
+                [encoder setRenderPipelineState:pipeline];
+                [encoder setCullMode:MTLCullModeNone];
+
+                DrawState state{};
+                state.primitive = primitive;
+                state.indexSize = draw.indexSize;
+                state.indexBase = draw.indexBase;
+                state.indexEndian = draw.indexEndian;
+                state.indexOffset = draw.registers[kRegIndexOffset];
+                state.vte = draw.registers[kRegVteControl];
+                for (int i = 0; i < 3; i++)
+                {
+                    state.viewportScale[i] = AsFloat(draw.registers[kRegViewportXScale + i * 2]);
+                    state.viewportOffset[i] = AsFloat(draw.registers[kRegViewportXScale + i * 2 + 1]);
+                }
+                state.targetSize[0] = kTargetWidth;
+                state.targetSize[1] = kTargetHeight;
+                std::memcpy(state.bools, &draw.registers[kRegBoolConstants], sizeof(state.bools));
+
+                const uint32_t* vertexConstants = &draw.registers[kRegAluConstants];
+                const uint32_t* pixelConstants = &draw.registers[kRegAluConstants + 256 * 4];
+                const uint32_t* fetchConstants = &draw.registers[kRegFetchConstants];
+                [encoder setVertexBuffer:memory offset:0 atIndex:0];
+                [encoder setVertexBytes:vertexConstants length:256 * 16 atIndex:1];
+                [encoder setVertexBytes:fetchConstants length:32 * 6 * 4 atIndex:2];
+                [encoder setVertexBytes:&state length:sizeof(state) atIndex:3];
+                [encoder setFragmentBuffer:memory offset:0 atIndex:0];
+                [encoder setFragmentBytes:pixelConstants length:256 * 16 atIndex:1];
+                [encoder setFragmentBytes:fetchConstants length:32 * 6 * 4 atIndex:2];
+                [encoder setFragmentBytes:&state length:sizeof(state) atIndex:3];
+                for (uint32_t slot : textureSlots)
+                {
+                    [encoder setFragmentTexture:TextureFor(&fetchConstants[slot * 6]) atIndex:slot];
+                    [encoder setFragmentSamplerState:SamplerFor(&fetchConstants[slot * 6]) atIndex:slot];
+                }
+
+                const uint32_t vertices = primitive == 13 ? draw.count / 4 * 6 : draw.count;
+                [encoder drawPrimitives:primitive == 6 ? MTLPrimitiveTypeTriangleStrip : MTLPrimitiveTypeTriangle
+                    vertexStart:0 vertexCount:vertices];
+                draws++;
+                return true;
+            }
+
+            void Resolve(const uint32_t* registers)
+            {
+                resolves++;
+                const uint32_t control = registers[kRegCopyControl];
+                const uint32_t destBase = registers[kRegCopyDestBase];
+                const uint32_t destPitch = registers[kRegCopyDestPitch] & 0x3FFF;
+                const uint32_t destHeight = (registers[kRegCopyDestPitch] >> 16) & 0x3FFF;
+                const uint32_t destInfo = registers[kRegCopyDestInfo];
+                const uint32_t destEndian = destInfo & 7, destFormat = (destInfo >> 7) & 0x3F;
+                const uint32_t source = control & 7;
+
+                // Copiar la EDRAM a memoria (solo color, formato 8_8_8_8 por ahora).
+                if (source < 4 && destFormat == 6 && destBase && destPitch && destHeight)
+                {
+                    EndPass(true);
+                    const uint32_t width = std::min(destPitch, kTargetWidth), height = std::min(destHeight, kTargetHeight);
+                    std::vector<uint32_t> pixels(size_t(width) * height);
+                    [target getBytes:pixels.data() bytesPerRow:width * 4 fromRegion:MTLRegionMake2D(0, 0, width, height) mipmapLevel:0];
+                    auto* dest = static_cast<uint8_t*>(memory::Translate(0xA0000000 | (destBase & 0x1FFFFFFF)));
+                    for (uint32_t y = 0; y < height; y++)
+                    {
+                        for (uint32_t x = 0; x < width; x++)
+                        {
+                            // RGBA8 de Metal (R en el byte bajo) -> palabra 0xAARRGGBB en memoria.
+                            const uint32_t rgba = pixels[size_t(y) * width + x];
+                            uint32_t value = (rgba & 0xFF00FF00) | ((rgba & 0xFF) << 16) | ((rgba >> 16) & 0xFF);
+                            switch (destEndian)
+                            {
+                            case 1: value = ((value & 0x00FF00FF) << 8) | ((value >> 8) & 0x00FF00FF); break;
+                            case 2: value = __builtin_bswap32(value); break;
+                            case 3: value = (value << 16) | (value >> 16); break;
+                            default: break;
+                            }
+                            std::memcpy(dest + TiledOffset(x, y, destPitch, 2), &value, 4);
+                        }
+                    }
+                }
+
+                // Borrado tras la copia (RB_COPY_CONTROL bit 8): en la siguiente pasada.
+                if (control & 0x100)
+                {
+                    EndPass(false);
+                    const uint32_t clear = registers[kRegColorClear];
+                    clearColor = MTLClearColorMake(((clear >> 16) & 0xFF) / 255.0, ((clear >> 8) & 0xFF) / 255.0,
+                        (clear & 0xFF) / 255.0, ((clear >> 24) & 0xFF) / 255.0);
+                    clearPending = true;
+                }
+            }
+        };
+
+        Renderer* gRenderer = nullptr;
+        bool gUnavailable = false;
+
+        Renderer* Get()
+        {
+            if (!gRenderer && !gUnavailable)
+            {
+                gRenderer = new Renderer();
+                if (!gRenderer->Initialize())
+                {
+                    std::fprintf(stderr, "[render] Metal no está disponible: no se dibujará nada\n");
+                    delete gRenderer;
+                    gRenderer = nullptr;
+                    gUnavailable = true;
+                }
+            }
+            return gRenderer;
+        }
+    }
+
+    bool RendererDraw(const DrawCall& draw)
+    {
+        @autoreleasepool
+        {
+            Renderer* renderer = Get();
+            return renderer && renderer->Draw(draw);
+        }
+    }
+
+    void RendererResolve(const uint32_t* registers)
+    {
+        @autoreleasepool
+        {
+            if (Renderer* renderer = Get())
+                renderer->Resolve(registers);
+        }
+    }
+}
