@@ -95,6 +95,7 @@ PPC_FUNC(__imp__XamShowDeviceSelectorUI)
     const uint32_t deviceId = ctx.r7.u32, overlapped = ctx.r8.u32;
     if (deviceId)
         memory::Write32(deviceId, kHardDrive);
+    ShowSystemUi();
     if (Trace())
         std::fprintf(stderr, "[xam] XamShowDeviceSelectorUI: se elige el disco duro\n");
     Finish(ctx, overlapped, kErrorSuccess);

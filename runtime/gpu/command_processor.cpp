@@ -55,6 +55,7 @@ namespace gpu
             uint32_t interruptCallback = 0;
             uint32_t interruptUserData = 0;
             std::array<uint32_t, kRegisterCount> registers{};
+            uint64_t constantsVersion = 1; // cambia al escribir constantes ALU / fetch / bool / loop
 
             // Predicated tiling: cada paquete predicado solo se ejecuta si su franja está activa.
             uint64_t binMask = ~0ull, binSelect = ~0ull;
@@ -104,6 +105,12 @@ namespace gpu
             if (index >= kRegisterCount)
                 return;
             gState.registers[index] = value;
+            // Las constantes de shader no se copian a la vista MMIO: el juego no las lee de vuelta.
+            if (index >= 0x4000 && index < 0x4920)
+            {
+                gState.constantsVersion++;
+                return;
+            }
             memory::Write32(kMmioBase + index * 4, value);
 
             // Registros scratch: si su bit de SCRATCH_UMSK está activo, se copian a memoria.
@@ -319,7 +326,10 @@ namespace gpu
                         }
                         break;
                     }
-                    std::this_thread::sleep_for(std::chrono::microseconds(50));
+                    if (Clock::now() - (deadline - std::chrono::seconds(1)) < std::chrono::milliseconds(2))
+                        std::this_thread::yield();
+                    else
+                        std::this_thread::sleep_for(std::chrono::microseconds(20));
                 }
                 break;
             }
@@ -401,7 +411,7 @@ namespace gpu
                 {
                     RendererResolve(gState.registers.data());
                 }
-                else if (mode == 4) // 5 = solo profundidad: sin búfer de profundidad todavía, se omite
+                else if (mode == 4 || mode == 5) // 5 = solo profundidad
                 {
                     DrawCall draw{};
                     draw.registers = gState.registers.data();
@@ -409,6 +419,8 @@ namespace gpu
                     draw.pixelShader = &gState.pixelShader;
                     draw.primitive = drawInitiator & 0x3F;
                     draw.count = drawInitiator >> 16;
+                    draw.depthOnly = mode == 5;
+                    draw.constantsVersion = gState.constantsVersion;
                     const uint32_t source = (drawInitiator >> 6) & 3; // 0 = índices en memoria, 2 = automáticos
                     if (source == 0 && opcode == 0x22)
                     {
@@ -471,12 +483,22 @@ namespace gpu
         // Procesador de comandos: vigila CP_RB_WPTR y ejecuta lo nuevo del ring.
         void GpuThread(PPCContext&, uint8_t*)
         {
+            // Sin trabajo, primero se cede el núcleo (yield) y solo tras 1 ms sin nada se duerme: D3D
+            // envía cada fotograma en muchos trozos y dormir tras cada uno retrasa a todo el juego.
+            auto lastWork = Clock::now();
             while (true)
             {
                 const uint32_t writePointer = ReadRegister(kRegCpRbWptr);
                 if (gState.ringDwords && writePointer != gState.readPointer && writePointer < gState.ringDwords)
+                {
                     ExecuteRing(writePointer);
-                std::this_thread::sleep_for(std::chrono::microseconds(100));
+                    lastWork = Clock::now();
+                    continue;
+                }
+                if (Clock::now() - lastWork < std::chrono::milliseconds(1))
+                    std::this_thread::yield();
+                else
+                    std::this_thread::sleep_for(std::chrono::microseconds(100));
             }
         }
 

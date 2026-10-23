@@ -22,9 +22,15 @@ namespace gpu
         uint32_t indexSize;         // 0 = automáticos, 2 o 4 bytes
         uint32_t indexBase;         // dirección física
         uint32_t indexEndian;
+        bool depthOnly;             // RB_MODECONTROL = 5: solo profundidad, sin color
+        uint64_t constantsVersion;  // cambia cuando cambia alguna constante de shader
     };
 
     // Devuelven false si el renderer no está disponible (sin GPU Metal).
     bool RendererDraw(const DrawCall& draw);
     void RendererResolve(const uint32_t* registers);
+
+    // Lee el front buffer de la copia en la GPU de su resolve (píxeles BGRA sin mosaico).
+    // Devuelve false si no hay ninguna: entonces hay que leerlo de la memoria del juego.
+    bool RendererReadFrame(uint32_t physical, uint32_t width, uint32_t height, uint32_t* pixels);
 }

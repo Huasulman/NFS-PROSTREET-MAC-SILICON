@@ -3,6 +3,7 @@
 #include "renderer.h"
 
 #include <cstdio>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <unordered_map>
@@ -25,6 +26,12 @@ namespace gpu
         constexpr uint32_t kRegVteControl = 0x2206;   // PA_CL_VTE_CNTL
         constexpr uint32_t kRegWindowOffset = 0x2080; // PA_SC_WINDOW_OFFSET
         constexpr uint32_t kRegModeControl = 0x2205;  // PA_SU_SC_MODE_CNTL
+        constexpr uint32_t kRegDepthInfo = 0x2002;    // RB_DEPTH_INFO (bit 16: profundidad en coma flotante)
+        constexpr uint32_t kRegDepthControl = 0x2200; // RB_DEPTHCONTROL
+        constexpr uint32_t kRegStencilBack = 0x210C;  // RB_STENCILREFMASK_BF
+        constexpr uint32_t kRegStencilFront = 0x210D; // RB_STENCILREFMASK: ref 0-7, máscara 8-15, escritura 16-23
+        constexpr uint32_t kRegDepthClear = 0x231D;   // RB_DEPTH_CLEAR: profundidad en 8-31, stencil en 0-7
+        constexpr MTLPixelFormat kDepthFormat = MTLPixelFormatDepth32Float_Stencil8;
 
         // Desplazamiento de ventana (x, y con signo de 15 bits) si el modo lo aplica a los
         // vértices (bit 16). Con "predicated tiling" el juego dibuja la escena en franjas: cada
@@ -62,6 +69,7 @@ namespace gpu
         {
             id<MTLTexture> texture;
             uint64_t hash = 0; // huella de la memoria original (con mosaico, sin intercambiar)
+            uint64_t epoch = 0; // época en la que se comprobó por última vez (ver Renderer::epoch)
         };
 
         // Imagen que ha escrito un resolve (con mosaico, 8_8_8_8): se guarda también una copia en
@@ -74,6 +82,10 @@ namespace gpu
             id<MTLTexture> texture; // RGBA8 tal como está en el renderer
             id<MTLTexture> view;    // la misma, con R y B cambiados: lo que lee la textura del juego
             uint64_t hash = 0;      // de la memoria de toda la imagen tras el último resolve
+            // Escritura diferida: la memoria del juego aún no tiene este rectángulo (en filas de la imagen).
+            bool pending = false;
+            uint64_t validEpoch = 0; // época en la que su memoria se comprobó (hash) por última vez
+            uint32_t pendingLeft = 0, pendingTop = 0, pendingRight = 0, pendingBottom = 0;
         };
 
         // Bytes de la memoria original de una imagen con mosaico (las filas van de 32 en 32).
@@ -109,6 +121,11 @@ namespace gpu
             id<MTLCommandQueue> queue;
             id<MTLBuffer> memory;      // memoria física del juego, sin copia
             id<MTLTexture> target;     // la "EDRAM": destino de dibujo
+            id<MTLTexture> depth;      // y su profundidad / stencil
+            bool depthClearPending = true;
+            double clearDepth = 1.0;
+            uint8_t clearStencil = 0;
+            std::unordered_map<uint64_t, id<MTLDepthStencilState>> depthStates;
             id<MTLCommandBuffer> commands;
             id<MTLRenderCommandEncoder> encoder;
             bool clearPending = true;
@@ -117,13 +134,98 @@ namespace gpu
             std::unordered_map<uint64_t, id<MTLFunction>> functions;
             std::unordered_map<uint64_t, bool> failedShaders;
             std::unordered_map<uint64_t, std::vector<uint32_t>> textureSlots; // texturas de cada shader
+            std::unordered_map<uint64_t, std::vector<std::pair<uint32_t, uint32_t>>> constantRanges; // de cada shader
             std::unordered_map<uint64_t, id<MTLRenderPipelineState>> pipelines;
             std::unordered_map<uint64_t, Texture> textures;
             std::vector<ResolvedSurface> surfaces;
+
+            // Por ranura de textura: la última constante de fetch vista, su textura, su sampler y en
+            // qué época. Muchos dibujos seguidos usan las mismas texturas.
+            struct SlotMemo
+            {
+                uint32_t fetch[6] = {};
+                uint64_t epoch = 0;
+                id<MTLTexture> texture;
+                id<MTLSamplerState> sampler;
+            };
+            SlotMemo slotMemos[32];
+            uint64_t lastPipelineKey = 0;
+            id<MTLRenderPipelineState> lastPipeline;
+            std::vector<uint32_t> lastPipelineSlots;
+            id<MTLCommandBuffer> lastCommit;   // el último trabajo enviado a la GPU, para esperarlo
+            // Época: cambia con cada resolve y cada fotograma presentado. Una textura ya comprobada
+            // en la época actual no se vuelve a comprobar (su memoria solo cambia entre medias).
+            uint64_t epoch = 1;
+            // PROSTREET_RESOLVE_WRITEBACK=1: escribir cada resolve en la memoria del juego en el acto.
+            const bool immediateWriteback = std::getenv("PROSTREET_RESOLVE_WRITEBACK") != nullptr;
             std::unordered_map<uint32_t, id<MTLSamplerState>> samplers;
             id<MTLTexture> missingTexture;
 
             uint64_t draws = 0, skipped = 0, resolves = 0;
+
+            // Constantes de los shaders (ALU de vértices y de píxeles, y de fetch) en un búfer
+            // circular: se copian solo cuando cambian, no en cada dibujo.
+            static constexpr size_t kRingSize = 64u << 20;
+            id<MTLBuffer> constantRing;
+            size_t ringOffset = 0;
+            id<MTLCommandBuffer> halfCommit[2]; // último trabajo que usó cada mitad del búfer
+            uint64_t uploadedVersion = 0;
+            uint64_t uploadedVertexShader = 0, uploadedPixelShader = 0;
+
+            struct ConstantOffsets
+            {
+                size_t vertex = 0, pixel = 0, fetch = 0; // desplazamientos a enlazar (buffer 1 y 2)
+            };
+            ConstantOffsets constantOffsets;
+
+            // Reserva espacio para los registros [first, last] de un banco de constantes de 16 bytes y
+            // devuelve el desplazamiento a enlazar (alineado a 256) con el que c[first] cae en lo reservado.
+            size_t Allocate(uint32_t first, uint32_t last, uint32_t stride)
+            {
+                const size_t low = size_t(first) * stride, high = size_t(last + 1) * stride;
+                const size_t oldHalf = std::min<size_t>(ringOffset * 2 / kRingSize, 1);
+                size_t bind = ringOffset > low ? (ringOffset - low + 255) & ~size_t(255) : 0;
+                if (bind + high > kRingSize) // vuelta al principio
+                    bind = 0;
+                // Al entrar en la otra mitad del búfer se espera al trabajo que la usó la vez anterior
+                // (normalmente ya terminado); el actual se envía para poder esperarlo después.
+                const size_t newHalf = (bind + high - 1) * 2 / kRingSize;
+                if (newHalf != oldHalf)
+                {
+                    EndPass(false);
+                    halfCommit[oldHalf] = lastCommit;
+                    if (halfCommit[newHalf] && halfCommit[newHalf] != lastCommit)
+                        [halfCommit[newHalf] waitUntilCompleted];
+                    halfCommit[newHalf] = nil;
+                }
+                ringOffset = bind + high;
+                return bind;
+            }
+
+            // Solo se copian los rangos de constantes que usan los shaders del dibujo.
+            const ConstantOffsets& UploadConstants(const DrawCall& draw)
+            {
+                const uint64_t vertexShader = draw.vertexShader->hash, pixelShader = draw.pixelShader->hash;
+                if (draw.constantsVersion == uploadedVersion && vertexShader == uploadedVertexShader && pixelShader == uploadedPixelShader)
+                    return constantOffsets;
+                auto* ring = static_cast<uint8_t*>(constantRing.contents);
+                auto upload = [&](const std::vector<std::pair<uint32_t, uint32_t>>& ranges, uint32_t bank) -> size_t {
+                    if (ranges.empty())
+                        return 0;
+                    const size_t bind = Allocate(ranges.front().first, ranges.back().first + ranges.back().second - 1, 16);
+                    for (const auto& [first, count] : ranges)
+                        std::memcpy(ring + bind + first * 16, &draw.registers[kRegAluConstants + bank * 4 + first * 4], count * 16);
+                    return bind;
+                };
+                constantOffsets.vertex = upload(constantRanges[vertexShader], 0);
+                constantOffsets.pixel = upload(constantRanges[pixelShader], 256);
+                constantOffsets.fetch = Allocate(0, 0, 32 * 6 * 4);
+                std::memcpy(ring + constantOffsets.fetch, &draw.registers[kRegFetchConstants], 32 * 6 * 4);
+                uploadedVertexShader = vertexShader;
+                uploadedPixelShader = pixelShader;
+                uploadedVersion = draw.constantsVersion;
+                return constantOffsets;
+            }
 
             bool Initialize()
             {
@@ -139,12 +241,18 @@ namespace gpu
                 descriptor.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
                 descriptor.storageMode = MTLStorageModeShared;
                 target = [device newTextureWithDescriptor:descriptor];
+                MTLTextureDescriptor* depthDescriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:kDepthFormat
+                    width:kTargetWidth height:kTargetHeight mipmapped:NO];
+                depthDescriptor.usage = MTLTextureUsageRenderTarget;
+                depthDescriptor.storageMode = MTLStorageModePrivate;
+                depth = [device newTextureWithDescriptor:depthDescriptor];
 
                 // Textura de 1x1 magenta para formatos aún no soportados (se ven enseguida).
                 MTLTextureDescriptor* small = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:1 height:1 mipmapped:NO];
                 missingTexture = [device newTextureWithDescriptor:small];
                 const uint32_t magenta = 0xFFFF00FF;
                 [missingTexture replaceRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:0 withBytes:&magenta bytesPerRow:4];
+                constantRing = [device newBufferWithLength:kRingSize options:MTLResourceStorageModeShared];
                 std::fprintf(stderr, "[render] Metal: %s\n", device.name.UTF8String);
                 return memory != nil && target != nil;
             }
@@ -175,6 +283,7 @@ namespace gpu
                     std::fprintf(stderr, "[render] %s: %s\n", translated.entry.c_str(), translated.warnings.c_str());
                 functions[shader.hash] = function;
                 textureSlots[shader.hash] = translated.textures;
+                constantRanges[shader.hash] = translated.constantRanges;
                 if (slots)
                     *slots = translated.textures;
                 return function;
@@ -222,6 +331,12 @@ namespace gpu
                 uint64_t key = draw.vertexShader->hash * 31 + draw.pixelShader->hash;
                 key = key * 1000003 + blend;
                 key = key * 17 + mask;
+                key = key * 3 + (draw.depthOnly ? 1 : 0);
+                if (key == lastPipelineKey && lastPipeline) // lo más habitual: el mismo que el dibujo anterior
+                {
+                    slots = lastPipelineSlots;
+                    return lastPipeline;
+                }
 
                 id<MTLFunction> vertex = Function(*draw.vertexShader, false, nullptr);
                 id<MTLFunction> fragment = Function(*draw.pixelShader, true, &slots);
@@ -229,14 +344,21 @@ namespace gpu
                     return nil;
                 auto it = pipelines.find(key);
                 if (it != pipelines.end())
+                {
+                    lastPipelineKey = key;
+                    lastPipeline = it->second;
+                    lastPipelineSlots = slots;
                     return it->second;
+                }
 
                 MTLRenderPipelineDescriptor* descriptor = [[MTLRenderPipelineDescriptor alloc] init];
                 descriptor.vertexFunction = vertex;
                 descriptor.fragmentFunction = fragment;
                 MTLRenderPipelineColorAttachmentDescriptor* color = descriptor.colorAttachments[0];
                 color.pixelFormat = target.pixelFormat;
-                color.writeMask = (mask & 1 ? MTLColorWriteMaskRed : 0) | (mask & 2 ? MTLColorWriteMaskGreen : 0) |
+                descriptor.depthAttachmentPixelFormat = kDepthFormat;
+                descriptor.stencilAttachmentPixelFormat = kDepthFormat;
+                color.writeMask = draw.depthOnly ? MTLColorWriteMaskNone : (mask & 1 ? MTLColorWriteMaskRed : 0) | (mask & 2 ? MTLColorWriteMaskGreen : 0) |
                                   (mask & 4 ? MTLColorWriteMaskBlue : 0) | (mask & 8 ? MTLColorWriteMaskAlpha : 0);
                 // RB_BLENDCONTROL: srcblend 0-4, comb 5-7, destblend 8-12, y lo mismo para alfa desde el bit 16.
                 const bool opaque = (blend & 0x1FFF) == 0x0001 && ((blend >> 16) & 0x1FFF) == 0x0001;
@@ -254,6 +376,42 @@ namespace gpu
                     std::fprintf(stderr, "[render] pipeline: %s\n", error.localizedDescription.UTF8String);
                 pipelines[key] = pipeline;
                 return pipeline;
+            }
+
+            // Prueba de profundidad y stencil (RB_DEPTHCONTROL). Las funciones de comparación y las
+            // operaciones de stencil de Xenos van en el mismo orden que las de Metal.
+            id<MTLDepthStencilState> DepthState(const uint32_t* registers)
+            {
+                const uint32_t control = registers[kRegDepthControl];
+                const uint32_t front = registers[kRegStencilFront], back = registers[kRegStencilBack];
+                const uint64_t key = (uint64_t(control) << 32) ^ (uint64_t(front & 0xFFFF00) << 8) ^ (back & 0xFFFF00);
+                auto it = depthStates.find(key);
+                if (it != depthStates.end())
+                    return it->second;
+
+                MTLDepthStencilDescriptor* descriptor = [[MTLDepthStencilDescriptor alloc] init];
+                const bool zEnable = control & 2, zWrite = control & 4;
+                descriptor.depthCompareFunction = zEnable ? MTLCompareFunction((control >> 4) & 7) : MTLCompareFunctionAlways;
+                descriptor.depthWriteEnabled = zEnable && zWrite;
+                if (control & 1)
+                {
+                    auto stencil = [](uint32_t bits, uint32_t refMask) {
+                        MTLStencilDescriptor* side = [[MTLStencilDescriptor alloc] init];
+                        side.stencilCompareFunction = MTLCompareFunction(bits & 7);
+                        side.stencilFailureOperation = MTLStencilOperation((bits >> 3) & 7);
+                        side.depthStencilPassOperation = MTLStencilOperation((bits >> 6) & 7);
+                        side.depthFailureOperation = MTLStencilOperation((bits >> 9) & 7);
+                        side.readMask = (refMask >> 8) & 0xFF;
+                        side.writeMask = (refMask >> 16) & 0xFF;
+                        return side;
+                    };
+                    descriptor.frontFaceStencil = stencil(control >> 8, front);
+                    // Sin "backface_enable" (bit 7) la cara trasera usa lo mismo que la delantera.
+                    descriptor.backFaceStencil = (control & 0x80) ? stencil(control >> 20, back) : stencil(control >> 8, front);
+                }
+                id<MTLDepthStencilState> state = [device newDepthStencilStateWithDescriptor:descriptor];
+                depthStates[key] = state;
+                return state;
             }
 
             // Textura a partir de una constante de fetch (6 palabras).
@@ -279,6 +437,7 @@ namespace gpu
                 case 18: pixelFormat = MTLPixelFormatBC1_RGBA; blockSize = 4; bytesPerBlock = 8; break;
                 case 19: pixelFormat = MTLPixelFormatBC2_RGBA; blockSize = 4; bytesPerBlock = 16; break;
                 case 20: pixelFormat = MTLPixelFormatBC3_RGBA; blockSize = 4; bytesPerBlock = 16; break;
+                case 49: pixelFormat = MTLPixelFormatBC5_RGUnorm; blockSize = 4; bytesPerBlock = 16; break; // DXN
                 default:
                 {
                     static std::unordered_map<uint32_t, int> reported;
@@ -300,16 +459,35 @@ namespace gpu
                 const auto* source = static_cast<const uint8_t*>(memory::Translate(0xA0000000 | (base & 0x1FFFFFFF)));
                 const size_t rawSize = std::min<size_t>(tiled ? TiledSize(pitchBlocks, blocksY, bytesPerBlock) :
                     size_t(pitchBlocks) * blocksY * bytesPerBlock, 0x20000000 - (base & 0x1FFFFFFF));
-                const uint64_t hash = HashMemory(source, rawSize);
+                // ¿Es la imagen de un resolve? Entonces se usa su copia en la GPU, mientras la memoria no
+                // haya cambiado desde el resolve (se comprueba una vez por época).
                 if (format == 6 && tiled)
-                    for (const ResolvedSurface& surface : surfaces)
+                    for (ResolvedSurface& surface : surfaces)
                         if (surface.base == (base & 0x1FFFFFFF) && surface.pitch == pitchBlocks && surface.height == height &&
-                            surface.endian == endian && width <= surface.pitch && surface.hash == hash)
-                            return surface.view;
+                            surface.endian == endian && width <= surface.pitch)
+                        {
+                            if (surface.validEpoch == epoch)
+                                return surface.view;
+                            if (surface.hash == HashMemory(source, rawSize))
+                            {
+                                surface.validEpoch = epoch;
+                                return surface.view;
+                            }
+                        }
                 const uint64_t key = (uint64_t(base) << 32) ^ (uint64_t(format) << 26) ^ (uint64_t(width) << 13) ^ height;
                 Texture& cached = textures[key];
-                if (cached.texture && cached.hash == hash)
+                if (cached.texture && cached.epoch == epoch)
                     return cached.texture;
+                const uint64_t hash = HashMemory(source, rawSize);
+                // Si la textura cae sobre un resolve aún no escrito en memoria (y no ha podido usar su
+                // copia), se escribe ahora para leer lo que toca.
+                if (WritebackOverlapping(base & 0x1FFFFFFF, rawSize))
+                    return TextureFor(fetch);
+                if (cached.texture && cached.hash == hash)
+                {
+                    cached.epoch = epoch;
+                    return cached.texture;
+                }
 
                 // Lectura (quitando el mosaico) e intercambio de bytes.
                 std::vector<uint8_t> data(size_t(blocksX) * blocksY * bytesPerBlock);
@@ -342,6 +520,7 @@ namespace gpu
                 [cached.texture replaceRegion:MTLRegionMake2D(0, 0, width, height) mipmapLevel:0 withBytes:data.data()
                     bytesPerRow:blocksX * bytesPerBlock];
                 cached.hash = hash;
+                cached.epoch = epoch;
                 if (Trace())
                     std::fprintf(stderr, "[render] textura 0x%08X %ux%u formato %u%s\n", base, width, height, format, tiled ? " (mosaico)" : "");
                 return cached.texture;
@@ -382,7 +561,16 @@ namespace gpu
                 pass.colorAttachments[0].loadAction = clearPending ? MTLLoadActionClear : MTLLoadActionLoad;
                 pass.colorAttachments[0].clearColor = clearColor;
                 pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+                pass.depthAttachment.texture = depth;
+                pass.depthAttachment.loadAction = depthClearPending ? MTLLoadActionClear : MTLLoadActionLoad;
+                pass.depthAttachment.clearDepth = clearDepth;
+                pass.depthAttachment.storeAction = MTLStoreActionStore;
+                pass.stencilAttachment.texture = depth;
+                pass.stencilAttachment.loadAction = depthClearPending ? MTLLoadActionClear : MTLLoadActionLoad;
+                pass.stencilAttachment.clearStencil = clearStencil;
+                pass.stencilAttachment.storeAction = MTLStoreActionStore;
                 clearPending = false;
+                depthClearPending = false;
                 encoder = [commands renderCommandEncoderWithDescriptor:pass];
             }
 
@@ -396,6 +584,7 @@ namespace gpu
                 if (commands)
                 {
                     [commands commit];
+                    lastCommit = commands;
                     if (wait)
                         [commands waitUntilCompleted];
                     commands = nil;
@@ -420,9 +609,15 @@ namespace gpu
                     return false;
                 }
 
+                const ConstantOffsets constants = UploadConstants(draw);
                 BeginPass();
                 [encoder setRenderPipelineState:pipeline];
                 [encoder setCullMode:MTLCullModeNone];
+                [encoder setDepthStencilState:DepthState(draw.registers)];
+                [encoder setStencilFrontReferenceValue:draw.registers[kRegStencilFront] & 0xFF
+                    backReferenceValue:((draw.registers[kRegDepthControl] & 0x80) ? draw.registers[kRegStencilBack] : draw.registers[kRegStencilFront]) & 0xFF];
+                // PA_SU_SC_MODE_CNTL bit 2: 0 = la cara delantera es la de sentido antihorario.
+                [encoder setFrontFacingWinding:(draw.registers[kRegModeControl] & 4) ? MTLWindingClockwise : MTLWindingCounterClockwise];
 
                 DrawState state{};
                 state.primitive = primitive;
@@ -444,21 +639,28 @@ namespace gpu
                 state.windowOffset[1] = float(windowY);
                 std::memcpy(state.bools, &draw.registers[kRegBoolConstants], sizeof(state.bools));
 
-                const uint32_t* vertexConstants = &draw.registers[kRegAluConstants];
-                const uint32_t* pixelConstants = &draw.registers[kRegAluConstants + 256 * 4];
                 const uint32_t* fetchConstants = &draw.registers[kRegFetchConstants];
                 [encoder setVertexBuffer:memory offset:0 atIndex:0];
-                [encoder setVertexBytes:vertexConstants length:256 * 16 atIndex:1];
-                [encoder setVertexBytes:fetchConstants length:32 * 6 * 4 atIndex:2];
+                [encoder setVertexBuffer:constantRing offset:constants.vertex atIndex:1];
+                [encoder setVertexBuffer:constantRing offset:constants.fetch atIndex:2];
                 [encoder setVertexBytes:&state length:sizeof(state) atIndex:3];
                 [encoder setFragmentBuffer:memory offset:0 atIndex:0];
-                [encoder setFragmentBytes:pixelConstants length:256 * 16 atIndex:1];
-                [encoder setFragmentBytes:fetchConstants length:32 * 6 * 4 atIndex:2];
+                [encoder setFragmentBuffer:constantRing offset:constants.pixel atIndex:1];
+                [encoder setFragmentBuffer:constantRing offset:constants.fetch atIndex:2];
                 [encoder setFragmentBytes:&state length:sizeof(state) atIndex:3];
                 for (uint32_t slot : textureSlots)
                 {
-                    [encoder setFragmentTexture:TextureFor(&fetchConstants[slot * 6]) atIndex:slot];
-                    [encoder setFragmentSamplerState:SamplerFor(&fetchConstants[slot * 6]) atIndex:slot];
+                    const uint32_t* fetch = &fetchConstants[slot * 6];
+                    SlotMemo& memo = slotMemos[slot & 31];
+                    if (memo.epoch != epoch || std::memcmp(memo.fetch, fetch, sizeof(memo.fetch)) != 0)
+                    {
+                        memo.texture = TextureFor(fetch);
+                        memo.sampler = SamplerFor(fetch);
+                        std::memcpy(memo.fetch, fetch, sizeof(memo.fetch));
+                        memo.epoch = epoch;
+                    }
+                    [encoder setFragmentTexture:memo.texture atIndex:slot];
+                    [encoder setFragmentSamplerState:memo.sampler atIndex:slot];
                 }
 
                 const uint32_t vertices = primitive == 13 ? draw.count / 4 * 6 : primitive == 8 ? draw.count / 3 * 6 : draw.count;
@@ -468,9 +670,79 @@ namespace gpu
                 return true;
             }
 
+            // Escribe en la memoria del juego (con mosaico y su orden de bytes) lo que un resolve
+            // diferido dejó solo en la GPU.
+            void WritebackSurface(ResolvedSurface& surface)
+            {
+                if (!surface.pending)
+                    return;
+                surface.pending = false;
+                EndPass(false);
+                [lastCommit waitUntilCompleted];
+                const uint32_t left = surface.pendingLeft, top = surface.pendingTop;
+                const uint32_t width = surface.pendingRight - left, height = surface.pendingBottom - top;
+                std::vector<uint32_t> pixels(size_t(width) * height);
+                [surface.texture getBytes:pixels.data() bytesPerRow:width * 4 fromRegion:MTLRegionMake2D(left, top, width, height) mipmapLevel:0];
+                auto* dest = static_cast<uint8_t*>(memory::Translate(0xA0000000 | surface.base));
+                for (uint32_t y = 0; y < height; y++)
+                    for (uint32_t x = 0; x < width; x++)
+                    {
+                        const uint32_t rgba = pixels[size_t(y) * width + x];
+                        uint32_t value = (rgba & 0xFF00FF00) | ((rgba & 0xFF) << 16) | ((rgba >> 16) & 0xFF);
+                        switch (surface.endian)
+                        {
+                        case 1: value = ((value & 0x00FF00FF) << 8) | ((value >> 8) & 0x00FF00FF); break;
+                        case 2: value = __builtin_bswap32(value); break;
+                        case 3: value = (value << 16) | (value >> 16); break;
+                        default: break;
+                        }
+                        std::memcpy(dest + TiledOffset(left + x, top + y, surface.pitch, 2), &value, 4);
+                    }
+                surface.hash = HashMemory(dest, std::min<size_t>(TiledSize(surface.pitch, surface.height, 4), 0x20000000 - surface.base));
+                epoch++; // la memoria del juego ha cambiado
+                surface.validEpoch = epoch;
+            }
+
+            // Escribe los resolves pendientes que se solapan con [base, base + size). Devuelve si escribió alguno.
+            bool WritebackOverlapping(uint32_t base, size_t size)
+            {
+                bool wrote = false;
+                for (ResolvedSurface& surface : surfaces)
+                {
+                    const size_t surfaceSize = TiledSize(surface.pitch, surface.height, 4);
+                    if (surface.pending && base < surface.base + surfaceSize && surface.base < base + size)
+                    {
+                        WritebackSurface(surface);
+                        wrote = true;
+                    }
+                }
+                return wrote;
+            }
+
+            // El front buffer para la ventana, directamente de la copia en la GPU (BGRA, sin mosaico).
+            bool ReadFrame(uint32_t base, uint32_t width, uint32_t height, uint32_t* pixels)
+            {
+                epoch++;
+                for (ResolvedSurface& surface : surfaces)
+                {
+                    if (surface.base != base || surface.pitch != width || surface.height < height)
+                        continue;
+                    EndPass(false);
+                    [lastCommit waitUntilCompleted];
+                    [surface.texture getBytes:pixels bytesPerRow:width * 4 fromRegion:MTLRegionMake2D(0, 0, width, height) mipmapLevel:0];
+                    for (size_t i = 0, n = size_t(width) * height; i < n; i++)
+                    {
+                        const uint32_t rgba = pixels[i];
+                        pixels[i] = (rgba & 0x0000FF00) | ((rgba & 0xFF) << 16) | ((rgba >> 16) & 0xFF) | 0xFF000000u;
+                    }
+                    return true;
+                }
+                return false;
+            }
+
             // Copia en la GPU de lo que acaba de escribir un resolve (ver ResolvedSurface).
             void UpdateSurface(uint32_t base, uint32_t pitch, uint32_t height, uint32_t endian,
-                uint32_t left, uint32_t top, uint32_t width, uint32_t rows)
+                uint32_t left, uint32_t top, uint32_t width, uint32_t rows, bool deferred)
             {
                 // ¿Es una franja de una imagen ya conocida? Las filas de 32 en 32 son contiguas.
                 ResolvedSurface* surface = nullptr;
@@ -490,13 +762,19 @@ namespace gpu
                 if (!surface || offsetY + top + rows > surface->height)
                 {
                     if (surface)
+                    {
+                        WritebackSurface(*surface);
                         surfaces.erase(surfaces.begin() + (surface - surfaces.data()));
+                    }
                     if (surfaces.size() >= 32)
+                    {
+                        WritebackSurface(surfaces.front());
                         surfaces.erase(surfaces.begin());
+                    }
                     MTLTextureDescriptor* descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
                         width:pitch height:height mipmapped:NO];
                     descriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
-                    descriptor.storageMode = MTLStorageModePrivate;
+                    descriptor.storageMode = MTLStorageModeShared; // se lee al escribir la memoria o presentar
                     ResolvedSurface created;
                     created.base = base;
                     created.pitch = pitch;
@@ -519,10 +797,34 @@ namespace gpu
                     destinationOrigin:MTLOriginMake(left, offsetY + top, 0)];
                 [blit endEncoding];
                 [copy commit];
+                lastCommit = copy;
 
-                const auto* memoryStart = static_cast<const uint8_t*>(memory::Translate(0xA0000000 | surface->base));
-                surface->hash = HashMemory(memoryStart, std::min<size_t>(TiledSize(pitch, surface->height, 4),
-                    0x20000000 - surface->base));
+                if (deferred)
+                {
+                    const uint32_t newTop = offsetY + top, newBottom = offsetY + top + rows;
+                    if (!surface->pending)
+                    {
+                        surface->pendingLeft = left; surface->pendingTop = newTop;
+                        surface->pendingRight = left + width; surface->pendingBottom = newBottom;
+                    }
+                    else
+                    {
+                        surface->pendingLeft = std::min(surface->pendingLeft, left);
+                        surface->pendingTop = std::min(surface->pendingTop, newTop);
+                        surface->pendingRight = std::max(surface->pendingRight, left + width);
+                        surface->pendingBottom = std::max(surface->pendingBottom, newBottom);
+                    }
+                    surface->pending = true;
+                }
+                // Huella de la memoria tal como queda tras el resolve (una vez por época si es diferido:
+                // entonces el resolve no la cambia).
+                if (!deferred || surface->validEpoch != epoch)
+                {
+                    const auto* memoryStart = static_cast<const uint8_t*>(memory::Translate(0xA0000000 | surface->base));
+                    surface->hash = HashMemory(memoryStart, std::min<size_t>(TiledSize(pitch, surface->height, 4),
+                        0x20000000 - surface->base));
+                    surface->validEpoch = epoch;
+                }
             }
 
             // Rectángulo del resolve: 3 vértices (x, y en float) de la constante de fetch 0, más el
@@ -580,7 +882,15 @@ namespace gpu
                 ResolveRect(registers, left, top, right, bottom);
                 right = std::min({right, destPitch, kTargetWidth});
                 bottom = std::min({bottom, destHeight, kTargetHeight});
-                if (source < 4 && destFormat == 6 && destBase && right > left && bottom > top)
+                if (immediateWriteback)
+                    epoch++; // la memoria cambia en el acto
+                if (source < 4 && destFormat == 6 && destBase && right > left && bottom > top && !immediateWriteback)
+                {
+                    // Solo en la GPU: la memoria se escribe cuando alguien la necesita (WritebackSurface).
+                    EndPass(false);
+                    UpdateSurface(destBase & 0x1FFFFFFF, destPitch, destHeight, destEndian, left, top, right - left, bottom - top, true);
+                }
+                else if (source < 4 && destFormat == 6 && destBase && right > left && bottom > top)
                 {
                     EndPass(true);
                     const uint32_t width = right - left, height = bottom - top;
@@ -604,7 +914,7 @@ namespace gpu
                             std::memcpy(dest + TiledOffset(left + x, top + y, destPitch, 2), &value, 4);
                         }
                     }
-                    UpdateSurface(destBase & 0x1FFFFFFF, destPitch, destHeight, destEndian, left, top, width, height);
+                    UpdateSurface(destBase & 0x1FFFFFFF, destPitch, destHeight, destEndian, left, top, width, height, false);
                 }
 
                 // Borrado tras la copia (RB_COPY_CONTROL bit 8): en la siguiente pasada.
@@ -615,6 +925,24 @@ namespace gpu
                     clearColor = MTLClearColorMake(((clear >> 16) & 0xFF) / 255.0, ((clear >> 8) & 0xFF) / 255.0,
                         (clear & 0xFF) / 255.0, ((clear >> 24) & 0xFF) / 255.0);
                     clearPending = true;
+                }
+                // Borrado de profundidad / stencil (bit 9). D24S8 o D24FS8 (20e4) según RB_DEPTH_INFO.
+                if (control & 0x200)
+                {
+                    EndPass(false);
+                    const uint32_t clear = registers[kRegDepthClear], value = clear >> 8;
+                    if (registers[kRegDepthInfo] & 0x10000)
+                    {
+                        const uint32_t exponent = value >> 20, mantissa = value & 0xFFFFF;
+                        clearDepth = exponent ? std::ldexp(1.0 + mantissa / 1048576.0, int(exponent) - 15) : std::ldexp(mantissa / 1048576.0, -14);
+                        clearDepth = std::min(clearDepth, 1.0);
+                    }
+                    else
+                    {
+                        clearDepth = value / 16777215.0;
+                    }
+                    clearStencil = uint8_t(clear & 0xFF);
+                    depthClearPending = true;
                 }
             }
         };
@@ -645,6 +973,15 @@ namespace gpu
         {
             Renderer* renderer = Get();
             return renderer && renderer->Draw(draw);
+        }
+    }
+
+    bool RendererReadFrame(uint32_t physical, uint32_t width, uint32_t height, uint32_t* pixels)
+    {
+        @autoreleasepool
+        {
+            Renderer* renderer = Get();
+            return renderer && renderer->ReadFrame(physical & 0x1FFFFFFF, width, height, pixels);
         }
     }
 

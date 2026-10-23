@@ -6,6 +6,7 @@
 //   imagen: por defecto analysis/default_image.bin (generada por tools/xex_dump)
 //   xex:    por defecto game/default.xex (para la cabecera)
 
+#include <chrono>
 #include <csignal>
 #include <execinfo.h>
 #include <sys/ucontext.h>
@@ -106,6 +107,27 @@ namespace
                 memory::Write16(data + 0, 2);           // Major
                 memory::Write16(data + 2, 0);           // Minor
                 memory::Write16(data + 4, 6132);        // Build (el XDK con el que se compiló el juego)
+            }
+            else if (std::strcmp(slot.name, "KeTimeStampBundle") == 0)
+            {
+                // KeTimeStampBundle: tiempo de interrupción (100 ns desde el arranque), hora del
+                // sistema (FILETIME) y milisegundos desde el arranque (GetTickCount la lee). El
+                // kernel la actualiza solo; aquí, un hilo cada milisegundo.
+                std::thread([data] {
+                    const auto start = std::chrono::steady_clock::now();
+                    for (;;)
+                    {
+                        const auto elapsed = std::chrono::steady_clock::now() - start;
+                        const uint64_t interrupt = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count() / 100);
+                        const uint64_t system = uint64_t(kernel::SystemTime());
+                        memory::Write32(data + 0, uint32_t(interrupt >> 32));
+                        memory::Write32(data + 4, uint32_t(interrupt));
+                        memory::Write32(data + 8, uint32_t(system >> 32));
+                        memory::Write32(data + 12, uint32_t(system));
+                        memory::Write32(data + 16, uint32_t(interrupt / 10000));
+                        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    }
+                }).detach();
             }
             else if (std::strcmp(slot.name, "XexExecutableModuleHandle") == 0)
             {

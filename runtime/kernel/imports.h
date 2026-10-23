@@ -45,3 +45,8 @@ void CompleteOverlapped(uint32_t overlapped, uint32_t result, uint32_t length = 
 // XamContentCreateEx con los paquetes de partidas guardadas.
 void MountDevice(const std::string& device, const std::string& hostPath);
 void UnmountDevice(const std::string& device);
+
+// Notificaciones del sistema (XNotifyGetNext): PostNotification entrega una a todos los
+// listeners; ShowSystemUi envía las de una ventana del sistema que se abre y se cierra.
+void PostNotification(uint32_t id, uint32_t param);
+void ShowSystemUi();

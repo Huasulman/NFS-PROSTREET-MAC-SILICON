@@ -4,6 +4,8 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -15,24 +17,99 @@
 using namespace kernel;
 
 // --- Notificaciones del sistema --------------------------------------------------------------
-// Un "listener" es un evento que se señala cuando hay notificaciones (cambios de usuario, de
-// almacenamiento, de la interfaz...). De momento no se genera ninguna.
+// Un "listener" es un evento que está señalado mientras tiene notificaciones pendientes
+// (cambios de usuario, de almacenamiento, ventanas del sistema...). Cada notificación se
+// entrega a todos los listeners.
+
+namespace
+{
+    struct Listener : Event
+    {
+        std::deque<std::pair<uint32_t, uint32_t>> pending; // (id, parámetro), con el cerrojo del dispatcher
+        Listener() : Event(true, false) {}
+    };
+
+    std::mutex gListenersLock;
+    std::vector<std::weak_ptr<Listener>> gListeners;
+
+    constexpr uint32_t kNotifySystemUi = 0x00000009; // XN_SYS_UI: 1 = se abre una ventana del sistema, 0 = se cierra
+}
+
+void PostNotification(uint32_t id, uint32_t param)
+{
+    std::lock_guard listenersLock(gListenersLock);
+    for (auto& weak : gListeners)
+    {
+        if (auto listener = weak.lock())
+        {
+            std::lock_guard lock(DispatcherLock());
+            listener->pending.emplace_back(id, param);
+            listener->signaled = true;
+            listener->WriteSignalState(1);
+        }
+    }
+    NotifyAll();
+}
+
+void ShowSystemUi()
+{
+    PostNotification(kNotifySystemUi, 1);
+    PostNotification(kNotifySystemUi, 0);
+}
 
 // uint32_t XamNotifyCreateListener(uint64_t areas, uint32_t maxVersion): devuelve un handle.
 PPC_FUNC(__imp__XamNotifyCreateListener)
 {
     (void)base;
-    auto listener = Register(std::make_shared<Event>(true, false));
+    auto listener = std::make_shared<Listener>();
+    Register(listener);
+    {
+        std::lock_guard lock(gListenersLock);
+        gListeners.push_back(listener);
+    }
     if (std::getenv("PROSTREET_TRACE"))
         std::fprintf(stderr, "[xam] XamNotifyCreateListener(áreas 0x%llX)\n", (unsigned long long)ctx.r3.u64);
     ctx.r3.u64 = CreateHandle(listener);
 }
 
 // BOOL XNotifyGetNext(uint32_t listener, uint32_t matchId, uint32_t* id, uint32_t* param)
+// Con matchId distinto de 0 solo se entrega esa notificación.
 PPC_FUNC(__imp__XNotifyGetNext)
 {
     (void)base;
-    ctx.r3.u64 = 0; // no hay notificaciones pendientes
+    auto object = FromHandle(ctx.r3.u32);
+    auto* listener = dynamic_cast<Listener*>(object.get());
+    const uint32_t matchId = ctx.r4.u32, idPtr = ctx.r5.u32, paramPtr = ctx.r6.u32;
+    ctx.r3.u64 = 0;
+    if (!listener)
+        return;
+    std::lock_guard lock(DispatcherLock());
+    for (auto it = listener->pending.begin(); it != listener->pending.end(); ++it)
+    {
+        if (matchId && it->first != matchId)
+            continue;
+        if (idPtr)
+            memory::Write32(idPtr, it->first);
+        if (paramPtr)
+            memory::Write32(paramPtr, it->second);
+        listener->pending.erase(it);
+        ctx.r3.u64 = 1;
+        break;
+    }
+    if (listener->pending.empty())
+    {
+        listener->signaled = false;
+        listener->WriteSignalState(0);
+    }
+}
+
+// uint32_t XamShowSigninUI(uint32_t panes, uint32_t flags): sin Xbox Live no hay a qué
+// conectarse. La ventana se "abre" y se cierra en el acto sin cambiar de usuario.
+PPC_FUNC(__imp__XamShowSigninUI)
+{
+    (void)base;
+    ShowSystemUi();
+    ctx.r3.u64 = 0;
 }
 
 // --- Idioma ----------------------------------------------------------------------------------
@@ -189,4 +266,25 @@ PPC_FUNC(__imp__NetDll_WSAWaitForMultipleEvents)
     const uint64_t timeout = timeoutMs == 0xFFFFFFFF ? kInfinite : uint64_t(timeoutMs) * 1000000;
     const uint32_t status = Wait(objects, ctx.r5.u32 != 0, timeout);
     ctx.r3.u64 = status == kStatusTimeout ? kWsaWaitTimeout : status; // WSA_WAIT_EVENT_0 + índice
+}
+
+// --- Red: sin conexión ------------------------------------------------------------------------
+// No hay Xbox Live ni red local: se responde "sin cable" y "sin dirección", para que el juego
+// vea enseguida que no hay conexión en lugar de esperar a que se configure.
+
+// uint32_t NetDll_XNetGetTitleXnAddr(uint32_t caller, XNADDR* address): XNET_GET_XNADDR_NONE.
+PPC_FUNC(__imp__NetDll_XNetGetTitleXnAddr)
+{
+    (void)base;
+    if (ctx.r4.u32)
+        for (uint32_t offset = 0; offset < 36; offset += 4) // XNADDR: 36 bytes
+            memory::Write32(ctx.r4.u32 + offset, 0);
+    ctx.r3.u64 = 1;
+}
+
+// uint32_t NetDll_XNetGetEthernetLinkStatus(uint32_t caller): 0 = sin enlace.
+PPC_FUNC(__imp__NetDll_XNetGetEthernetLinkStatus)
+{
+    (void)base;
+    ctx.r3.u64 = 0;
 }

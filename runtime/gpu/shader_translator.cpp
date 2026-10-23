@@ -142,6 +142,7 @@ inline bool bool_constant(constant DrawState& st, uint index) { return (st.bools
             std::ostringstream out;
             std::ostringstream warnings;
             std::set<uint32_t> textures;
+            std::set<uint32_t> constants;
             uint32_t lastStride = 0;
             int indent = 1;
 
@@ -167,6 +168,7 @@ inline bool bool_constant(constant DrawState& st, uint index) { return (st.bools
                 else
                 {
                     name = "c[" + std::to_string(reg) + "]";
+                    constants.insert(reg);
                 }
                 return (negate ? "(-" : "(") + name + AluSwizzle(swizzle) + ")";
             }
@@ -616,6 +618,14 @@ inline bool bool_constant(constant DrawState& st, uint index) { return (st.bools
         result.source = std::string(kPrelude) + "\n" + translator.out.str();
         result.warnings = translator.warnings.str();
         result.textures.assign(translator.textures.begin(), translator.textures.end());
+        for (uint32_t reg : translator.constants)
+        {
+            auto& ranges = result.constantRanges;
+            if (!ranges.empty() && reg <= ranges.back().first + ranges.back().second + 4)
+                ranges.back().second = reg + 1 - ranges.back().first;
+            else
+                ranges.emplace_back(reg, 1);
+        }
         return result;
     }
 }

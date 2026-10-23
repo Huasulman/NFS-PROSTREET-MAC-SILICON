@@ -7,6 +7,7 @@
 #include <string>
 
 #include "../memory.h"
+#include "renderer.h"
 
 namespace gpu
 {
@@ -51,6 +52,7 @@ namespace gpu
         frame.height = height;
         frame.pixels.resize(size_t(width) * height);
         const auto* source = static_cast<const uint8_t*>(memory::Translate(frontBufferGuest));
+        if (gLinear || !RendererReadFrame(frontBufferGuest, width, height, frame.pixels.data()))
         for (uint32_t y = 0; y < height; y++)
         {
             for (uint32_t x = 0; x < width; x++)

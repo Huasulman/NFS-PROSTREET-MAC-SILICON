@@ -560,17 +560,10 @@ PPC_FUNC(__imp__KeQuerySystemTime)
     memory::Write32(ctx.r3.u32 + 4, uint32_t(now));
 }
 
-// uint64_t KeQueryPerformanceFrequency()
-// El código recompilado lee el contador del procesador (mftb) con el contador del anfitrión,
-// así que la frecuencia debe ser la del anfitrión (24 MHz en Apple Silicon), no los 50 MHz de la Xbox.
+// uint64_t KeQueryPerformanceFrequency(): la del timebase de la Xbox 360 (50 MHz). El código
+// recompilado lee mftb con el contador del anfitrión reescalado a esa frecuencia (ppc_context.h).
 PPC_FUNC(__imp__KeQueryPerformanceFrequency)
 {
     (void)base;
-    uint64_t frequency;
-#if defined(__aarch64__)
-    asm volatile("mrs %0, cntfrq_el0" : "=r"(frequency));
-#else
-    frequency = 50000000;
-#endif
-    ctx.r3.u64 = frequency;
+    ctx.r3.u64 = 50000000;
 }
