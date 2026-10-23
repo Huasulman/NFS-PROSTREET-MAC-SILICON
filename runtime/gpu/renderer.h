@@ -28,4 +28,8 @@ namespace gpu
     // Devuelven false si el renderer no está disponible (sin GPU Metal).
     bool RendererDraw(const DrawCall& draw);
     void RendererResolve(const uint32_t* registers);
+
+    // Lee el front buffer de la copia en la GPU de su resolve (píxeles BGRA sin mosaico).
+    // Devuelve false si no hay ninguna: entonces hay que leerlo de la memoria del juego.
+    bool RendererReadFrame(uint32_t physical, uint32_t width, uint32_t height, uint32_t* pixels);
 }

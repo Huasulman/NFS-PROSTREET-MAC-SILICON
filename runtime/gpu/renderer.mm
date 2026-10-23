@@ -69,6 +69,7 @@ namespace gpu
         {
             id<MTLTexture> texture;
             uint64_t hash = 0; // huella de la memoria original (con mosaico, sin intercambiar)
+            uint64_t epoch = 0; // época en la que se comprobó por última vez (ver Renderer::epoch)
         };
 
         // Imagen que ha escrito un resolve (con mosaico, 8_8_8_8): se guarda también una copia en
@@ -81,6 +82,9 @@ namespace gpu
             id<MTLTexture> texture; // RGBA8 tal como está en el renderer
             id<MTLTexture> view;    // la misma, con R y B cambiados: lo que lee la textura del juego
             uint64_t hash = 0;      // de la memoria de toda la imagen tras el último resolve
+            // Escritura diferida: la memoria del juego aún no tiene este rectángulo (en filas de la imagen).
+            bool pending = false;
+            uint32_t pendingLeft = 0, pendingTop = 0, pendingRight = 0, pendingBottom = 0;
         };
 
         // Bytes de la memoria original de una imagen con mosaico (las filas van de 32 en 32).
@@ -132,6 +136,12 @@ namespace gpu
             std::unordered_map<uint64_t, id<MTLRenderPipelineState>> pipelines;
             std::unordered_map<uint64_t, Texture> textures;
             std::vector<ResolvedSurface> surfaces;
+            id<MTLCommandBuffer> lastCommit;   // el último trabajo enviado a la GPU, para esperarlo
+            // Época: cambia con cada resolve y cada fotograma presentado. Una textura ya comprobada
+            // en la época actual no se vuelve a comprobar (su memoria solo cambia entre medias).
+            uint64_t epoch = 1;
+            // PROSTREET_RESOLVE_WRITEBACK=1: escribir cada resolve en la memoria del juego en el acto.
+            const bool immediateWriteback = std::getenv("PROSTREET_RESOLVE_WRITEBACK") != nullptr;
             std::unordered_map<uint32_t, id<MTLSamplerState>> samplers;
             id<MTLTexture> missingTexture;
 
@@ -356,16 +366,25 @@ namespace gpu
                 const auto* source = static_cast<const uint8_t*>(memory::Translate(0xA0000000 | (base & 0x1FFFFFFF)));
                 const size_t rawSize = std::min<size_t>(tiled ? TiledSize(pitchBlocks, blocksY, bytesPerBlock) :
                     size_t(pitchBlocks) * blocksY * bytesPerBlock, 0x20000000 - (base & 0x1FFFFFFF));
+                const uint64_t key = (uint64_t(base) << 32) ^ (uint64_t(format) << 26) ^ (uint64_t(width) << 13) ^ height;
+                Texture& cached = textures[key];
+                if (cached.texture && cached.epoch == epoch)
+                    return cached.texture;
                 const uint64_t hash = HashMemory(source, rawSize);
                 if (format == 6 && tiled)
                     for (const ResolvedSurface& surface : surfaces)
                         if (surface.base == (base & 0x1FFFFFFF) && surface.pitch == pitchBlocks && surface.height == height &&
                             surface.endian == endian && width <= surface.pitch && surface.hash == hash)
                             return surface.view;
-                const uint64_t key = (uint64_t(base) << 32) ^ (uint64_t(format) << 26) ^ (uint64_t(width) << 13) ^ height;
-                Texture& cached = textures[key];
+                // Si la textura cae sobre un resolve aún no escrito en memoria (y no ha podido usar su
+                // copia), se escribe ahora para leer lo que toca.
+                if (WritebackOverlapping(base & 0x1FFFFFFF, rawSize))
+                    return TextureFor(fetch);
                 if (cached.texture && cached.hash == hash)
+                {
+                    cached.epoch = epoch;
                     return cached.texture;
+                }
 
                 // Lectura (quitando el mosaico) e intercambio de bytes.
                 std::vector<uint8_t> data(size_t(blocksX) * blocksY * bytesPerBlock);
@@ -398,6 +417,7 @@ namespace gpu
                 [cached.texture replaceRegion:MTLRegionMake2D(0, 0, width, height) mipmapLevel:0 withBytes:data.data()
                     bytesPerRow:blocksX * bytesPerBlock];
                 cached.hash = hash;
+                cached.epoch = epoch;
                 if (Trace())
                     std::fprintf(stderr, "[render] textura 0x%08X %ux%u formato %u%s\n", base, width, height, format, tiled ? " (mosaico)" : "");
                 return cached.texture;
@@ -461,6 +481,7 @@ namespace gpu
                 if (commands)
                 {
                     [commands commit];
+                    lastCommit = commands;
                     if (wait)
                         [commands waitUntilCompleted];
                     commands = nil;
@@ -538,9 +559,77 @@ namespace gpu
                 return true;
             }
 
+            // Escribe en la memoria del juego (con mosaico y su orden de bytes) lo que un resolve
+            // diferido dejó solo en la GPU.
+            void WritebackSurface(ResolvedSurface& surface)
+            {
+                if (!surface.pending)
+                    return;
+                surface.pending = false;
+                EndPass(false);
+                [lastCommit waitUntilCompleted];
+                const uint32_t left = surface.pendingLeft, top = surface.pendingTop;
+                const uint32_t width = surface.pendingRight - left, height = surface.pendingBottom - top;
+                std::vector<uint32_t> pixels(size_t(width) * height);
+                [surface.texture getBytes:pixels.data() bytesPerRow:width * 4 fromRegion:MTLRegionMake2D(left, top, width, height) mipmapLevel:0];
+                auto* dest = static_cast<uint8_t*>(memory::Translate(0xA0000000 | surface.base));
+                for (uint32_t y = 0; y < height; y++)
+                    for (uint32_t x = 0; x < width; x++)
+                    {
+                        const uint32_t rgba = pixels[size_t(y) * width + x];
+                        uint32_t value = (rgba & 0xFF00FF00) | ((rgba & 0xFF) << 16) | ((rgba >> 16) & 0xFF);
+                        switch (surface.endian)
+                        {
+                        case 1: value = ((value & 0x00FF00FF) << 8) | ((value >> 8) & 0x00FF00FF); break;
+                        case 2: value = __builtin_bswap32(value); break;
+                        case 3: value = (value << 16) | (value >> 16); break;
+                        default: break;
+                        }
+                        std::memcpy(dest + TiledOffset(left + x, top + y, surface.pitch, 2), &value, 4);
+                    }
+                surface.hash = HashMemory(dest, std::min<size_t>(TiledSize(surface.pitch, surface.height, 4), 0x20000000 - surface.base));
+            }
+
+            // Escribe los resolves pendientes que se solapan con [base, base + size). Devuelve si escribió alguno.
+            bool WritebackOverlapping(uint32_t base, size_t size)
+            {
+                bool wrote = false;
+                for (ResolvedSurface& surface : surfaces)
+                {
+                    const size_t surfaceSize = TiledSize(surface.pitch, surface.height, 4);
+                    if (surface.pending && base < surface.base + surfaceSize && surface.base < base + size)
+                    {
+                        WritebackSurface(surface);
+                        wrote = true;
+                    }
+                }
+                return wrote;
+            }
+
+            // El front buffer para la ventana, directamente de la copia en la GPU (BGRA, sin mosaico).
+            bool ReadFrame(uint32_t base, uint32_t width, uint32_t height, uint32_t* pixels)
+            {
+                epoch++;
+                for (ResolvedSurface& surface : surfaces)
+                {
+                    if (surface.base != base || surface.pitch != width || surface.height < height)
+                        continue;
+                    EndPass(false);
+                    [lastCommit waitUntilCompleted];
+                    [surface.texture getBytes:pixels bytesPerRow:width * 4 fromRegion:MTLRegionMake2D(0, 0, width, height) mipmapLevel:0];
+                    for (size_t i = 0, n = size_t(width) * height; i < n; i++)
+                    {
+                        const uint32_t rgba = pixels[i];
+                        pixels[i] = (rgba & 0x0000FF00) | ((rgba & 0xFF) << 16) | ((rgba >> 16) & 0xFF) | 0xFF000000u;
+                    }
+                    return true;
+                }
+                return false;
+            }
+
             // Copia en la GPU de lo que acaba de escribir un resolve (ver ResolvedSurface).
             void UpdateSurface(uint32_t base, uint32_t pitch, uint32_t height, uint32_t endian,
-                uint32_t left, uint32_t top, uint32_t width, uint32_t rows)
+                uint32_t left, uint32_t top, uint32_t width, uint32_t rows, bool deferred)
             {
                 // ¿Es una franja de una imagen ya conocida? Las filas de 32 en 32 son contiguas.
                 ResolvedSurface* surface = nullptr;
@@ -560,13 +649,19 @@ namespace gpu
                 if (!surface || offsetY + top + rows > surface->height)
                 {
                     if (surface)
+                    {
+                        WritebackSurface(*surface);
                         surfaces.erase(surfaces.begin() + (surface - surfaces.data()));
+                    }
                     if (surfaces.size() >= 32)
+                    {
+                        WritebackSurface(surfaces.front());
                         surfaces.erase(surfaces.begin());
+                    }
                     MTLTextureDescriptor* descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
                         width:pitch height:height mipmapped:NO];
                     descriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
-                    descriptor.storageMode = MTLStorageModePrivate;
+                    descriptor.storageMode = MTLStorageModeShared; // se lee al escribir la memoria o presentar
                     ResolvedSurface created;
                     created.base = base;
                     created.pitch = pitch;
@@ -589,7 +684,25 @@ namespace gpu
                     destinationOrigin:MTLOriginMake(left, offsetY + top, 0)];
                 [blit endEncoding];
                 [copy commit];
+                lastCommit = copy;
 
+                if (deferred)
+                {
+                    const uint32_t newTop = offsetY + top, newBottom = offsetY + top + rows;
+                    if (!surface->pending)
+                    {
+                        surface->pendingLeft = left; surface->pendingTop = newTop;
+                        surface->pendingRight = left + width; surface->pendingBottom = newBottom;
+                    }
+                    else
+                    {
+                        surface->pendingLeft = std::min(surface->pendingLeft, left);
+                        surface->pendingTop = std::min(surface->pendingTop, newTop);
+                        surface->pendingRight = std::max(surface->pendingRight, left + width);
+                        surface->pendingBottom = std::max(surface->pendingBottom, newBottom);
+                    }
+                    surface->pending = true;
+                }
                 const auto* memoryStart = static_cast<const uint8_t*>(memory::Translate(0xA0000000 | surface->base));
                 surface->hash = HashMemory(memoryStart, std::min<size_t>(TiledSize(pitch, surface->height, 4),
                     0x20000000 - surface->base));
@@ -650,7 +763,14 @@ namespace gpu
                 ResolveRect(registers, left, top, right, bottom);
                 right = std::min({right, destPitch, kTargetWidth});
                 bottom = std::min({bottom, destHeight, kTargetHeight});
-                if (source < 4 && destFormat == 6 && destBase && right > left && bottom > top)
+                epoch++;
+                if (source < 4 && destFormat == 6 && destBase && right > left && bottom > top && !immediateWriteback)
+                {
+                    // Solo en la GPU: la memoria se escribe cuando alguien la necesita (WritebackSurface).
+                    EndPass(false);
+                    UpdateSurface(destBase & 0x1FFFFFFF, destPitch, destHeight, destEndian, left, top, right - left, bottom - top, true);
+                }
+                else if (source < 4 && destFormat == 6 && destBase && right > left && bottom > top)
                 {
                     EndPass(true);
                     const uint32_t width = right - left, height = bottom - top;
@@ -674,7 +794,7 @@ namespace gpu
                             std::memcpy(dest + TiledOffset(left + x, top + y, destPitch, 2), &value, 4);
                         }
                     }
-                    UpdateSurface(destBase & 0x1FFFFFFF, destPitch, destHeight, destEndian, left, top, width, height);
+                    UpdateSurface(destBase & 0x1FFFFFFF, destPitch, destHeight, destEndian, left, top, width, height, false);
                 }
 
                 // Borrado tras la copia (RB_COPY_CONTROL bit 8): en la siguiente pasada.
@@ -733,6 +853,15 @@ namespace gpu
         {
             Renderer* renderer = Get();
             return renderer && renderer->Draw(draw);
+        }
+    }
+
+    bool RendererReadFrame(uint32_t physical, uint32_t width, uint32_t height, uint32_t* pixels)
+    {
+        @autoreleasepool
+        {
+            Renderer* renderer = Get();
+            return renderer && renderer->ReadFrame(physical & 0x1FFFFFFF, width, height, pixels);
         }
     }
 
