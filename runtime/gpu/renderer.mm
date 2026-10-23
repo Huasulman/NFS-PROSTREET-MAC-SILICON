@@ -3,6 +3,7 @@
 #include "renderer.h"
 
 #include <cstdio>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <unordered_map>
@@ -25,6 +26,12 @@ namespace gpu
         constexpr uint32_t kRegVteControl = 0x2206;   // PA_CL_VTE_CNTL
         constexpr uint32_t kRegWindowOffset = 0x2080; // PA_SC_WINDOW_OFFSET
         constexpr uint32_t kRegModeControl = 0x2205;  // PA_SU_SC_MODE_CNTL
+        constexpr uint32_t kRegDepthInfo = 0x2002;    // RB_DEPTH_INFO (bit 16: profundidad en coma flotante)
+        constexpr uint32_t kRegDepthControl = 0x2200; // RB_DEPTHCONTROL
+        constexpr uint32_t kRegStencilBack = 0x210C;  // RB_STENCILREFMASK_BF
+        constexpr uint32_t kRegStencilFront = 0x210D; // RB_STENCILREFMASK: ref 0-7, máscara 8-15, escritura 16-23
+        constexpr uint32_t kRegDepthClear = 0x231D;   // RB_DEPTH_CLEAR: profundidad en 8-31, stencil en 0-7
+        constexpr MTLPixelFormat kDepthFormat = MTLPixelFormatDepth32Float_Stencil8;
 
         // Desplazamiento de ventana (x, y con signo de 15 bits) si el modo lo aplica a los
         // vértices (bit 16). Con "predicated tiling" el juego dibuja la escena en franjas: cada
@@ -109,6 +116,11 @@ namespace gpu
             id<MTLCommandQueue> queue;
             id<MTLBuffer> memory;      // memoria física del juego, sin copia
             id<MTLTexture> target;     // la "EDRAM": destino de dibujo
+            id<MTLTexture> depth;      // y su profundidad / stencil
+            bool depthClearPending = true;
+            double clearDepth = 1.0;
+            uint8_t clearStencil = 0;
+            std::unordered_map<uint64_t, id<MTLDepthStencilState>> depthStates;
             id<MTLCommandBuffer> commands;
             id<MTLRenderCommandEncoder> encoder;
             bool clearPending = true;
@@ -139,6 +151,11 @@ namespace gpu
                 descriptor.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
                 descriptor.storageMode = MTLStorageModeShared;
                 target = [device newTextureWithDescriptor:descriptor];
+                MTLTextureDescriptor* depthDescriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:kDepthFormat
+                    width:kTargetWidth height:kTargetHeight mipmapped:NO];
+                depthDescriptor.usage = MTLTextureUsageRenderTarget;
+                depthDescriptor.storageMode = MTLStorageModePrivate;
+                depth = [device newTextureWithDescriptor:depthDescriptor];
 
                 // Textura de 1x1 magenta para formatos aún no soportados (se ven enseguida).
                 MTLTextureDescriptor* small = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:1 height:1 mipmapped:NO];
@@ -222,6 +239,7 @@ namespace gpu
                 uint64_t key = draw.vertexShader->hash * 31 + draw.pixelShader->hash;
                 key = key * 1000003 + blend;
                 key = key * 17 + mask;
+                key = key * 3 + (draw.depthOnly ? 1 : 0);
 
                 id<MTLFunction> vertex = Function(*draw.vertexShader, false, nullptr);
                 id<MTLFunction> fragment = Function(*draw.pixelShader, true, &slots);
@@ -236,7 +254,9 @@ namespace gpu
                 descriptor.fragmentFunction = fragment;
                 MTLRenderPipelineColorAttachmentDescriptor* color = descriptor.colorAttachments[0];
                 color.pixelFormat = target.pixelFormat;
-                color.writeMask = (mask & 1 ? MTLColorWriteMaskRed : 0) | (mask & 2 ? MTLColorWriteMaskGreen : 0) |
+                descriptor.depthAttachmentPixelFormat = kDepthFormat;
+                descriptor.stencilAttachmentPixelFormat = kDepthFormat;
+                color.writeMask = draw.depthOnly ? MTLColorWriteMaskNone : (mask & 1 ? MTLColorWriteMaskRed : 0) | (mask & 2 ? MTLColorWriteMaskGreen : 0) |
                                   (mask & 4 ? MTLColorWriteMaskBlue : 0) | (mask & 8 ? MTLColorWriteMaskAlpha : 0);
                 // RB_BLENDCONTROL: srcblend 0-4, comb 5-7, destblend 8-12, y lo mismo para alfa desde el bit 16.
                 const bool opaque = (blend & 0x1FFF) == 0x0001 && ((blend >> 16) & 0x1FFF) == 0x0001;
@@ -254,6 +274,42 @@ namespace gpu
                     std::fprintf(stderr, "[render] pipeline: %s\n", error.localizedDescription.UTF8String);
                 pipelines[key] = pipeline;
                 return pipeline;
+            }
+
+            // Prueba de profundidad y stencil (RB_DEPTHCONTROL). Las funciones de comparación y las
+            // operaciones de stencil de Xenos van en el mismo orden que las de Metal.
+            id<MTLDepthStencilState> DepthState(const uint32_t* registers)
+            {
+                const uint32_t control = registers[kRegDepthControl];
+                const uint32_t front = registers[kRegStencilFront], back = registers[kRegStencilBack];
+                const uint64_t key = (uint64_t(control) << 32) ^ (uint64_t(front & 0xFFFF00) << 8) ^ (back & 0xFFFF00);
+                auto it = depthStates.find(key);
+                if (it != depthStates.end())
+                    return it->second;
+
+                MTLDepthStencilDescriptor* descriptor = [[MTLDepthStencilDescriptor alloc] init];
+                const bool zEnable = control & 2, zWrite = control & 4;
+                descriptor.depthCompareFunction = zEnable ? MTLCompareFunction((control >> 4) & 7) : MTLCompareFunctionAlways;
+                descriptor.depthWriteEnabled = zEnable && zWrite;
+                if (control & 1)
+                {
+                    auto stencil = [](uint32_t bits, uint32_t refMask) {
+                        MTLStencilDescriptor* side = [[MTLStencilDescriptor alloc] init];
+                        side.stencilCompareFunction = MTLCompareFunction(bits & 7);
+                        side.stencilFailureOperation = MTLStencilOperation((bits >> 3) & 7);
+                        side.depthStencilPassOperation = MTLStencilOperation((bits >> 6) & 7);
+                        side.depthFailureOperation = MTLStencilOperation((bits >> 9) & 7);
+                        side.readMask = (refMask >> 8) & 0xFF;
+                        side.writeMask = (refMask >> 16) & 0xFF;
+                        return side;
+                    };
+                    descriptor.frontFaceStencil = stencil(control >> 8, front);
+                    // Sin "backface_enable" (bit 7) la cara trasera usa lo mismo que la delantera.
+                    descriptor.backFaceStencil = (control & 0x80) ? stencil(control >> 20, back) : stencil(control >> 8, front);
+                }
+                id<MTLDepthStencilState> state = [device newDepthStencilStateWithDescriptor:descriptor];
+                depthStates[key] = state;
+                return state;
             }
 
             // Textura a partir de una constante de fetch (6 palabras).
@@ -382,7 +438,16 @@ namespace gpu
                 pass.colorAttachments[0].loadAction = clearPending ? MTLLoadActionClear : MTLLoadActionLoad;
                 pass.colorAttachments[0].clearColor = clearColor;
                 pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+                pass.depthAttachment.texture = depth;
+                pass.depthAttachment.loadAction = depthClearPending ? MTLLoadActionClear : MTLLoadActionLoad;
+                pass.depthAttachment.clearDepth = clearDepth;
+                pass.depthAttachment.storeAction = MTLStoreActionStore;
+                pass.stencilAttachment.texture = depth;
+                pass.stencilAttachment.loadAction = depthClearPending ? MTLLoadActionClear : MTLLoadActionLoad;
+                pass.stencilAttachment.clearStencil = clearStencil;
+                pass.stencilAttachment.storeAction = MTLStoreActionStore;
                 clearPending = false;
+                depthClearPending = false;
                 encoder = [commands renderCommandEncoderWithDescriptor:pass];
             }
 
@@ -423,6 +488,11 @@ namespace gpu
                 BeginPass();
                 [encoder setRenderPipelineState:pipeline];
                 [encoder setCullMode:MTLCullModeNone];
+                [encoder setDepthStencilState:DepthState(draw.registers)];
+                [encoder setStencilFrontReferenceValue:draw.registers[kRegStencilFront] & 0xFF
+                    backReferenceValue:((draw.registers[kRegDepthControl] & 0x80) ? draw.registers[kRegStencilBack] : draw.registers[kRegStencilFront]) & 0xFF];
+                // PA_SU_SC_MODE_CNTL bit 2: 0 = la cara delantera es la de sentido antihorario.
+                [encoder setFrontFacingWinding:(draw.registers[kRegModeControl] & 4) ? MTLWindingClockwise : MTLWindingCounterClockwise];
 
                 DrawState state{};
                 state.primitive = primitive;
@@ -615,6 +685,24 @@ namespace gpu
                     clearColor = MTLClearColorMake(((clear >> 16) & 0xFF) / 255.0, ((clear >> 8) & 0xFF) / 255.0,
                         (clear & 0xFF) / 255.0, ((clear >> 24) & 0xFF) / 255.0);
                     clearPending = true;
+                }
+                // Borrado de profundidad / stencil (bit 9). D24S8 o D24FS8 (20e4) según RB_DEPTH_INFO.
+                if (control & 0x200)
+                {
+                    EndPass(false);
+                    const uint32_t clear = registers[kRegDepthClear], value = clear >> 8;
+                    if (registers[kRegDepthInfo] & 0x10000)
+                    {
+                        const uint32_t exponent = value >> 20, mantissa = value & 0xFFFFF;
+                        clearDepth = exponent ? std::ldexp(1.0 + mantissa / 1048576.0, int(exponent) - 15) : std::ldexp(mantissa / 1048576.0, -14);
+                        clearDepth = std::min(clearDepth, 1.0);
+                    }
+                    else
+                    {
+                        clearDepth = value / 16777215.0;
+                    }
+                    clearStencil = uint8_t(clear & 0xFF);
+                    depthClearPending = true;
                 }
             }
         };

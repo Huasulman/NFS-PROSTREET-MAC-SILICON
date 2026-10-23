@@ -401,7 +401,7 @@ namespace gpu
                 {
                     RendererResolve(gState.registers.data());
                 }
-                else if (mode == 4) // 5 = solo profundidad: sin búfer de profundidad todavía, se omite
+                else if (mode == 4 || mode == 5) // 5 = solo profundidad
                 {
                     DrawCall draw{};
                     draw.registers = gState.registers.data();
@@ -409,6 +409,7 @@ namespace gpu
                     draw.pixelShader = &gState.pixelShader;
                     draw.primitive = drawInitiator & 0x3F;
                     draw.count = drawInitiator >> 16;
+                    draw.depthOnly = mode == 5;
                     const uint32_t source = (drawInitiator >> 6) & 3; // 0 = índices en memoria, 2 = automáticos
                     if (source == 0 && opcode == 0x22)
                     {
