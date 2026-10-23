@@ -23,6 +23,21 @@ namespace gpu
         constexpr uint32_t kRegViewportXScale = 0x210F; // PA_CL_VPORT_XSCALE (y luego XOFFSET, YSCALE...)
         constexpr uint32_t kRegBlendControl0 = 0x2201; // RB_BLENDCONTROL0
         constexpr uint32_t kRegVteControl = 0x2206;   // PA_CL_VTE_CNTL
+        constexpr uint32_t kRegWindowOffset = 0x2080; // PA_SC_WINDOW_OFFSET
+        constexpr uint32_t kRegModeControl = 0x2205;  // PA_SU_SC_MODE_CNTL
+
+        // Desplazamiento de ventana (x, y con signo de 15 bits) si el modo lo aplica a los
+        // vértices (bit 16). Con "predicated tiling" el juego dibuja la escena en franjas: cada
+        // una se desplaza a la esquina de la EDRAM y un resolve la copia a su sitio.
+        void WindowOffset(const uint32_t* registers, int32_t& x, int32_t& y)
+        {
+            x = y = 0;
+            if (!(registers[kRegModeControl] & 0x10000))
+                return;
+            const uint32_t offset = registers[kRegWindowOffset];
+            x = int32_t(offset << 17) >> 17;
+            y = int32_t((offset >> 16) << 17) >> 17;
+        }
         constexpr uint32_t kRegCopyControl = 0x2318;  // RB_COPY_CONTROL
         constexpr uint32_t kRegCopyDestBase = 0x2319;
         constexpr uint32_t kRegCopyDestPitch = 0x231A;
@@ -338,9 +353,9 @@ namespace gpu
 
             bool Draw(const DrawCall& draw)
             {
-                // De momento: listas de triángulos, tiras y listas de quads.
+                // De momento: listas de triángulos, tiras, listas de rectángulos y de quads.
                 const uint32_t primitive = draw.primitive;
-                if ((primitive != 4 && primitive != 6 && primitive != 13) || draw.count == 0 ||
+                if ((primitive != 4 && primitive != 6 && primitive != 8 && primitive != 13) || draw.count == 0 ||
                     draw.vertexShader->code.empty() || draw.pixelShader->code.empty())
                 {
                     skipped++;
@@ -372,6 +387,10 @@ namespace gpu
                 }
                 state.targetSize[0] = kTargetWidth;
                 state.targetSize[1] = kTargetHeight;
+                int32_t windowX, windowY;
+                WindowOffset(draw.registers, windowX, windowY);
+                state.windowOffset[0] = float(windowX);
+                state.windowOffset[1] = float(windowY);
                 std::memcpy(state.bools, &draw.registers[kRegBoolConstants], sizeof(state.bools));
 
                 const uint32_t* vertexConstants = &draw.registers[kRegAluConstants];
@@ -391,11 +410,33 @@ namespace gpu
                     [encoder setFragmentSamplerState:SamplerFor(&fetchConstants[slot * 6]) atIndex:slot];
                 }
 
-                const uint32_t vertices = primitive == 13 ? draw.count / 4 * 6 : draw.count;
+                const uint32_t vertices = primitive == 13 ? draw.count / 4 * 6 : primitive == 8 ? draw.count / 3 * 6 : draw.count;
                 [encoder drawPrimitives:primitive == 6 ? MTLPrimitiveTypeTriangleStrip : MTLPrimitiveTypeTriangle
                     vertexStart:0 vertexCount:vertices];
                 draws++;
                 return true;
+            }
+
+            // Rectángulo del resolve: 3 vértices (x, y en float) de la constante de fetch 0, más el
+            // desplazamiento de ventana. Si no parece válido se deja el que viene (todo el destino).
+            void ResolveRect(const uint32_t* registers, uint32_t& left, uint32_t& top, uint32_t& right, uint32_t& bottom)
+            {
+                const uint32_t vertices = 0xA0000000 | (registers[kRegFetchConstants] & 0x1FFFFFFC);
+                float minX = 1e9f, minY = 1e9f, maxX = -1e9f, maxY = -1e9f;
+                for (int i = 0; i < 3; i++)
+                {
+                    const float x = AsFloat(__builtin_bswap32(*static_cast<const uint32_t*>(memory::Translate(vertices + i * 8))));
+                    const float y = AsFloat(__builtin_bswap32(*static_cast<const uint32_t*>(memory::Translate(vertices + i * 8 + 4))));
+                    minX = std::min(minX, x); maxX = std::max(maxX, x);
+                    minY = std::min(minY, y); maxY = std::max(maxY, y);
+                }
+                int32_t windowX, windowY;
+                WindowOffset(registers, windowX, windowY);
+                minX += windowX; maxX += windowX; minY += windowY; maxY += windowY;
+                if (!(minX >= 0 && minY >= 0 && maxX > minX && maxY > minY && maxX <= 8192 && maxY <= 8192))
+                    return;
+                left = uint32_t(minX); top = uint32_t(minY);
+                right = uint32_t(maxX); bottom = uint32_t(maxY);
             }
 
             void Resolve(const uint32_t* registers)
@@ -409,13 +450,34 @@ namespace gpu
                 const uint32_t destEndian = destInfo & 7, destFormat = (destInfo >> 7) & 0x3F;
                 const uint32_t source = control & 7;
 
-                // Copiar la EDRAM a memoria (solo color, formato 8_8_8_8 por ahora).
-                if (source < 4 && destFormat == 6 && destBase && destPitch && destHeight)
+                static const bool trace = std::getenv("PROSTREET_GPU_RESOLVES") != nullptr;
+                if (trace)
+                {
+                    // El rectángulo del resolve son 3 vértices (x, y en float) de la constante de fetch 0.
+                    const uint32_t vertices = 0xA0000000 | (registers[kRegFetchConstants] & 0x1FFFFFFC);
+                    float rect[6];
+                    for (int i = 0; i < 6; i++)
+                        rect[i] = AsFloat(__builtin_bswap32(*static_cast<const uint32_t*>(memory::Translate(vertices + i * 4))));
+                    std::fprintf(stderr, "[resolve] control 0x%X destino 0x%08X pitch %u alto %u info 0x%08X | ventana 0x%08X "
+                        "recorte 0x%08X-0x%08X superficie 0x%08X color 0x%08X modo 0x%08X | rect (%.0f,%.0f) (%.0f,%.0f) (%.0f,%.0f)\n",
+                        control, destBase, destPitch, destHeight, destInfo, registers[0x2080], registers[0x2081],
+                        registers[0x2082], registers[kRegSurfaceInfo], registers[0x2001], registers[0x2205],
+                        rect[0], rect[1], rect[2], rect[3], rect[4], rect[5]);
+                }
+
+                // Copiar la EDRAM a memoria (solo color, formato 8_8_8_8 por ahora). El rectángulo
+                // está en coordenadas de pantalla: con el desplazamiento de ventana pasa a las de
+                // la EDRAM, que son también las del destino (cuya base ya apunta a la franja).
+                uint32_t left = 0, top = 0, right = destPitch, bottom = destHeight;
+                ResolveRect(registers, left, top, right, bottom);
+                right = std::min({right, destPitch, kTargetWidth});
+                bottom = std::min({bottom, destHeight, kTargetHeight});
+                if (source < 4 && destFormat == 6 && destBase && right > left && bottom > top)
                 {
                     EndPass(true);
-                    const uint32_t width = std::min(destPitch, kTargetWidth), height = std::min(destHeight, kTargetHeight);
+                    const uint32_t width = right - left, height = bottom - top;
                     std::vector<uint32_t> pixels(size_t(width) * height);
-                    [target getBytes:pixels.data() bytesPerRow:width * 4 fromRegion:MTLRegionMake2D(0, 0, width, height) mipmapLevel:0];
+                    [target getBytes:pixels.data() bytesPerRow:width * 4 fromRegion:MTLRegionMake2D(left, top, width, height) mipmapLevel:0];
                     auto* dest = static_cast<uint8_t*>(memory::Translate(0xA0000000 | (destBase & 0x1FFFFFFF)));
                     for (uint32_t y = 0; y < height; y++)
                     {
@@ -431,7 +493,7 @@ namespace gpu
                             case 3: value = (value << 16) | (value >> 16); break;
                             default: break;
                             }
-                            std::memcpy(dest + TiledOffset(x, y, destPitch, 2), &value, 4);
+                            std::memcpy(dest + TiledOffset(left + x, top + y, destPitch, 2), &value, 4);
                         }
                     }
                 }

@@ -15,7 +15,7 @@ using namespace metal;
 struct DrawState
 {
     uint primitive; uint indexSize; uint indexBase; uint indexEndian; uint indexOffset; uint vte;
-    float viewportScale[4]; float viewportOffset[4]; float targetSize[2]; uint padding[2]; uint bools[8];
+    float viewportScale[4]; float viewportOffset[4]; float targetSize[2]; float windowOffset[2]; uint bools[8];
 };
 
 struct VSOut
@@ -486,16 +486,11 @@ inline bool bool_constant(constant DrawState& st, uint index) { return (st.bools
                 // Cabecera y cuerpo de la función.
                 if (!pixel)
                 {
-                    out << "vertex VSOut " << entry << "(uint vid [[vertex_id]], device const uint* mem [[buffer(0)]],\n"
-                        << "    constant float4* c [[buffer(1)]], constant uint* fc [[buffer(2)]], constant DrawState& st [[buffer(3)]])\n{\n";
-                    out << R"MSL(    // Índice del vértice: las listas de quads se dibujan como dos triángulos por quad.
-    uint index = vid;
-    if (st.primitive == 13)
-    {
-        const uint corners[6] = { 0, 1, 2, 0, 2, 3 };
-        index = (vid / 6) * 4 + corners[vid % 6];
-    }
-    if (st.indexSize == 2)
+                    // El shader del juego va en una función aparte (<entrada>_run): las listas de
+                    // rectángulos necesitan ejecutarlo para tres vértices y deducir el cuarto.
+                    out << "static VSOut " << entry << "_run(uint index, device const uint* mem, constant float4* c,\n"
+                        << "    constant uint* fc, constant DrawState& st)\n{\n";
+                    out << R"MSL(    if (st.indexSize == 2)
     {
         uint address = st.indexBase + index * 2;
         uint word = load_word(mem, address & ~3u, st.indexEndian);
@@ -531,6 +526,7 @@ inline bool bool_constant(constant DrawState& st, uint index) { return (st.bools
     window.y = ((vte & 4) ? v.y * st.viewportScale[1] : v.y) + ((vte & 8) ? st.viewportOffset[1] : 0.0f);
     window.z = ((vte & 16) ? v.z * st.viewportScale[2] : v.z) + ((vte & 32) ? st.viewportOffset[2] : 0.0f);
     float wOut = (vte & 0x100) ? 1.0f : w;
+    window.xy += float2(st.windowOffset[0], st.windowOffset[1]); // PA_SC_WINDOW_OFFSET (tiling)
     float2 clip = float2(window.x / st.targetSize[0] * 2.0f - 1.0f, 1.0f - window.y / st.targetSize[1] * 2.0f);
 
     VSOut result;
@@ -540,6 +536,47 @@ inline bool bool_constant(constant DrawState& st, uint index) { return (st.bools
     result.i8 = o[8]; result.i9 = o[9]; result.i10 = o[10]; result.i11 = o[11];
     result.i12 = o[12]; result.i13 = o[13]; result.i14 = o[14]; result.i15 = o[15];
     return result;
+}
+)MSL";
+                    out << "vertex VSOut " << entry << "(uint vid [[vertex_id]], device const uint* mem [[buffer(0)]],\n"
+                        << "    constant float4* c [[buffer(1)]], constant uint* fc [[buffer(2)]], constant DrawState& st [[buffer(3)]])\n{\n";
+                    out << R"MSL(    // Listas de quads: dos triángulos por quad (0 1 2, 0 2 3).
+    if (st.primitive == 13)
+    {
+        const uint corners[6] = { 0, 1, 2, 0, 2, 3 };
+        return )MSL" << entry << R"MSL(_run((vid / 6) * 4 + corners[vid % 6], mem, c, fc, st);
+    }
+    // Listas de rectángulos: 3 esquinas por rectángulo. El primer triángulo son las tres; el
+    // segundo usa la cuarta, P + Q - R, donde R es la esquina en ángulo recto (la opuesta al
+    // lado más largo), para la posición y para todos los interpolantes.
+    if (st.primitive == 8)
+    {
+        uint rect = vid / 6, k = vid % 6;
+        if (k < 3)
+            return )MSL" << entry << R"MSL(_run(rect * 3 + k, mem, c, fc, st);
+        VSOut v[3];
+        for (uint i = 0; i < 3; i++)
+            v[i] = )MSL" << entry << R"MSL(_run(rect * 3 + i, mem, c, fc, st);
+        float2 p0 = v[0].position.xy / v[0].position.w, p1 = v[1].position.xy / v[1].position.w,
+               p2 = v[2].position.xy / v[2].position.w;
+        float d01 = distance_squared(p0, p1), d12 = distance_squared(p1, p2), d02 = distance_squared(p0, p2);
+        uint r = (d12 >= d01 && d12 >= d02) ? 0u : ((d02 >= d01) ? 1u : 2u);
+        uint a = (r == 0u) ? 1u : 0u, b = (r == 2u) ? 1u : 2u;
+        if (k == 3) return v[a];
+        if (k == 4) return v[b];
+        VSOut result;
+        result.position = v[a].position + v[b].position - v[r].position;
+        result.i0 = v[a].i0 + v[b].i0 - v[r].i0; result.i1 = v[a].i1 + v[b].i1 - v[r].i1;
+        result.i2 = v[a].i2 + v[b].i2 - v[r].i2; result.i3 = v[a].i3 + v[b].i3 - v[r].i3;
+        result.i4 = v[a].i4 + v[b].i4 - v[r].i4; result.i5 = v[a].i5 + v[b].i5 - v[r].i5;
+        result.i6 = v[a].i6 + v[b].i6 - v[r].i6; result.i7 = v[a].i7 + v[b].i7 - v[r].i7;
+        result.i8 = v[a].i8 + v[b].i8 - v[r].i8; result.i9 = v[a].i9 + v[b].i9 - v[r].i9;
+        result.i10 = v[a].i10 + v[b].i10 - v[r].i10; result.i11 = v[a].i11 + v[b].i11 - v[r].i11;
+        result.i12 = v[a].i12 + v[b].i12 - v[r].i12; result.i13 = v[a].i13 + v[b].i13 - v[r].i13;
+        result.i14 = v[a].i14 + v[b].i14 - v[r].i14; result.i15 = v[a].i15 + v[b].i15 - v[r].i15;
+        return result;
+    }
+    return )MSL" << entry << R"MSL(_run(vid, mem, c, fc, st);
 }
 )MSL";
                 }
