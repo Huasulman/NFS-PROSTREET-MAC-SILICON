@@ -2,6 +2,7 @@
 // También implementa la escritura de PNG para la captura de fotogramas (ImageIO).
 
 #import <Cocoa/Cocoa.h>
+#import <GameController/GameController.h>
 #import <ImageIO/ImageIO.h>
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
@@ -9,6 +10,7 @@
 
 #include <string>
 
+#include "input.h"
 #include "window.h"
 #include "../gpu/presenter.h"
 
@@ -90,6 +92,22 @@ namespace gpu
     [commands commit];
 }
 
+// Teclado: las pulsaciones van a platform::SetKey (sin pasarlas a super, que haría "beep").
+- (BOOL)acceptsFirstResponder
+{
+    return YES;
+}
+
+- (void)keyDown:(NSEvent*)event
+{
+    platform::SetKey(event.keyCode, true);
+}
+
+- (void)keyUp:(NSEvent*)event
+{
+    platform::SetKey(event.keyCode, false);
+}
+
 @end
 
 @interface ProStreetDelegate : NSObject <NSApplicationDelegate, NSWindowDelegate>
@@ -112,10 +130,22 @@ namespace gpu
     self.window.contentView = self.view;
     [self.window center];
     [self.window makeKeyAndOrderFront:nil];
+    [self.window makeFirstResponder:self.view];
     [NSApp activateIgnoringOtherApps:YES];
 
     // Se comprueba si hay fotograma nuevo a 120 Hz: el juego presenta a 60.
-    [NSTimer scheduledTimerWithTimeInterval:1.0 / 120.0 repeats:YES block:^(NSTimer*) { [self.view tick]; }];
+    // También se leen los mandos (siguen funcionando con la ventana en segundo plano).
+    GCController.shouldMonitorBackgroundEvents = YES;
+    [NSTimer scheduledTimerWithTimeInterval:1.0 / 120.0 repeats:YES block:^(NSTimer*) {
+        platform::PollControllers();
+        [self.view tick];
+    }];
+}
+
+// Al perder el foco no llegan los keyUp: se sueltan todas las teclas.
+- (void)windowDidResignKey:(NSNotification*)notification
+{
+    platform::ReleaseAllKeys();
 }
 
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication*)sender

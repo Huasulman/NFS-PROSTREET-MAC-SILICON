@@ -50,4 +50,12 @@ namespace memory
     {
         *static_cast<uint16_t*>(Translate(address)) = __builtin_bswap16(value);
     }
+    inline uint8_t Read8(uint32_t address)
+    {
+        return *static_cast<const uint8_t*>(Translate(address));
+    }
+    inline void Write8(uint32_t address, uint8_t value)
+    {
+        *static_cast<uint8_t*>(Translate(address)) = value;
+    }
 }
