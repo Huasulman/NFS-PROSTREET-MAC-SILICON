@@ -437,6 +437,7 @@ namespace gpu
                 case 18: pixelFormat = MTLPixelFormatBC1_RGBA; blockSize = 4; bytesPerBlock = 8; break;
                 case 19: pixelFormat = MTLPixelFormatBC2_RGBA; blockSize = 4; bytesPerBlock = 16; break;
                 case 20: pixelFormat = MTLPixelFormatBC3_RGBA; blockSize = 4; bytesPerBlock = 16; break;
+                case 49: pixelFormat = MTLPixelFormatBC5_RGUnorm; blockSize = 4; bytesPerBlock = 16; break; // DXN
                 default:
                 {
                     static std::unordered_map<uint32_t, int> reported;
