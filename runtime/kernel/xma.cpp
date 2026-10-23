@@ -132,6 +132,10 @@ PPC_FUNC(__imp__XMAInitializeContext)
     Set(context, kLoopCount, loop >> 24);
     Set(context, kLoopSubframeEnd, (loop >> 16) & 0xFF);
     Set(context, kLoopSubframeSkip, (loop >> 8) & 0xFF);
+    if (std::getenv("PROSTREET_TRACE"))
+        std::fprintf(stderr, "[xma] init 0x%08X: entrada 0x%08X (%u paq.) / 0x%08X (%u paq.), salida 0x%08X (%u bloques), "
+            "frecuencia %u, canales %u, bucle %u-%u x%u\n", context, field(0), field(1), field(2), field(3), field(5),
+            field(6), field(10), field(9), field(11), field(12), loop >> 24);
     ctx.r3.u64 = 0;
 }
 
@@ -139,12 +143,21 @@ PPC_FUNC(__imp__XMAInitializeContext)
 PPC_FUNC(__imp__XMAEnableContext)
 {
     (void)base;
+    if (std::getenv("PROSTREET_TRACE"))
+    {
+        std::fprintf(stderr, "[xma] activar 0x%08X:", ctx.r3.u32);
+        for (uint32_t i = 0; i < 16; i++)
+            std::fprintf(stderr, " %08X", memory::Read32(ctx.r3.u32 + i * 4));
+        std::fprintf(stderr, "\n");
+    }
     ctx.r3.u64 = 0;
 }
 
 PPC_FUNC(__imp__XMADisableContext)
 {
     (void)base;
+    if (std::getenv("PROSTREET_TRACE"))
+        std::fprintf(stderr, "[xma] desactivar 0x%08X\n", ctx.r3.u32);
     ctx.r3.u64 = 0;
 }
 
@@ -152,6 +165,8 @@ PPC_FUNC(__imp__XMADisableContext)
 PPC_FUNC(__imp__XMASetInputBuffer0)
 {
     (void)base;
+    if (std::getenv("PROSTREET_TRACE"))
+        std::fprintf(stderr, "[xma] entrada0 0x%08X: 0x%08X %u paq.\n", ctx.r3.u32, ctx.r4.u32, ctx.r5.u32);
     Set(ctx.r3.u32, kInput0Pointer, ctx.r4.u32);
     Set(ctx.r3.u32, kInput0PacketCount, ctx.r5.u32);
     ctx.r3.u64 = 0;
