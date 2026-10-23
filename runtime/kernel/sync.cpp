@@ -362,6 +362,9 @@ namespace
         std::condition_variable released;
         const void* owner = nullptr; // hilo del anfitrión que lo tiene
         uint32_t recursion = 0;
+        uint32_t ownerId = 0, ownerLr = 0; // para diagnosticar bloqueos
+        std::chrono::steady_clock::time_point ownerSince;
+        bool reported = false;
     };
 
     std::mutex gCriticalSectionsLock;
@@ -382,7 +385,13 @@ namespace
         return *section;
     }
 
-    bool EnterCriticalSection(uint32_t address, bool wait)
+    uint32_t CurrentThreadId()
+    {
+        const Thread* thread = CurrentThread();
+        return thread ? thread->id : 0;
+    }
+
+    bool EnterCriticalSection(const PPCContext& ctx, uint32_t address, bool wait)
     {
         CriticalSectionLock& section = CriticalSection(address);
         std::unique_lock lock(section.mutex);
@@ -390,9 +399,29 @@ namespace
         if (section.owner != self)
         {
             if (!wait && section.owner)
+            {
+                if (!section.reported && std::chrono::steady_clock::now() - section.ownerSince > std::chrono::seconds(5))
+                {
+                    section.reported = true;
+                    std::fprintf(stderr, "[kernel] el hilo %u (lr 0x%08X) no consigue la sección crítica 0x%08X: "
+                        "la tiene el hilo %u desde 0x%08X hace más de 5 s\n", CurrentThreadId(), uint32_t(ctx.lr),
+                        address, section.ownerId, section.ownerLr);
+                }
                 return false;
-            section.released.wait(lock, [&] { return section.owner == nullptr; });
+            }
+            // Si la espera es larga, probablemente sea un bloqueo: se avisa una vez.
+            if (!section.released.wait_for(lock, std::chrono::seconds(5), [&] { return section.owner == nullptr; }))
+            {
+                std::fprintf(stderr, "[kernel] el hilo %u (lr 0x%08X) lleva 5 s esperando la sección crítica 0x%08X, "
+                    "que tiene el hilo %u desde 0x%08X\n", CurrentThreadId(), uint32_t(ctx.lr), address,
+                    section.ownerId, section.ownerLr);
+                section.released.wait(lock, [&] { return section.owner == nullptr; });
+            }
             section.owner = self;
+            section.ownerId = CurrentThreadId();
+            section.ownerLr = uint32_t(ctx.lr);
+            section.ownerSince = std::chrono::steady_clock::now();
+            section.reported = false;
         }
         section.recursion++;
         return true;
@@ -429,7 +458,7 @@ PPC_FUNC(__imp__RtlInitializeCriticalSection)
 PPC_FUNC(__imp__RtlEnterCriticalSection)
 {
     (void)base;
-    EnterCriticalSection(ctx.r3.u32, true);
+    EnterCriticalSection(ctx, ctx.r3.u32, true);
 }
 
 // void RtlLeaveCriticalSection(RTL_CRITICAL_SECTION* cs)
@@ -443,7 +472,7 @@ PPC_FUNC(__imp__RtlLeaveCriticalSection)
 PPC_FUNC(__imp__RtlTryEnterCriticalSection)
 {
     (void)base;
-    ctx.r3.u64 = EnterCriticalSection(ctx.r3.u32, false);
+    ctx.r3.u64 = EnterCriticalSection(ctx, ctx.r3.u32, false);
 }
 
 // --- Spinlocks e IRQL ----------------------------------------------------------------------

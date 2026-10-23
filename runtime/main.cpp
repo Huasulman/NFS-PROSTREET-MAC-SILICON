@@ -14,6 +14,7 @@
 #include <cstring>
 #include <fstream>
 #include <pthread.h>
+#include <thread>
 #include <unistd.h>
 #include <vector>
 
@@ -198,6 +199,42 @@ int main(int argc, char** argv)
     // Con PROSTREET_NO_WINDOW=1 no hay ventana y el programa espera al hilo del juego.
     std::printf("Arrancando: punto de entrada 0x%08X\n\n", kEntryPoint);
     auto mainThread = kernel::CreateThread(kEntryPoint, 0, 0, kMainStackSize, false);
+
+    // PROSTREET_THREADS=N: cada N segundos, la última llamada (lr) de cada hilo del juego, para
+    // ver dónde se queda atascado.
+    if (const char* every = std::getenv("PROSTREET_THREADS"))
+    {
+        const int seconds = std::max(1, std::atoi(every));
+        std::thread([seconds] {
+            for (;;)
+            {
+                std::this_thread::sleep_for(std::chrono::seconds(seconds));
+                std::fprintf(stderr, "[hilos]");
+                for (uint32_t id = 1; id < 64; id++)
+                    if (auto thread = kernel::FindThreadById(id); thread && thread->ctx && !thread->exited)
+                    {
+                        std::fprintf(stderr, " %u:%08X", id, uint32_t(thread->ctx->lr));
+                        if (id == 1)
+                        {
+                            // Pila del invitado: r1 apunta a la cadena de marcos; el lr guardado
+                            // de cada llamante está en (marco anterior - 8).
+                            uint32_t frame = thread->ctx->r1.u32;
+                            std::fprintf(stderr, " [");
+                            for (int depth = 0; depth < 16 && frame > thread->stackEnd && frame < thread->stackBase; depth++)
+                            {
+                                const uint32_t previous = memory::Read32(frame);
+                                if (previous <= frame || previous >= thread->stackBase)
+                                    break;
+                                std::fprintf(stderr, " %08X", memory::Read32(previous - 8));
+                                frame = previous;
+                            }
+                            std::fprintf(stderr, " ]");
+                        }
+                    }
+                std::fprintf(stderr, "\n");
+            }
+        }).detach();
+    }
     if (std::getenv("PROSTREET_NO_WINDOW"))
     {
         pthread_join(mainThread->host, nullptr);
