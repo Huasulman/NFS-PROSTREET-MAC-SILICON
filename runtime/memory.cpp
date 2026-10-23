@@ -10,7 +10,7 @@
 
 namespace memory
 {
-    static uint8_t* gBase = nullptr;
+    uint8_t* gBase = nullptr;
     static std::mutex gLock;
     static std::map<uint32_t, uint32_t> gNext; // inicio de región -> siguiente dirección libre
 
@@ -53,8 +53,6 @@ namespace memory
         mprotect(gBase, 0x10000, PROT_NONE);
         return gBase;
     }
-
-    uint8_t* Base() { return gBase; }
 
     uint32_t Used(uint32_t regionBase)
     {

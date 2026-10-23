@@ -134,6 +134,7 @@ namespace gpu
             std::unordered_map<uint64_t, id<MTLFunction>> functions;
             std::unordered_map<uint64_t, bool> failedShaders;
             std::unordered_map<uint64_t, std::vector<uint32_t>> textureSlots; // texturas de cada shader
+            std::unordered_map<uint64_t, std::vector<std::pair<uint32_t, uint32_t>>> constantRanges; // de cada shader
             std::unordered_map<uint64_t, id<MTLRenderPipelineState>> pipelines;
             std::unordered_map<uint64_t, Texture> textures;
             std::vector<ResolvedSurface> surfaces;
@@ -147,6 +148,60 @@ namespace gpu
             id<MTLTexture> missingTexture;
 
             uint64_t draws = 0, skipped = 0, resolves = 0;
+
+            // Constantes de los shaders (ALU de vértices y de píxeles, y de fetch) en un búfer
+            // circular: se copian solo cuando cambian, no en cada dibujo.
+            static constexpr size_t kRingSize = 64u << 20;
+            static constexpr size_t kConstantsBlock = 256 * 16 * 2 + 32 * 6 * 4; // 8 KB + 768 B
+            id<MTLBuffer> constantRing;
+            size_t ringOffset = 0, constantsOffset = 0;
+            uint64_t uploadedVersion = 0;
+            uint64_t uploadedVertexShader = 0, uploadedPixelShader = 0;
+
+            // Solo se copian los rangos de constantes que usan los shaders del dibujo.
+            size_t UploadConstants(const DrawCall& draw)
+            {
+                const uint64_t vertexShader = draw.vertexShader->hash, pixelShader = draw.pixelShader->hash;
+                if (draw.constantsVersion == uploadedVersion && vertexShader == uploadedVertexShader && pixelShader == uploadedPixelShader)
+                    return constantsOffset;
+                size_t offset = (ringOffset + 255) & ~size_t(255);
+                if (offset + kConstantsBlock > kRingSize)
+                {
+                    // Vuelta al principio: antes hay que esperar a que la GPU haya usado lo anterior.
+                    EndPass(false);
+                    [lastCommit waitUntilCompleted];
+                    offset = 0;
+                }
+                auto* dest = static_cast<uint8_t*>(constantRing.contents) + offset;
+                uint32_t copied = 0;
+                for (const auto& [first, count] : constantRanges[vertexShader])
+                {
+                    std::memcpy(dest + first * 16, &draw.registers[kRegAluConstants + first * 4], count * 16);
+                    copied += count;
+                }
+                for (const auto& [first, count] : constantRanges[pixelShader])
+                {
+                    std::memcpy(dest + 256 * 16 + first * 16, &draw.registers[kRegAluConstants + 256 * 4 + first * 4], count * 16);
+                    copied += count;
+                }
+                std::memcpy(dest + 256 * 16 * 2, &draw.registers[kRegFetchConstants], 32 * 6 * 4);
+                uploadedVertexShader = vertexShader;
+                uploadedPixelShader = pixelShader;
+                static const bool stats = std::getenv("PROSTREET_GPU_STATS") != nullptr;
+                static uint64_t uploads = 0, bytes = 0, calls = 0;
+                if (stats)
+                {
+                    uploads++;
+                    bytes += copied * 16 + 768;
+                    if (++calls % 20000 == 0)
+                        std::fprintf(stderr, "[stats] subidas de constantes: %llu, media %llu bytes\n",
+                            (unsigned long long)uploads, (unsigned long long)(bytes / uploads));
+                }
+                ringOffset = offset + kConstantsBlock;
+                constantsOffset = offset;
+                uploadedVersion = draw.constantsVersion;
+                return offset;
+            }
 
             bool Initialize()
             {
@@ -173,6 +228,7 @@ namespace gpu
                 missingTexture = [device newTextureWithDescriptor:small];
                 const uint32_t magenta = 0xFFFF00FF;
                 [missingTexture replaceRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:0 withBytes:&magenta bytesPerRow:4];
+                constantRing = [device newBufferWithLength:kRingSize options:MTLResourceStorageModeShared];
                 std::fprintf(stderr, "[render] Metal: %s\n", device.name.UTF8String);
                 return memory != nil && target != nil;
             }
@@ -203,6 +259,7 @@ namespace gpu
                     std::fprintf(stderr, "[render] %s: %s\n", translated.entry.c_str(), translated.warnings.c_str());
                 functions[shader.hash] = function;
                 textureSlots[shader.hash] = translated.textures;
+                constantRanges[shader.hash] = translated.constantRanges;
                 if (slots)
                     *slots = translated.textures;
                 return function;
@@ -517,6 +574,7 @@ namespace gpu
                     return false;
                 }
 
+                const size_t constants = UploadConstants(draw);
                 BeginPass();
                 [encoder setRenderPipelineState:pipeline];
                 [encoder setCullMode:MTLCullModeNone];
@@ -546,16 +604,14 @@ namespace gpu
                 state.windowOffset[1] = float(windowY);
                 std::memcpy(state.bools, &draw.registers[kRegBoolConstants], sizeof(state.bools));
 
-                const uint32_t* vertexConstants = &draw.registers[kRegAluConstants];
-                const uint32_t* pixelConstants = &draw.registers[kRegAluConstants + 256 * 4];
                 const uint32_t* fetchConstants = &draw.registers[kRegFetchConstants];
                 [encoder setVertexBuffer:memory offset:0 atIndex:0];
-                [encoder setVertexBytes:vertexConstants length:256 * 16 atIndex:1];
-                [encoder setVertexBytes:fetchConstants length:32 * 6 * 4 atIndex:2];
+                [encoder setVertexBuffer:constantRing offset:constants atIndex:1];
+                [encoder setVertexBuffer:constantRing offset:constants + 256 * 16 * 2 atIndex:2];
                 [encoder setVertexBytes:&state length:sizeof(state) atIndex:3];
                 [encoder setFragmentBuffer:memory offset:0 atIndex:0];
-                [encoder setFragmentBytes:pixelConstants length:256 * 16 atIndex:1];
-                [encoder setFragmentBytes:fetchConstants length:32 * 6 * 4 atIndex:2];
+                [encoder setFragmentBuffer:constantRing offset:constants + 256 * 16 atIndex:1];
+                [encoder setFragmentBuffer:constantRing offset:constants + 256 * 16 * 2 atIndex:2];
                 [encoder setFragmentBytes:&state length:sizeof(state) atIndex:3];
                 for (uint32_t slot : textureSlots)
                 {

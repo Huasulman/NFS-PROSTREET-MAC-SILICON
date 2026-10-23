@@ -18,7 +18,8 @@ namespace memory
     constexpr uint32_t kPhysicalSize = 0x20000000;   // 512 MB
 
     uint8_t* Reserve();
-    uint8_t* Base();
+    extern uint8_t* gBase;
+    inline uint8_t* Base() { return gBase; }
 
     // Reserva memoria del invitado dentro de [regionBase, regionEnd); devuelve la dirección
     // del invitado (0 si no queda espacio). La memoria nueva está a cero.

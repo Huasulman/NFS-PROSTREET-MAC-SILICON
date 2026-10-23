@@ -55,6 +55,7 @@ namespace gpu
             uint32_t interruptCallback = 0;
             uint32_t interruptUserData = 0;
             std::array<uint32_t, kRegisterCount> registers{};
+            uint64_t constantsVersion = 1; // cambia al escribir constantes ALU / fetch / bool / loop
 
             // Predicated tiling: cada paquete predicado solo se ejecuta si su franja está activa.
             uint64_t binMask = ~0ull, binSelect = ~0ull;
@@ -105,6 +106,8 @@ namespace gpu
                 return;
             gState.registers[index] = value;
             memory::Write32(kMmioBase + index * 4, value);
+            if (index >= 0x4000 && index < 0x4920)
+                gState.constantsVersion++;
 
             // Registros scratch: si su bit de SCRATCH_UMSK está activo, se copian a memoria.
             // D3D los usa como vallas para saber hasta dónde ha llegado la GPU.
@@ -410,6 +413,7 @@ namespace gpu
                     draw.primitive = drawInitiator & 0x3F;
                     draw.count = drawInitiator >> 16;
                     draw.depthOnly = mode == 5;
+                    draw.constantsVersion = gState.constantsVersion;
                     const uint32_t source = (drawInitiator >> 6) & 3; // 0 = índices en memoria, 2 = automáticos
                     if (source == 0 && opcode == 0x22)
                     {

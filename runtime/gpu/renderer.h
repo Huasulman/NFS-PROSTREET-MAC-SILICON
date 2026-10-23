@@ -23,6 +23,7 @@ namespace gpu
         uint32_t indexBase;         // dirección física
         uint32_t indexEndian;
         bool depthOnly;             // RB_MODECONTROL = 5: solo profundidad, sin color
+        uint64_t constantsVersion;  // cambia cuando cambia alguna constante de shader
     };
 
     // Devuelven false si el renderer no está disponible (sin GPU Metal).
