@@ -64,6 +64,24 @@ namespace gpu
             uint64_t hash = 0; // huella de la memoria original (con mosaico, sin intercambiar)
         };
 
+        // Imagen que ha escrito un resolve (con mosaico, 8_8_8_8): se guarda también una copia en
+        // la GPU. Si un dibujo la usa luego como textura y la memoria no ha cambiado, se usa esa
+        // copia en vez de deshacer el mosaico y volver a subirla. Con predicated tiling, cada
+        // franja se escribe en su parte de la misma imagen.
+        struct ResolvedSurface
+        {
+            uint32_t base = 0, pitch = 0, height = 0, endian = 0;
+            id<MTLTexture> texture; // RGBA8 tal como está en el renderer
+            id<MTLTexture> view;    // la misma, con R y B cambiados: lo que lee la textura del juego
+            uint64_t hash = 0;      // de la memoria de toda la imagen tras el último resolve
+        };
+
+        // Bytes de la memoria original de una imagen con mosaico (las filas van de 32 en 32).
+        size_t TiledSize(uint32_t pitchBlocks, uint32_t blocksY, uint32_t bytesPerBlock)
+        {
+            return size_t((pitchBlocks + 31) & ~31u) * ((blocksY + 31) & ~31u) * bytesPerBlock;
+        }
+
         // Huella rápida de un bloque de memoria: palabras de 64 bits cada 32 bytes. Basta para
         // ver si una textura cambió (resolves, vídeos, texturas que se cargan) sin reconvertirla.
         uint64_t HashMemory(const uint8_t* data, size_t size)
@@ -101,6 +119,7 @@ namespace gpu
             std::unordered_map<uint64_t, std::vector<uint32_t>> textureSlots; // texturas de cada shader
             std::unordered_map<uint64_t, id<MTLRenderPipelineState>> pipelines;
             std::unordered_map<uint64_t, Texture> textures;
+            std::vector<ResolvedSurface> surfaces;
             std::unordered_map<uint32_t, id<MTLSamplerState>> samplers;
             id<MTLTexture> missingTexture;
 
@@ -244,7 +263,11 @@ namespace gpu
                 const uint32_t pitch = ((fetch[0] >> 22) & 0x1FF) * 32;
                 const uint32_t format = fetch[1] & 0x3F, endian = (fetch[1] >> 6) & 3;
                 const uint32_t base = fetch[1] & 0xFFFFF000;
-                const uint32_t width = (fetch[2] & 0x1FFF) + 1, height = ((fetch[2] >> 13) & 0x1FFF) + 1;
+                // Tamaño: 13 + 13 bits en 2D; en 3D, 11 + 11 (+ 10 de profundidad). De una textura 3D
+                // (p. ej. una tabla de color) de momento se usa la primera capa como 2D.
+                const uint32_t dimension = (fetch[5] >> 9) & 3;
+                const uint32_t width = dimension == 2 ? (fetch[2] & 0x7FF) + 1 : (fetch[2] & 0x1FFF) + 1;
+                const uint32_t height = dimension == 2 ? ((fetch[2] >> 11) & 0x7FF) + 1 : ((fetch[2] >> 13) & 0x1FFF) + 1;
 
                 MTLPixelFormat pixelFormat;
                 uint32_t blockSize = 1, bytesPerBlock;
@@ -275,10 +298,14 @@ namespace gpu
 
                 // ¿Ha cambiado? Se mira la memoria original (con mosaico, las filas van de 32 en 32).
                 const auto* source = static_cast<const uint8_t*>(memory::Translate(0xA0000000 | (base & 0x1FFFFFFF)));
-                const uint32_t rows = tiled ? (blocksY + 31) & ~31u : blocksY;
-                const size_t rawSize = std::min<size_t>(size_t(tiled ? (pitchBlocks + 31) & ~31u : pitchBlocks) * rows * bytesPerBlock,
-                    0x20000000 - (base & 0x1FFFFFFF));
+                const size_t rawSize = std::min<size_t>(tiled ? TiledSize(pitchBlocks, blocksY, bytesPerBlock) :
+                    size_t(pitchBlocks) * blocksY * bytesPerBlock, 0x20000000 - (base & 0x1FFFFFFF));
                 const uint64_t hash = HashMemory(source, rawSize);
+                if (format == 6 && tiled)
+                    for (const ResolvedSurface& surface : surfaces)
+                        if (surface.base == (base & 0x1FFFFFFF) && surface.pitch == pitchBlocks && surface.height == height &&
+                            surface.endian == endian && width <= surface.pitch && surface.hash == hash)
+                            return surface.view;
                 const uint64_t key = (uint64_t(base) << 32) ^ (uint64_t(format) << 26) ^ (uint64_t(width) << 13) ^ height;
                 Texture& cached = textures[key];
                 if (cached.texture && cached.hash == hash)
@@ -441,6 +468,63 @@ namespace gpu
                 return true;
             }
 
+            // Copia en la GPU de lo que acaba de escribir un resolve (ver ResolvedSurface).
+            void UpdateSurface(uint32_t base, uint32_t pitch, uint32_t height, uint32_t endian,
+                uint32_t left, uint32_t top, uint32_t width, uint32_t rows)
+            {
+                // ¿Es una franja de una imagen ya conocida? Las filas de 32 en 32 son contiguas.
+                ResolvedSurface* surface = nullptr;
+                uint32_t offsetY = 0;
+                const uint32_t macroRow = pitch * 4 * 32;
+                for (ResolvedSurface& candidate : surfaces)
+                {
+                    const uint32_t size = candidate.pitch * 4 * candidate.height;
+                    if (candidate.pitch == pitch && base >= candidate.base && base < candidate.base + size &&
+                        (base - candidate.base) % macroRow == 0)
+                    {
+                        surface = &candidate;
+                        offsetY = (base - candidate.base) / (pitch * 4);
+                        break;
+                    }
+                }
+                if (!surface || offsetY + top + rows > surface->height)
+                {
+                    if (surface)
+                        surfaces.erase(surfaces.begin() + (surface - surfaces.data()));
+                    if (surfaces.size() >= 32)
+                        surfaces.erase(surfaces.begin());
+                    MTLTextureDescriptor* descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                        width:pitch height:height mipmapped:NO];
+                    descriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
+                    descriptor.storageMode = MTLStorageModePrivate;
+                    ResolvedSurface created;
+                    created.base = base;
+                    created.pitch = pitch;
+                    created.height = height;
+                    created.texture = [device newTextureWithDescriptor:descriptor];
+                    created.view = [created.texture newTextureViewWithPixelFormat:MTLPixelFormatRGBA8Unorm textureType:MTLTextureType2D
+                        levels:NSMakeRange(0, 1) slices:NSMakeRange(0, 1)
+                        swizzle:MTLTextureSwizzleChannelsMake(MTLTextureSwizzleBlue, MTLTextureSwizzleGreen,
+                            MTLTextureSwizzleRed, MTLTextureSwizzleAlpha)];
+                    surfaces.push_back(created);
+                    surface = &surfaces.back();
+                    offsetY = 0;
+                }
+                surface->endian = endian;
+
+                id<MTLCommandBuffer> copy = [queue commandBuffer];
+                id<MTLBlitCommandEncoder> blit = [copy blitCommandEncoder];
+                [blit copyFromTexture:target sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(left, top, 0)
+                    sourceSize:MTLSizeMake(width, rows, 1) toTexture:surface->texture destinationSlice:0 destinationLevel:0
+                    destinationOrigin:MTLOriginMake(left, offsetY + top, 0)];
+                [blit endEncoding];
+                [copy commit];
+
+                const auto* memoryStart = static_cast<const uint8_t*>(memory::Translate(0xA0000000 | surface->base));
+                surface->hash = HashMemory(memoryStart, std::min<size_t>(TiledSize(pitch, surface->height, 4),
+                    0x20000000 - surface->base));
+            }
+
             // Rectángulo del resolve: 3 vértices (x, y en float) de la constante de fetch 0, más el
             // desplazamiento de ventana. Si no parece válido se deja el que viene (todo el destino).
             void ResolveRect(const uint32_t* registers, uint32_t& left, uint32_t& top, uint32_t& right, uint32_t& bottom)
@@ -520,6 +604,7 @@ namespace gpu
                             std::memcpy(dest + TiledOffset(left + x, top + y, destPitch, 2), &value, 4);
                         }
                     }
+                    UpdateSurface(destBase & 0x1FFFFFFF, destPitch, destHeight, destEndian, left, top, width, height);
                 }
 
                 // Borrado tras la copia (RB_COPY_CONTROL bit 8): en la siguiente pasada.
