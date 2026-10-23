@@ -70,6 +70,7 @@ namespace
 
     std::mutex gLinksLock;
     std::unordered_map<std::string, std::string> gSymbolicLinks; // en minúsculas, sin "\??\"
+    std::unordered_map<std::string, fs::path> gMounts;           // unidad en minúsculas ("save:") -> carpeta
 
     struct Resolved
     {
@@ -130,7 +131,17 @@ namespace
         }
 
         Resolved resolved;
-        if (key == "d:" || key == "game:" || key == "\\device\\cdrom0")
+        fs::path mount;
+        {
+            std::lock_guard lock(gLinksLock);
+            if (auto it = gMounts.find(key); it != gMounts.end())
+                mount = it->second;
+        }
+        if (!mount.empty()) // paquete de contenido montado (XamContentCreateEx)
+        {
+            resolved.host = mount;
+        }
+        else if (key == "d:" || key == "game:" || key == "\\device\\cdrom0")
         {
             resolved.host = fs::path("game");
             resolved.readOnly = true;
@@ -757,4 +768,18 @@ PPC_FUNC(__imp__NtDeviceIoControlFile)
         file ? file->guestPath.c_str() : "?");
     WriteIoStatus(ctx.r7.u32, kStatusNotImplemented, 0);
     ctx.r3.u64 = kStatusNotImplemented;
+}
+
+void MountDevice(const std::string& device, const std::string& hostPath)
+{
+    std::error_code error;
+    fs::create_directories(hostPath, error);
+    std::lock_guard lock(gLinksLock);
+    gMounts[Lower(device)] = fs::path(hostPath);
+}
+
+void UnmountDevice(const std::string& device)
+{
+    std::lock_guard lock(gLinksLock);
+    gMounts.erase(Lower(device));
 }

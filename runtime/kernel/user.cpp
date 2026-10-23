@@ -38,29 +38,6 @@ namespace
         memory::Write32(address + 4, uint32_t(value));
     }
 
-    // Termina en el acto una operación asíncrona (XOVERLAPPED: InternalLow = resultado,
-    // InternalHigh = longitud, hEvent en +12, error extendido en +24).
-    void CompleteOverlapped(uint32_t overlapped, uint32_t result, uint32_t length = 0)
-    {
-        memory::Write32(overlapped + 0, result);
-        memory::Write32(overlapped + 4, length);
-        memory::Write32(overlapped + 24, result);
-        if (const uint32_t handle = memory::Read32(overlapped + 12))
-        {
-            auto object = FromHandle(handle);
-            if (object && (object->type == ObjectType::NotificationEvent || object->type == ObjectType::SynchronizationEvent))
-            {
-                auto* event = static_cast<Event*>(object.get());
-                {
-                    std::lock_guard lock(DispatcherLock());
-                    event->signaled = true;
-                    event->WriteSignalState(1);
-                }
-                NotifyAll();
-            }
-        }
-    }
-
     // --- Ajustes del perfil ----------------------------------------------------------------
     // El identificador de un ajuste lleva su tipo en los 4 bits altos y su tamaño máximo en
     // los bits 16-27. Tipos (X_USER_DATA): 1 int32, 2 int64, 3 double, 4 texto UTF-16,
@@ -96,6 +73,28 @@ namespace
         std::filesystem::create_directories(SettingPath(id).parent_path(), error);
         std::ofstream file(SettingPath(id), std::ios::binary | std::ios::trunc);
         file.write(reinterpret_cast<const char*>(data), std::streamsize(size));
+    }
+}
+
+// XOVERLAPPED: InternalLow = resultado, InternalHigh = longitud, hEvent en +12, error extendido en +24.
+void CompleteOverlapped(uint32_t overlapped, uint32_t result, uint32_t length)
+{
+    memory::Write32(overlapped + 0, result);
+    memory::Write32(overlapped + 4, length);
+    memory::Write32(overlapped + 24, result);
+    if (const uint32_t handle = memory::Read32(overlapped + 12))
+    {
+        auto object = FromHandle(handle);
+        if (object && (object->type == ObjectType::NotificationEvent || object->type == ObjectType::SynchronizationEvent))
+        {
+            auto* event = static_cast<Event*>(object.get());
+            {
+                std::lock_guard lock(DispatcherLock());
+                event->signaled = true;
+                event->WriteSignalState(1);
+            }
+            NotifyAll();
+        }
     }
 }
 
