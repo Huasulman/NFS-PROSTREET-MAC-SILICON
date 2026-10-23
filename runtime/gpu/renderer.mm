@@ -84,6 +84,7 @@ namespace gpu
             uint64_t hash = 0;      // de la memoria de toda la imagen tras el último resolve
             // Escritura diferida: la memoria del juego aún no tiene este rectángulo (en filas de la imagen).
             bool pending = false;
+            uint64_t validEpoch = 0; // época en la que su memoria se comprobó (hash) por última vez
             uint32_t pendingLeft = 0, pendingTop = 0, pendingRight = 0, pendingBottom = 0;
         };
 
@@ -366,16 +367,26 @@ namespace gpu
                 const auto* source = static_cast<const uint8_t*>(memory::Translate(0xA0000000 | (base & 0x1FFFFFFF)));
                 const size_t rawSize = std::min<size_t>(tiled ? TiledSize(pitchBlocks, blocksY, bytesPerBlock) :
                     size_t(pitchBlocks) * blocksY * bytesPerBlock, 0x20000000 - (base & 0x1FFFFFFF));
+                // ¿Es la imagen de un resolve? Entonces se usa su copia en la GPU, mientras la memoria no
+                // haya cambiado desde el resolve (se comprueba una vez por época).
+                if (format == 6 && tiled)
+                    for (ResolvedSurface& surface : surfaces)
+                        if (surface.base == (base & 0x1FFFFFFF) && surface.pitch == pitchBlocks && surface.height == height &&
+                            surface.endian == endian && width <= surface.pitch)
+                        {
+                            if (surface.validEpoch == epoch)
+                                return surface.view;
+                            if (surface.hash == HashMemory(source, rawSize))
+                            {
+                                surface.validEpoch = epoch;
+                                return surface.view;
+                            }
+                        }
                 const uint64_t key = (uint64_t(base) << 32) ^ (uint64_t(format) << 26) ^ (uint64_t(width) << 13) ^ height;
                 Texture& cached = textures[key];
                 if (cached.texture && cached.epoch == epoch)
                     return cached.texture;
                 const uint64_t hash = HashMemory(source, rawSize);
-                if (format == 6 && tiled)
-                    for (const ResolvedSurface& surface : surfaces)
-                        if (surface.base == (base & 0x1FFFFFFF) && surface.pitch == pitchBlocks && surface.height == height &&
-                            surface.endian == endian && width <= surface.pitch && surface.hash == hash)
-                            return surface.view;
                 // Si la textura cae sobre un resolve aún no escrito en memoria (y no ha podido usar su
                 // copia), se escribe ahora para leer lo que toca.
                 if (WritebackOverlapping(base & 0x1FFFFFFF, rawSize))
@@ -588,6 +599,8 @@ namespace gpu
                         std::memcpy(dest + TiledOffset(left + x, top + y, surface.pitch, 2), &value, 4);
                     }
                 surface.hash = HashMemory(dest, std::min<size_t>(TiledSize(surface.pitch, surface.height, 4), 0x20000000 - surface.base));
+                epoch++; // la memoria del juego ha cambiado
+                surface.validEpoch = epoch;
             }
 
             // Escribe los resolves pendientes que se solapan con [base, base + size). Devuelve si escribió alguno.
@@ -703,9 +716,15 @@ namespace gpu
                     }
                     surface->pending = true;
                 }
-                const auto* memoryStart = static_cast<const uint8_t*>(memory::Translate(0xA0000000 | surface->base));
-                surface->hash = HashMemory(memoryStart, std::min<size_t>(TiledSize(pitch, surface->height, 4),
-                    0x20000000 - surface->base));
+                // Huella de la memoria tal como queda tras el resolve (una vez por época si es diferido:
+                // entonces el resolve no la cambia).
+                if (!deferred || surface->validEpoch != epoch)
+                {
+                    const auto* memoryStart = static_cast<const uint8_t*>(memory::Translate(0xA0000000 | surface->base));
+                    surface->hash = HashMemory(memoryStart, std::min<size_t>(TiledSize(pitch, surface->height, 4),
+                        0x20000000 - surface->base));
+                    surface->validEpoch = epoch;
+                }
             }
 
             // Rectángulo del resolve: 3 vértices (x, y en float) de la constante de fetch 0, más el
@@ -763,7 +782,8 @@ namespace gpu
                 ResolveRect(registers, left, top, right, bottom);
                 right = std::min({right, destPitch, kTargetWidth});
                 bottom = std::min({bottom, destHeight, kTargetHeight});
-                epoch++;
+                if (immediateWriteback)
+                    epoch++; // la memoria cambia en el acto
                 if (source < 4 && destFormat == 6 && destBase && right > left && bottom > top && !immediateWriteback)
                 {
                     // Solo en la GPU: la memoria se escribe cuando alguien la necesita (WritebackSurface).
