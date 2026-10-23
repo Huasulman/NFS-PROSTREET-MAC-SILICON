@@ -105,9 +105,13 @@ namespace gpu
             if (index >= kRegisterCount)
                 return;
             gState.registers[index] = value;
-            memory::Write32(kMmioBase + index * 4, value);
+            // Las constantes de shader no se copian a la vista MMIO: el juego no las lee de vuelta.
             if (index >= 0x4000 && index < 0x4920)
+            {
                 gState.constantsVersion++;
+                return;
+            }
+            memory::Write32(kMmioBase + index * 4, value);
 
             // Registros scratch: si su bit de SCRATCH_UMSK está activo, se copian a memoria.
             // D3D los usa como vallas para saber hasta dónde ha llegado la GPU.
@@ -322,7 +326,7 @@ namespace gpu
                         }
                         break;
                     }
-                    if (Clock::now() - (deadline - std::chrono::seconds(1)) < std::chrono::microseconds(200))
+                    if (Clock::now() - (deadline - std::chrono::seconds(1)) < std::chrono::milliseconds(2))
                         std::this_thread::yield();
                     else
                         std::this_thread::sleep_for(std::chrono::microseconds(20));
