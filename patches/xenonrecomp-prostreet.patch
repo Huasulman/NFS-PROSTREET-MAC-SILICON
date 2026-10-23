@@ -324,7 +324,7 @@ index fa91527..34032a8 100644
              println("\t__builtin_debugtrap();");
              break;
 diff --git a/XenonUtils/ppc_context.h b/XenonUtils/ppc_context.h
-index 31a86cd..66b492d 100644
+index 31a86cd..34cbe73 100644
 --- a/XenonUtils/ppc_context.h
 +++ b/XenonUtils/ppc_context.h
 @@ -682,6 +682,43 @@ inline simde__m128i simde_mm_vctsxs(simde__m128 src1)
@@ -371,3 +371,22 @@ index 31a86cd..66b492d 100644
  inline simde__m128i simde_mm_vsr(simde__m128i a, simde__m128i b)
  {
      b = simde_mm_srli_epi64(simde_mm_slli_epi64(b, 61), 61);
+@@ -689,12 +726,15 @@ inline simde__m128i simde_mm_vsr(simde__m128i a, simde__m128i b)
+ }
+ 
+ #if defined(__aarch64__) || defined(_M_ARM64)
++// mftb: el timebase de la Xbox 360 avanza a 50 MHz y el juego da por hecha esa frecuencia (no
++// siempre la pregunta), así que el contador del anfitrión (24 MHz en Apple Silicon) se reescala.
+ inline uint64_t __rdtsc()
+ {
+-    uint64_t ret;
++    uint64_t ticks, frequency;
+     asm volatile("mrs %0, cntvct_el0\n\t"
+-                 : "=r"(ret)::"memory");
+-    return ret;
++                 : "=r"(ticks)::"memory");
++    asm volatile("mrs %0, cntfrq_el0" : "=r"(frequency));
++    return uint64_t((unsigned __int128)ticks * 50000000u / frequency);
+ }
+ #elif !defined(__x86_64__) && !defined(_M_X64)
+ #   error "Missing implementation for __rdtsc()"
