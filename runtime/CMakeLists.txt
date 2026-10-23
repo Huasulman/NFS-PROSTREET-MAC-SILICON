@@ -46,6 +46,7 @@ add_executable(prostreet
     gpu/shader_translator.cpp
     platform/window.mm
     platform/input.mm
+    platform/audio.cpp
     kernel/xboxkrnl.cpp
     kernel/xex.cpp
     kernel/xma.cpp
@@ -55,5 +56,5 @@ target_include_directories(prostreet PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_options(prostreet PRIVATE -g)
 target_link_libraries(prostreet PRIVATE ppc_recomp
     "-framework Cocoa" "-framework Metal" "-framework QuartzCore" "-framework ImageIO"
-    "-framework CoreGraphics" "-framework UniformTypeIdentifiers" "-framework GameController")
+    "-framework CoreGraphics" "-framework UniformTypeIdentifiers" "-framework GameController" "-framework AudioToolbox" "-framework CoreAudio")
 set_source_files_properties(platform/window.mm platform/input.mm gpu/renderer.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")

@@ -13,6 +13,7 @@
 #include "objects.h"
 #include "threads.h"
 #include "../memory.h"
+#include "../platform/audio.h"
 
 using namespace kernel;
 
@@ -127,7 +128,8 @@ PPC_FUNC(__imp__XGetLanguage)
 // El cliente es una función del juego (callback[0]) con su contexto (callback[1]) que el sistema
 // de audio llama cada vez que necesita más muestras: cada 256 muestras a 48 kHz (5,33 ms). El
 // motor de audio del juego (y lo que se sincroniza con él, como los vídeos) avanza con esas
-// llamadas. Todavía no hay salida de sonido: lo que entrega XAudioSubmitRenderDriverFrame se descarta.
+// llamadas. Con salida de sonido, el ritmo lo marca ella (se llama cuando cabe otro bloque);
+// sin ella, un temporizador.
 PPC_FUNC(__imp__XAudioRegisterRenderDriverClient)
 {
     (void)base;
@@ -143,10 +145,14 @@ PPC_FUNC(__imp__XAudioRegisterRenderDriverClient)
         *static_cast<uint8_t*>(memory::Translate(thread.r13.u32 + 0x10C)) = cpu;
         using Clock = std::chrono::steady_clock;
         constexpr auto kPeriod = std::chrono::microseconds(5333); // 256 muestras a 48 kHz
+        const bool audio = platform::StartAudio();
         auto next = Clock::now() + kPeriod;
         while (true)
         {
-            std::this_thread::sleep_until(next);
+            if (audio)
+                platform::WaitForAudioSpace();
+            else
+                std::this_thread::sleep_until(next);
             thread.r3.u64 = context;
             CallGuest(*CurrentThread(), callback);
             next += kPeriod;
@@ -156,6 +162,21 @@ PPC_FUNC(__imp__XAudioRegisterRenderDriverClient)
     });
 
     memory::Write32(ctx.r4.u32, 0x41550000); // identificador de driver (como en Xenia)
+    ctx.r3.u64 = 0;
+}
+
+// NTSTATUS XAudioSubmitRenderDriverFrame(driver, float* samples): un bloque mezclado por el
+// juego, 6 canales x 256 muestras en coma flotante big-endian (un canal detrás de otro).
+PPC_FUNC(__imp__XAudioSubmitRenderDriverFrame)
+{
+    (void)base;
+    float samples[platform::kAudioFrameSamples * platform::kAudioChannels];
+    for (uint32_t i = 0; i < platform::kAudioFrameSamples * platform::kAudioChannels; i++)
+    {
+        const uint32_t bits = memory::Read32(ctx.r4.u32 + i * 4);
+        std::memcpy(&samples[i], &bits, 4);
+    }
+    platform::SubmitAudioFrame(samples);
     ctx.r3.u64 = 0;
 }
 
