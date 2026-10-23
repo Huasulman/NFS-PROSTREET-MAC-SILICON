@@ -35,6 +35,7 @@ namespace kernel
         constexpr uint32_t kPcrStackBase = 0x70;
         constexpr uint32_t kPcrStackEnd = 0x74;
         constexpr uint32_t kPcrCurrentThread = 0x100;
+        constexpr uint32_t kPcrCurrentCpu = 0x10C;
 
         thread_local Thread* tCurrent = nullptr;
         thread_local std::shared_ptr<Thread> tCurrentRef;
@@ -194,6 +195,15 @@ namespace kernel
         return thread;
     }
 
+    void SetAffinity(Thread& thread, uint32_t affinity)
+    {
+        thread.affinity = affinity;
+        // La CPU "actual" del KPCR es la primera de la máscara (como en Xenia): hay código, como
+        // XAudio, que indexa datos por procesador con ella.
+        if (affinity & 0x3F)
+            *static_cast<uint8_t*>(memory::Translate(thread.pcr + kPcrCurrentCpu)) = uint8_t(__builtin_ctz(affinity & 0x3F));
+    }
+
     std::shared_ptr<Thread> CreateHostThread(std::function<void(PPCContext&, uint8_t*)> body)
     {
         // Se crea suspendido para fijar el cuerpo antes de que arranque.
@@ -258,6 +268,9 @@ PPC_FUNC(__imp__ExCreateThread)
         ctx.r3.u64 = kStatusNoMemory;
         return;
     }
+    // Los 8 bits altos de los flags son la máscara de procesadores del hilo.
+    if (const uint32_t processors = ctx.r9.u32 >> 24)
+        SetAffinity(*thread, processors);
     if (handlePtr)
         memory::Write32(handlePtr, CreateHandle(thread));
     if (threadIdPtr)
@@ -343,7 +356,7 @@ PPC_FUNC(__imp__KeQueryBasePriorityThread)
 }
 
 // uint32_t KeSetAffinityThread(KTHREAD* thread, uint32_t affinity, uint32_t* previous)
-// Se guarda pero no se aplica: macOS no permite fijar hilos a núcleos.
+// Solo cambia la CPU que ve el juego: macOS no permite fijar hilos a núcleos.
 PPC_FUNC(__imp__KeSetAffinityThread)
 {
     (void)base;
@@ -352,7 +365,7 @@ PPC_FUNC(__imp__KeSetAffinityThread)
     if (thread)
     {
         previous = thread->affinity;
-        thread->affinity = ctx.r4.u32;
+        SetAffinity(*thread, ctx.r4.u32);
     }
     if (ctx.r5.u32)
         memory::Write32(ctx.r5.u32, previous);

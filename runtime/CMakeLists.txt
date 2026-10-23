@@ -27,11 +27,14 @@ target_compile_options(ppc_recomp PRIVATE -w -g0 -include ${CMAKE_CURRENT_SOURCE
 add_executable(prostreet
     main.cpp
     memory.cpp
+    debug/hooks.cpp
     kernel/filesystem.cpp
     kernel/imports.cpp
+    kernel/input.cpp
     kernel/objects.cpp
     kernel/sync.cpp
     kernel/threads.cpp
+    kernel/user.cpp
     kernel/video.cpp
     kernel/xam.cpp
     gpu/command_processor.cpp
@@ -39,13 +42,15 @@ add_executable(prostreet
     gpu/renderer.mm
     gpu/shader_translator.cpp
     platform/window.mm
+    platform/input.mm
     kernel/xboxkrnl.cpp
     kernel/xex.cpp
+    kernel/xma.cpp
     generated/imports.cpp
 )
 target_include_directories(prostreet PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_options(prostreet PRIVATE -g)
 target_link_libraries(prostreet PRIVATE ppc_recomp
     "-framework Cocoa" "-framework Metal" "-framework QuartzCore" "-framework ImageIO"
-    "-framework CoreGraphics" "-framework UniformTypeIdentifiers")
-set_source_files_properties(platform/window.mm gpu/renderer.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+    "-framework CoreGraphics" "-framework UniformTypeIdentifiers" "-framework GameController")
+set_source_files_properties(platform/window.mm platform/input.mm gpu/renderer.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")

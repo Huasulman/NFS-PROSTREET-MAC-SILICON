@@ -56,6 +56,9 @@ namespace kernel
     // Llama a una función del juego desde un hilo del runtime, con la pila reiniciada.
     void CallGuest(Thread& thread, uint32_t function);
 
+    // Fija la máscara de procesadores del hilo y, con ella, la CPU que ve en su KPCR.
+    void SetAffinity(Thread& thread, uint32_t affinity);
+
     // Reanuda un hilo; devuelve el contador de suspensión anterior.
     uint32_t ResumeThread(Thread& thread);
 

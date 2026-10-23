@@ -530,6 +530,34 @@ PPC_FUNC(__imp__NtSetInformationFile)
             fs::remove(file->host, error);
         }
         break;
+    case 10: // FileRenameInformation: {replaceExisting, rootDirectory, ANSI_STRING nombre nuevo}
+    {
+        std::string name = GuestString(in + 8);
+        if (const uint32_t root = memory::Read32(in + 4))
+            if (File* directory = AsFile(FromHandle(root)))
+                name = directory->guestPath + "\\" + name;
+        const Resolved target = Resolve(name);
+        const bool replace = memory::Read32(in) != 0;
+        std::error_code error;
+        if (file->readOnly || target.readOnly)
+            status = kStatusAccessDenied;
+        else if (!replace && fs::exists(target.host, error))
+            status = kStatusObjectNameCollision;
+        else
+        {
+            fs::rename(file->host, target.host, error);
+            if (error)
+                status = kStatusAccessDenied;
+            else
+            {
+                file->host = target.host;
+                file->guestPath = name;
+            }
+        }
+        if (Trace())
+            std::fprintf(stderr, "[archivo] renombrar -> \"%s\": 0x%08X\n", name.c_str(), status);
+        break;
+    }
     default:
         std::fprintf(stderr, "[archivo] NtSetInformationFile: clase %u no implementada\n", infoClass);
         status = kStatusInvalidInfoClass;
