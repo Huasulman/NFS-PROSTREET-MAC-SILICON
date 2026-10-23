@@ -322,7 +322,10 @@ namespace gpu
                         }
                         break;
                     }
-                    std::this_thread::sleep_for(std::chrono::microseconds(50));
+                    if (Clock::now() - (deadline - std::chrono::seconds(1)) < std::chrono::microseconds(200))
+                        std::this_thread::yield();
+                    else
+                        std::this_thread::sleep_for(std::chrono::microseconds(20));
                 }
                 break;
             }
@@ -476,12 +479,22 @@ namespace gpu
         // Procesador de comandos: vigila CP_RB_WPTR y ejecuta lo nuevo del ring.
         void GpuThread(PPCContext&, uint8_t*)
         {
+            // Sin trabajo, primero se cede el núcleo (yield) y solo tras 1 ms sin nada se duerme: D3D
+            // envía cada fotograma en muchos trozos y dormir tras cada uno retrasa a todo el juego.
+            auto lastWork = Clock::now();
             while (true)
             {
                 const uint32_t writePointer = ReadRegister(kRegCpRbWptr);
                 if (gState.ringDwords && writePointer != gState.readPointer && writePointer < gState.ringDwords)
+                {
                     ExecuteRing(writePointer);
-                std::this_thread::sleep_for(std::chrono::microseconds(100));
+                    lastWork = Clock::now();
+                    continue;
+                }
+                if (Clock::now() - lastWork < std::chrono::milliseconds(1))
+                    std::this_thread::yield();
+                else
+                    std::this_thread::sleep_for(std::chrono::microseconds(100));
             }
         }
 
