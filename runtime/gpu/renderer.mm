@@ -61,8 +61,29 @@ namespace gpu
         struct Texture
         {
             id<MTLTexture> texture;
-            uint64_t hash = 0;
+            uint64_t hash = 0; // huella de la memoria original (con mosaico, sin intercambiar)
         };
+
+        // Huella rápida de un bloque de memoria: palabras de 64 bits cada 32 bytes. Basta para
+        // ver si una textura cambió (resolves, vídeos, texturas que se cargan) sin reconvertirla.
+        uint64_t HashMemory(const uint8_t* data, size_t size)
+        {
+            uint64_t hash = 1469598103934665603ull ^ size;
+            size_t i = 0;
+            for (; i + 8 <= size; i += 32)
+            {
+                uint64_t word;
+                std::memcpy(&word, data + i, 8);
+                hash = (hash ^ word) * 1099511628211ull;
+            }
+            if (size >= 8)
+            {
+                uint64_t word;
+                std::memcpy(&word, data + size - 8, 8);
+                hash = (hash ^ word) * 1099511628211ull;
+            }
+            return hash;
+        }
 
         struct Renderer
         {
@@ -252,9 +273,19 @@ namespace gpu
                 while ((1u << log2Bytes) < bytesPerBlock)
                     log2Bytes++;
 
+                // ¿Ha cambiado? Se mira la memoria original (con mosaico, las filas van de 32 en 32).
+                const auto* source = static_cast<const uint8_t*>(memory::Translate(0xA0000000 | (base & 0x1FFFFFFF)));
+                const uint32_t rows = tiled ? (blocksY + 31) & ~31u : blocksY;
+                const size_t rawSize = std::min<size_t>(size_t(tiled ? (pitchBlocks + 31) & ~31u : pitchBlocks) * rows * bytesPerBlock,
+                    0x20000000 - (base & 0x1FFFFFFF));
+                const uint64_t hash = HashMemory(source, rawSize);
+                const uint64_t key = (uint64_t(base) << 32) ^ (uint64_t(format) << 26) ^ (uint64_t(width) << 13) ^ height;
+                Texture& cached = textures[key];
+                if (cached.texture && cached.hash == hash)
+                    return cached.texture;
+
                 // Lectura (quitando el mosaico) e intercambio de bytes.
                 std::vector<uint8_t> data(size_t(blocksX) * blocksY * bytesPerBlock);
-                const auto* source = static_cast<const uint8_t*>(memory::Translate(0xA0000000 | (base & 0x1FFFFFFF)));
                 for (uint32_t by = 0; by < blocksY; by++)
                 {
                     for (uint32_t bx = 0; bx < blocksX; bx++)
@@ -277,14 +308,7 @@ namespace gpu
                     std::memcpy(&data[i], &word, 4);
                 }
 
-                uint64_t hash = 1469598103934665603ull;
-                for (size_t i = 0; i < data.size(); i += 64)
-                    hash = (hash ^ data[i]) * 1099511628211ull ^ (data.size() > i + 32 ? data[i + 32] : 0);
-                const uint64_t key = (uint64_t(base) << 32) ^ (uint64_t(format) << 26) ^ (uint64_t(width) << 13) ^ height;
-                Texture& cached = textures[key];
-                if (cached.texture && cached.hash == hash)
-                    return cached.texture;
-
+                // Textura nueva (no se reescribe la anterior: puede usarla un dibujo aún sin enviar).
                 MTLTextureDescriptor* descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pixelFormat
                     width:width height:height mipmapped:NO];
                 cached.texture = [device newTextureWithDescriptor:descriptor];
