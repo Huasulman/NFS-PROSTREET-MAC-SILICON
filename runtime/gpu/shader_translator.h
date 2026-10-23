@@ -38,7 +38,7 @@ namespace gpu
         float viewportScale[4]; // PA_CL_VPORT_{X,Y,Z}SCALE
         float viewportOffset[4];
         float targetSize[2];    // tamaño del destino de dibujo, en píxeles
-        uint32_t padding[2];
+        float windowOffset[2];  // PA_SC_WINDOW_OFFSET si PA_SU_SC_MODE_CNTL lo activa
         uint32_t bools[8];      // constantes booleanas (256 bits)
     };
 }

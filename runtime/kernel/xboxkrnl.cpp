@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <algorithm>
 #include <cstring>
+#include <ctime>
 #include <string>
 #include <strings.h>
 #include <fstream>
@@ -299,10 +300,31 @@ PPC_FUNC(__imp__ExGetXConfigSetting)
     const uint32_t buffer = ctx.r5.u32, bufferSize = ctx.r6.u32 & 0xFFFF, requiredSize = ctx.r7.u32;
 
     uint32_t value;
-    if (category == 3 && setting == 0x09)       // XCONFIG_USER_LANGUAGE
+    if (category == 3 && setting == 0x01)       // XCONFIG_USER_TIME_ZONE_BIAS: minutos (UTC - local), los del Mac
+    {
+        const std::time_t now = std::time(nullptr);
+        std::tm local{};
+        localtime_r(&now, &local);
+        value = uint32_t(int32_t(-local.tm_gmtoff / 60));
+    }
+    else if (category == 3 && (setting == 0x02 || setting == 0x03)) // nombres de zona (estándar / verano), 4 caracteres
+    {
+        const std::time_t now = std::time(nullptr);
+        std::tm local{};
+        localtime_r(&now, &local);
+        char name[4] = {};
+        std::strncpy(name, local.tm_zone ? local.tm_zone : "UTC", sizeof(name));
+        value = (uint32_t(uint8_t(name[0])) << 24) | (uint32_t(uint8_t(name[1])) << 16) |
+                (uint32_t(uint8_t(name[2])) << 8) | uint8_t(name[3]); // Write32 los deja en orden
+    }
+    else if (category == 3 && setting >= 0x04 && setting <= 0x07) // fechas y ajustes del horario de verano:
+        value = 0;                                                // el desplazamiento ya incluye el actual
+    else if (category == 3 && setting == 0x09)  // XCONFIG_USER_LANGUAGE
         value = ConsoleLanguage();
     else if (category == 3 && setting == 0x0A)  // XCONFIG_USER_VIDEO_FLAGS: panorámico
         value = 0x00040000;
+    else if (category == 3 && setting == 0x0C)  // XCONFIG_USER_RETAIL_FLAGS
+        value = 0x40;
     else
     {
         std::fprintf(stderr, "[kernel] ExGetXConfigSetting(%u, 0x%X): ajuste no soportado\n", category, setting);
@@ -320,4 +342,27 @@ PPC_FUNC(__imp__ExGetXConfigSetting)
     if (buffer)
         memory::Write32(buffer, value);
     ctx.r3.u64 = 0;
+}
+
+// void RtlTimeToTimeFields(const LARGE_INTEGER* time, TIME_FIELDS* fields)
+// time: unidades de 100 ns desde 1601. TIME_FIELDS: año, mes, día, hora, minuto, segundo,
+// milisegundo y día de la semana (0 = domingo), cada uno de 16 bits.
+PPC_FUNC(__imp__RtlTimeToTimeFields)
+{
+    (void)base;
+    constexpr int64_t kUnixEpochAsFileTime = 116444736000000000LL;
+    const int64_t time = int64_t((uint64_t(memory::Read32(ctx.r3.u32)) << 32) | memory::Read32(ctx.r3.u32 + 4));
+    const int64_t sinceUnix = time - kUnixEpochAsFileTime;
+    const std::time_t seconds = std::time_t(sinceUnix >= 0 ? sinceUnix / 10000000 : (sinceUnix - 9999999) / 10000000);
+    std::tm fields{};
+    gmtime_r(&seconds, &fields);
+    const uint32_t out = ctx.r4.u32;
+    memory::Write16(out + 0, uint16_t(fields.tm_year + 1900));
+    memory::Write16(out + 2, uint16_t(fields.tm_mon + 1));
+    memory::Write16(out + 4, uint16_t(fields.tm_mday));
+    memory::Write16(out + 6, uint16_t(fields.tm_hour));
+    memory::Write16(out + 8, uint16_t(fields.tm_min));
+    memory::Write16(out + 10, uint16_t(fields.tm_sec));
+    memory::Write16(out + 12, uint16_t((sinceUnix - int64_t(seconds) * 10000000) / 10000));
+    memory::Write16(out + 14, uint16_t(fields.tm_wday));
 }

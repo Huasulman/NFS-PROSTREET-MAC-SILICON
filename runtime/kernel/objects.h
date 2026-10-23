@@ -30,6 +30,7 @@ namespace kernel
         NotificationTimer = 8,
         SynchronizationTimer = 9,
         File = 0x80,                 // no es un tipo del dispatcher: archivos y directorios abiertos
+        Enumerator = 0x81,           // tampoco: enumeradores de Xam (XamEnumerate)
     };
 
     struct Thread;

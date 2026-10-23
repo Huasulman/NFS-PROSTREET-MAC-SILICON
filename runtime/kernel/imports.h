@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
 
 #include <ppc_config.h>
 #include <ppc_context.h>
@@ -35,3 +36,12 @@ extern thread_local const char* gLastImport;
 // Idioma de la consola (XC_LANGUAGE_*): 1 = inglés, 3 = alemán, 4 = francés, 5 = español,
 // 6 = italiano, 11 = polaco, 12 = ruso. Se elige con PROSTREET_LANGUAGE (por defecto español).
 uint32_t ConsoleLanguage();
+
+// Termina en el acto una operación asíncrona de Xam (XOVERLAPPED): escribe el resultado y la
+// longitud y señala su evento, si tiene.
+void CompleteOverlapped(uint32_t overlapped, uint32_t result, uint32_t length = 0);
+
+// Monta una carpeta del Mac como unidad del juego ("save:" -> data/content/...), como hace
+// XamContentCreateEx con los paquetes de partidas guardadas.
+void MountDevice(const std::string& device, const std::string& hostPath);
+void UnmountDevice(const std::string& device);

@@ -41,6 +41,7 @@ namespace gpu
         constexpr uint32_t kPm4Interrupt = 0x54;
         constexpr uint32_t kPm4EventWriteShd = 0x58;
         constexpr uint32_t kPm4EventWriteExt = 0x59;
+        constexpr uint32_t kPm4EventWriteExtents = 0x5A; // extensión en pantalla del último dibujo
 
         constexpr auto kVsyncPeriod = std::chrono::nanoseconds(1000000000 / 60);
 
@@ -249,10 +250,20 @@ namespace gpu
             const uint32_t opcode = (header >> 8) & 0x7F, count = ((header >> 16) & 0x3FFF) + 1;
             auto data = [&](uint32_t n) { return read(i + 1 + n); };
 
+            // PROSTREET_GPU_TRACE: todos los paquetes; PROSTREET_GPU_TRACE_FROM=N: solo el fotograma N.
+            static const bool kTraceAll = std::getenv("PROSTREET_GPU_TRACE") != nullptr;
+            static const uint64_t kTraceFrom = std::getenv("PROSTREET_GPU_TRACE_FROM") ?
+                std::strtoull(std::getenv("PROSTREET_GPU_TRACE_FROM"), nullptr, 10) : ~0ull;
+            const bool kTracePackets = kTraceAll || gState.frames == kTraceFrom;
+
             // Paquete predicado (bit 0) de una franja que no está activa: se salta.
             if ((header & 1) && !(gState.binSelect & gState.binMask))
+            {
+                if (kTracePackets)
+                    std::fprintf(stderr, "[pm4] %*s0x%02X saltado (franjas: máscara %llX, selección %llX)\n", depth * 2, "",
+                        opcode, (unsigned long long)gState.binMask, (unsigned long long)gState.binSelect);
                 return 1 + count;
-            static const bool kTracePackets = std::getenv("PROSTREET_GPU_TRACE") != nullptr;
+            }
             if (kTracePackets)
                 std::fprintf(stderr, "[pm4] %*s0x%02X x%-4u %08X %08X %08X %08X\n", depth * 2, "", opcode, count,
                     count > 0 ? data(0) : 0, count > 1 ? data(1) : 0, count > 2 ? data(2) : 0, count > 3 ? data(3) : 0);
@@ -270,7 +281,11 @@ namespace gpu
             case kPm4EventWriteShd: // escribe un valor (una valla) al terminar lo anterior
                 GpuWrite(data(1), (data(0) >> 31) ? uint32_t(gState.frames) : data(2));
                 break;
-            case kPm4EventWriteExt: // extensión de la pantalla: (0, 8192, 0, 8192, 0, 1) en 16 bits
+            // Extensión en pantalla de lo dibujado: (0, 8192, 0, 8192, 0, 1) en 16 bits, es decir, toda
+            // la pantalla. Con predicated tiling, D3D las lee en la CPU entre franjas para decidir
+            // en qué franjas sale cada dibujo (reescribe sus SET_BIN_MASK): así se dibuja en todas.
+            case kPm4EventWriteExt:
+            case kPm4EventWriteExtents:
             {
                 static const uint16_t kExtents[] = { 0, 8192 >> 3, 0, 8192 >> 3, 0, 1 };
                 const uint32_t guest = PhysicalToGuest(data(1) & ~3u);
@@ -386,7 +401,7 @@ namespace gpu
                 {
                     RendererResolve(gState.registers.data());
                 }
-                else if (mode == 4 || mode == 5)
+                else if (mode == 4) // 5 = solo profundidad: sin búfer de profundidad todavía, se omite
                 {
                     DrawCall draw{};
                     draw.registers = gState.registers.data();
@@ -405,15 +420,15 @@ namespace gpu
                         RendererDraw(draw);
                 }
                 static const bool kTraceDraws = std::getenv("PROSTREET_GPU_DRAWS") != nullptr;
-                if (kTraceDraws)
+                if (kTraceDraws || kTracePackets)
                 {
                     const auto& r = gState.registers;
                     const uint32_t initiator = opcode == 0x22 ? data(1) : data(0);
                     std::fprintf(stderr, "[draw] prim=%u src=%u n=%u mode=%u vs=%016llx ps=%016llx vf0=%08X:%08X "
-                        "tf0=%08X:%08X:%08X SURFACE=%08X COLOR0=%08X COPY=%08X DEST=%08X BLEND=%08X MASK=%08X\n",
+                        "tf0=%08X:%08X:%08X SURFACE=%08X COLOR0=%08X COPY=%08X DEST=%08X BLEND=%08X MASK=%08X WINDOW=%08X MODE=%08X VTE=%08X\n",
                         initiator & 0x3F, (initiator >> 6) & 3, initiator >> 16, r[0x2208] & 7,
                         (unsigned long long)gState.vertexShader.hash, (unsigned long long)gState.pixelShader.hash,
-                        r[0x4800], r[0x4801], r[0x4800], r[0x4801], r[0x4802], r[0x2000], r[0x2001], r[0x2318], r[0x2319], r[0x2201], r[0x2104]);
+                        r[0x4800], r[0x4801], r[0x4800], r[0x4801], r[0x4802], r[0x2000], r[0x2001], r[0x2318], r[0x2319], r[0x2201], r[0x2104], r[0x2080], r[0x2205], r[0x2206]);
                     if ((initiator & 0x3F) == 13)
                     {
                         // Constantes de fetch: vértices 95 (2 palabras) y texturas 0 y 1 (6 palabras).

@@ -28,6 +28,7 @@ add_executable(prostreet
     main.cpp
     memory.cpp
     debug/hooks.cpp
+    kernel/content.cpp
     kernel/filesystem.cpp
     kernel/imports.cpp
     kernel/input.cpp
