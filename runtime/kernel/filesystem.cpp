@@ -398,6 +398,9 @@ PPC_FUNC(__imp__NtReadFile)
     const uint32_t io = ctx.r7.u32, buffer = ctx.r8.u32, length = ctx.r9.u32, offsetPtr = ctx.r10.u32;
     if (!file || file->fd < 0)
     {
+        if (Trace())
+            std::fprintf(stderr, "[archivo] NtReadFile sobre handle 0x%08X no válido (%s)\n", ctx.r3.u32,
+                file ? file->guestPath.c_str() : "no es un archivo");
         ctx.r3.u64 = kStatusInvalidHandle;
         return;
     }
@@ -457,6 +460,8 @@ PPC_FUNC(__imp__NtQueryInformationFile)
     (void)base;
     File* file = AsFile(FromHandle(ctx.r3.u32));
     const uint32_t io = ctx.r4.u32, out = ctx.r5.u32, length = ctx.r6.u32, infoClass = ctx.r7.u32;
+    if (Trace())
+        std::fprintf(stderr, "[archivo] NtQueryInformationFile clase %u sobre \"%s\"\n", infoClass, file ? file->guestPath.c_str() : "?");
     if (!file)
     {
         ctx.r3.u64 = kStatusInvalidHandle;
@@ -604,6 +609,8 @@ PPC_FUNC(__imp__NtQueryVolumeInformationFile)
     (void)base;
     File* file = AsFile(FromHandle(ctx.r3.u32));
     const uint32_t io = ctx.r4.u32, out = ctx.r5.u32, length = ctx.r6.u32, infoClass = ctx.r7.u32;
+    if (Trace())
+        std::fprintf(stderr, "[archivo] NtQueryVolumeInformationFile clase %u sobre \"%s\"\n", infoClass, file ? file->guestPath.c_str() : "?");
     if (!file)
     {
         ctx.r3.u64 = kStatusInvalidHandle;
