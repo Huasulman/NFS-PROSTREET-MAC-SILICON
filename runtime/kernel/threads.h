@@ -59,6 +59,9 @@ namespace kernel
     // Fija la máscara de procesadores del hilo y, con ella, la CPU que ve en su KPCR.
     void SetAffinity(Thread& thread, uint32_t affinity);
 
+    // Imprime la cadena de llamadas del invitado del hilo actual (para diagnóstico).
+    void PrintGuestStack(const PPCContext& ctx, const char* label);
+
     // Reanuda un hilo; devuelve el contador de suspensión anterior.
     uint32_t ResumeThread(Thread& thread);
 

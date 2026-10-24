@@ -366,3 +366,61 @@ PPC_FUNC(__imp__RtlTimeToTimeFields)
     memory::Write16(out + 12, uint16_t((sinceUnix - int64_t(seconds) * 10000000) / 10000));
     memory::Write16(out + 14, uint16_t(fields.tm_wday));
 }
+
+// --- Depuración --------------------------------------------------------------------------------
+
+// uint32_t DbgPrint(const char* format, ...): los mensajes de depuración del juego, a stderr.
+// Argumentos enteros y cadenas en r4..r10 y luego en la pila; los decimales, en f1..f8.
+PPC_FUNC(__imp__DbgPrint)
+{
+    (void)base;
+    const char* format = static_cast<const char*>(memory::Translate(ctx.r3.u32));
+    const uint64_t* integers[] = { &ctx.r4.u64, &ctx.r5.u64, &ctx.r6.u64, &ctx.r7.u64, &ctx.r8.u64, &ctx.r9.u64, &ctx.r10.u64 };
+    const double floats[] = { ctx.f1.f64, ctx.f2.f64, ctx.f3.f64, ctx.f4.f64, ctx.f5.f64, ctx.f6.f64, ctx.f7.f64, ctx.f8.f64 };
+    uint32_t nextInteger = 0, nextFloat = 0;
+    auto integer = [&]() -> uint64_t {
+        const uint32_t n = nextInteger++;
+        return n < 7 ? *integers[n] : StackArgument(ctx, n - 7);
+    };
+
+    std::string out;
+    for (const char* p = format; *p; p++)
+    {
+        if (*p != '%')
+        {
+            out += *p;
+            continue;
+        }
+        // Especificador: %[flags][ancho][.precisión][l|h]tipo
+        std::string spec = "%";
+        p++;
+        while (*p && std::strchr("-+ #0123456789.lhIq", *p))
+            spec += *p++;
+        if (!*p)
+            break;
+        const char type = *p;
+        spec.erase(std::remove_if(spec.begin() + 1, spec.end(), [](char c) { return c == 'l' || c == 'h' || c == 'I' || c == 'q'; }), spec.end());
+        char buffer[512];
+        switch (type)
+        {
+        case 's':
+        {
+            const uint32_t address = uint32_t(integer());
+            std::snprintf(buffer, sizeof(buffer), (spec + "s").c_str(), address ? static_cast<const char*>(memory::Translate(address)) : "(null)");
+            break;
+        }
+        case 'f': case 'g': case 'e':
+            std::snprintf(buffer, sizeof(buffer), (spec + type).c_str(), nextFloat < 8 ? floats[nextFloat++] : 0.0);
+            break;
+        case '%':
+            std::snprintf(buffer, sizeof(buffer), "%%");
+            break;
+        default: // d i u x X c p
+            std::snprintf(buffer, sizeof(buffer), (spec + (type == 'p' ? 'x' : type)).c_str(), uint32_t(integer()));
+            break;
+        }
+        out += buffer;
+    }
+    std::fprintf(stderr, "[juego] %s%s", out.c_str(), (!out.empty() && out.back() == '\n') ? "" : "\n");
+    ctx.r3.u64 = 0;
+}

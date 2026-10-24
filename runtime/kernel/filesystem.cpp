@@ -375,8 +375,10 @@ namespace
 PPC_FUNC(__imp__NtCreateFile)
 {
     (void)base;
-    ctx.r3.u64 = OpenFile(PathFromAttributes(ctx.r5.u32), ctx.r4.u32, ctx.r10.u32, StackArgument(ctx, 0),
-        ctx.r3.u32, ctx.r6.u32);
+    const std::string path = PathFromAttributes(ctx.r5.u32);
+    if (Trace() && path.find("(null)") != std::string::npos)
+        PrintGuestStack(ctx, path.c_str());
+    ctx.r3.u64 = OpenFile(path, ctx.r4.u32, ctx.r10.u32, StackArgument(ctx, 0), ctx.r3.u32, ctx.r6.u32);
 }
 
 // NTSTATUS NtOpenFile(uint32_t* handle, uint32_t access, OBJECT_ATTRIBUTES* attributes,

@@ -309,3 +309,68 @@ PPC_FUNC(__imp__NetDll_XNetGetEthernetLinkStatus)
     (void)base;
     ctx.r3.u64 = 0;
 }
+
+// --- Mensajes a aplicaciones del sistema (XMsg) -------------------------------------------------
+// La única que usa el juego es el reproductor de música de la consola (XMP, aplicación 0xFA), para
+// saber si la música la pone el juego o el usuario (su propia música): si cree que es el usuario,
+// apaga la banda sonora.
+
+namespace
+{
+    constexpr uint32_t kAppXmp = 0xFA;
+    constexpr uint32_t kXmpGetPlaybackController = 0x0007001B;
+    constexpr uint32_t kXmpControllerTitle = 1; // 0 = usuario, 1 = juego (como Xenia)
+
+    uint32_t DispatchMessage(uint32_t app, uint32_t message, uint32_t buffer)
+    {
+        if (app == kAppXmp && message == kXmpGetPlaybackController && buffer)
+        {
+            // {cliente, uint32_t* controlador, uint32_t* bloqueado}
+            if (const uint32_t controller = memory::Read32(buffer + 4))
+                memory::Write32(controller, kXmpControllerTitle);
+            if (const uint32_t locked = memory::Read32(buffer + 8))
+                memory::Write32(locked, 0);
+        }
+        else if (std::getenv("PROSTREET_TRACE"))
+        {
+            std::fprintf(stderr, "[xam] mensaje 0x%08X a la aplicación 0x%X: se acepta sin más\n", message, app);
+        }
+        return 0;
+    }
+}
+
+// uint32_t XMsgInProcessCall(uint32_t app, uint32_t message, void* buffer, uint32_t length)
+PPC_FUNC(__imp__XMsgInProcessCall)
+{
+    (void)base;
+    ctx.r3.u64 = DispatchMessage(ctx.r3.u32, ctx.r4.u32, ctx.r5.u32);
+}
+
+// uint32_t XMsgStartIORequestEx(uint32_t app, uint32_t message, XOVERLAPPED* overlapped,
+//     void* buffer, uint32_t length, ...)
+PPC_FUNC(__imp__XMsgStartIORequestEx)
+{
+    (void)base;
+    const uint32_t result = DispatchMessage(ctx.r3.u32, ctx.r4.u32, ctx.r6.u32);
+    if (const uint32_t overlapped = ctx.r5.u32)
+    {
+        CompleteOverlapped(overlapped, result);
+        ctx.r3.u64 = 0x3E5; // ERROR_IO_PENDING
+        return;
+    }
+    ctx.r3.u64 = result;
+}
+
+// uint32_t XMsgStartIORequest(uint32_t app, uint32_t message, XOVERLAPPED* overlapped, void* buffer, uint32_t length)
+PPC_FUNC(__imp__XMsgStartIORequest)
+{
+    (void)base;
+    const uint32_t result = DispatchMessage(ctx.r3.u32, ctx.r4.u32, ctx.r6.u32);
+    if (const uint32_t overlapped = ctx.r5.u32)
+    {
+        CompleteOverlapped(overlapped, result);
+        ctx.r3.u64 = 0x3E5;
+        return;
+    }
+    ctx.r3.u64 = result;
+}

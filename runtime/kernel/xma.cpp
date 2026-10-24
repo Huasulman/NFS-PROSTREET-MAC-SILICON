@@ -15,6 +15,8 @@
 
 namespace
 {
+    constexpr uint32_t kRegisterBase = 0x7FEA0000;            // registros del decodificador (MMIO)
+    constexpr uint32_t kRegContextArrayAddress = 0x1800;
     constexpr uint32_t kContextSize = 64;
     constexpr uint32_t kContextCount = 320; // como el hardware
 
@@ -71,13 +73,24 @@ namespace
     }
 }
 
+// Tabla de contextos del decodificador: XAudio lee su dirección física del registro
+// CONTEXT_ARRAY_ADDRESS (0x7FEA1800, en little-endian) y trabaja con ella directamente; sin ella
+// cree que no hay decodificador XMA y descarta esas voces (música, sonidos de los menús).
+void XmaInitialize()
+{
+    std::lock_guard lock(gLock);
+    // Es la primera reserva física: sin este hueco quedaría en la dirección física 0, que para
+    // XAudio significa "no hay tabla".
+    memory::Allocate(memory::kPhysicalBase, memory::kPhysicalEnd, 0x10000, 0x1000);
+    gContexts = memory::Allocate(memory::kPhysicalBase, memory::kPhysicalEnd, kContextSize * kContextCount, 0x1000);
+    memory::Write32(kRegisterBase + kRegContextArrayAddress, __builtin_bswap32(gContexts & 0x1FFFFFFF));
+}
+
 // uint32_t XMACreateContext(uint32_t* context)
 PPC_FUNC(__imp__XMACreateContext)
 {
     (void)base;
     std::lock_guard lock(gLock);
-    if (gContexts == 0)
-        gContexts = memory::Allocate(memory::kPhysicalBase, memory::kPhysicalEnd, kContextSize * kContextCount, 0x1000);
     for (uint32_t index = 0; index < kContextCount; index++)
     {
         if (gUsed[index])
