@@ -53,6 +53,11 @@ add_executable(prostreet
     generated/imports.cpp
 )
 target_include_directories(prostreet PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+# FFmpeg (Homebrew: brew install ffmpeg) para decodificar XMA, el audio comprimido de la Xbox 360.
+find_package(PkgConfig REQUIRED)
+set(ENV{PKG_CONFIG_PATH} "/opt/homebrew/lib/pkgconfig:$ENV{PKG_CONFIG_PATH}")
+pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET libavcodec libavutil)
+target_link_libraries(prostreet PRIVATE PkgConfig::FFMPEG)
 target_compile_options(prostreet PRIVATE -g)
 target_link_libraries(prostreet PRIVATE ppc_recomp
     "-framework Cocoa" "-framework Metal" "-framework QuartzCore" "-framework ImageIO"

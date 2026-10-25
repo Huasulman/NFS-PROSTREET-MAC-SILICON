@@ -2,12 +2,25 @@
 // (XMA_CONTEXT_DATA, 16 palabras big-endian con campos de bits, según Xenia) que describen los
 // búferes de entrada (paquetes XMA) y el de salida (PCM) de una voz.
 //
-// De momento solo se implementan los contextos: todavía no se decodifica nada, así que el
-// búfer de salida no avanza (las voces XMA suenan en silencio).
+// El decodificador es un hilo que, como el hardware, recorre los contextos activos: toma los
+// paquetes XMA (2 KB) del búfer de entrada actual, los decodifica con FFmpeg y escribe el PCM
+// (16 bits big-endian) en el anillo de salida. Al acabar un búfer de entrada lo marca como no
+// válido y pasa al otro, y el juego lo va rellenando: así llegan la música y los sonidos de menú.
 
+extern "C"
+{
+#include <libavcodec/avcodec.h>
+#include <libavutil/channel_layout.h>
+#include <libavutil/mem.h>
+}
+
+#include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
+#include <thread>
 #include <vector>
 
 #include "imports.h"
@@ -54,6 +67,10 @@ namespace
     constexpr Field kOutputPointer{7, 0, 32};
     constexpr Field kWorkPointer{8, 0, 32};
     constexpr Field kOutputReadOffset{9, 0, 5};
+    constexpr Field kCurrentBuffer{4, 31, 1};
+
+    constexpr uint32_t kPacketBytes = 2048, kBlockBytes = 256;
+    constexpr uint32_t kPacketHeaderBits = 32;
 
     uint32_t Mask(const Field& field)
     {
@@ -71,6 +88,165 @@ namespace
         const uint32_t mask = Mask(field);
         memory::Write32(address, (memory::Read32(address) & ~mask) | ((value << field.shift) & mask));
     }
+
+    uint8_t* Physical(uint32_t address)
+    {
+        return static_cast<uint8_t*>(memory::Translate(0xA0000000 | (address & 0x1FFFFFFF)));
+    }
+
+    // Estado del anfitrión de cada contexto: el decodificador de FFmpeg y el PCM que aún no ha
+    // cabido en la salida (ya en 16 bits big-endian).
+    struct Decoder
+    {
+        bool enabled = false;
+        AVCodecContext* codec = nullptr;
+        AVPacket* packet = nullptr;
+        AVFrame* frame = nullptr;
+        std::vector<uint8_t> pending;
+        bool failed = false;
+    };
+    Decoder gDecoders[kContextCount];
+
+    uint32_t IndexOf(uint32_t context)
+    {
+        return (context - gContexts) / kContextSize;
+    }
+
+    void Reset(Decoder& decoder)
+    {
+        avcodec_free_context(&decoder.codec);
+        decoder.pending.clear();
+        decoder.failed = false;
+    }
+
+    bool Open(Decoder& decoder, uint32_t context)
+    {
+        static const AVCodec* codec = avcodec_find_decoder(AV_CODEC_ID_XMA2);
+        if (!codec)
+            return false;
+        static constexpr int kRates[] = { 24000, 32000, 44100, 48000 };
+        const int channels = Get(context, kStereo) ? 2 : 1;
+        decoder.codec = avcodec_alloc_context3(codec);
+        decoder.codec->sample_rate = kRates[Get(context, kSampleRate)];
+        av_channel_layout_default(&decoder.codec->ch_layout, channels);
+        decoder.codec->block_align = kPacketBytes;
+        // XMA2WAVEFORMATEX (34 bytes): número de flujos y máscara de canales.
+        decoder.codec->extradata = static_cast<uint8_t*>(av_mallocz(34 + AV_INPUT_BUFFER_PADDING_SIZE));
+        decoder.codec->extradata_size = 34;
+        decoder.codec->extradata[0] = 1;
+        const uint32_t mask = channels == 2 ? 3 : 4; // estéreo / centro
+        std::memcpy(decoder.codec->extradata + 2, &mask, 4); // little-endian
+        if (avcodec_open2(decoder.codec, codec, nullptr) < 0)
+        {
+            std::fprintf(stderr, "[xma] FFmpeg no pudo abrir el decodificador XMA2\n");
+            avcodec_free_context(&decoder.codec);
+            return false;
+        }
+        if (!decoder.packet)
+            decoder.packet = av_packet_alloc();
+        if (!decoder.frame)
+            decoder.frame = av_frame_alloc();
+        return true;
+    }
+
+    // Decodifica un paquete y deja el PCM (16 bits big-endian, entrelazado) en `pending`.
+    void DecodePacket(Decoder& decoder, const uint8_t* data)
+    {
+        if (av_new_packet(decoder.packet, kPacketBytes) < 0)
+            return;
+        std::memcpy(decoder.packet->data, data, kPacketBytes);
+        const int sent = avcodec_send_packet(decoder.codec, decoder.packet);
+        av_packet_unref(decoder.packet);
+        if (sent < 0)
+        {
+            if (!decoder.failed)
+                std::fprintf(stderr, "[xma] paquete rechazado por FFmpeg (%d)\n", sent);
+            decoder.failed = true;
+            return;
+        }
+        while (avcodec_receive_frame(decoder.codec, decoder.frame) == 0)
+        {
+            const int channels = decoder.frame->ch_layout.nb_channels, samples = decoder.frame->nb_samples;
+            const size_t start = decoder.pending.size();
+            decoder.pending.resize(start + size_t(samples) * channels * 2);
+            uint8_t* out = decoder.pending.data() + start;
+            for (int i = 0; i < samples; i++)
+                for (int c = 0; c < channels; c++)
+                {
+                    const float value = reinterpret_cast<const float*>(decoder.frame->extended_data[c])[i];
+                    const int16_t sample = int16_t(std::clamp(value, -1.0f, 1.0f) * 32767.0f);
+                    *out++ = uint8_t(uint16_t(sample) >> 8);
+                    *out++ = uint8_t(sample);
+                }
+            av_frame_unref(decoder.frame);
+        }
+    }
+
+    // Lo que hace el hardware con un contexto activo en cada pasada (con gLock tomado).
+    void Work(uint32_t context, Decoder& decoder)
+    {
+        if (!Get(context, kOutputValid))
+            return;
+        if (!decoder.codec && (decoder.failed || !Open(decoder, context)))
+        {
+            decoder.failed = true;
+            return;
+        }
+        const uint32_t blocks = Get(context, kOutputBlockCount);
+        uint8_t* output = Physical(Get(context, kOutputPointer));
+        for (int guard = 0; guard < 64; guard++)
+        {
+            // 1. Lo pendiente, a la salida, en bloques enteros y dejando uno libre.
+            uint32_t write = Get(context, kOutputWriteOffset);
+            const uint32_t read = Get(context, kOutputReadOffset);
+            uint32_t free = (read + blocks - write - 1) % blocks;
+            while (free > 0 && decoder.pending.size() >= kBlockBytes)
+            {
+                std::memcpy(output + write * kBlockBytes, decoder.pending.data(), kBlockBytes);
+                decoder.pending.erase(decoder.pending.begin(), decoder.pending.begin() + kBlockBytes);
+                write = (write + 1) % blocks;
+                free--;
+            }
+            Set(context, kOutputWriteOffset, write);
+            if (decoder.pending.size() >= kBlockBytes || free == 0)
+                return; // la salida está llena: se sigue en la próxima pasada
+
+            // 2. El siguiente paquete del búfer de entrada actual.
+            const uint32_t current = Get(context, kCurrentBuffer);
+            const Field& valid = current ? kInput1Valid : kInput0Valid;
+            if (!Get(context, valid))
+                return; // el juego aún no ha dado más datos
+            const uint32_t packets = Get(context, current ? kInput1PacketCount : kInput0PacketCount);
+            const uint32_t packet = Get(context, kInputReadOffset) / (kPacketBytes * 8);
+            if (packet < packets)
+                DecodePacket(decoder, Physical(Get(context, current ? kInput1Pointer : kInput0Pointer)) + packet * kPacketBytes);
+            if (packet + 1 < packets)
+            {
+                Set(context, kInputReadOffset, (packet + 1) * kPacketBytes * 8 + kPacketHeaderBits);
+            }
+            else
+            {
+                // Búfer agotado: se devuelve al juego y se pasa al otro.
+                Set(context, valid, 0);
+                Set(context, kCurrentBuffer, current ^ 1);
+                Set(context, kInputReadOffset, kPacketHeaderBits);
+            }
+        }
+    }
+
+    void DecoderThread()
+    {
+        for (;;)
+        {
+            {
+                std::lock_guard lock(gLock);
+                for (uint32_t index = 0; index < kContextCount; index++)
+                    if (gDecoders[index].enabled)
+                        Work(gContexts + index * kContextSize, gDecoders[index]);
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
 }
 
 // Tabla de contextos del decodificador: XAudio lee su dirección física del registro
@@ -84,6 +260,7 @@ void XmaInitialize()
     memory::Allocate(memory::kPhysicalBase, memory::kPhysicalEnd, 0x10000, 0x1000);
     gContexts = memory::Allocate(memory::kPhysicalBase, memory::kPhysicalEnd, kContextSize * kContextCount, 0x1000);
     memory::Write32(kRegisterBase + kRegContextArrayAddress, __builtin_bswap32(gContexts & 0x1FFFFFFF));
+    std::thread(DecoderThread).detach();
 }
 
 // uint32_t XMACreateContext(uint32_t* context)
@@ -114,7 +291,11 @@ PPC_FUNC(__imp__XMAReleaseContext)
     std::lock_guard lock(gLock);
     const uint32_t index = (ctx.r3.u32 - gContexts) / kContextSize;
     if (gContexts && index < kContextCount)
+    {
         gUsed[index] = false;
+        gDecoders[index].enabled = false;
+        Reset(gDecoders[index]);
+    }
     ctx.r3.u64 = 0;
 }
 
@@ -125,6 +306,9 @@ PPC_FUNC(__imp__XMAInitializeContext)
 {
     (void)base;
     const uint32_t context = ctx.r3.u32, init = ctx.r4.u32;
+    std::lock_guard lock(gLock);
+    if (IndexOf(context) < kContextCount)
+        Reset(gDecoders[IndexOf(context)]);
     for (uint32_t offset = 0; offset < kContextSize; offset += 4)
         memory::Write32(context + offset, 0);
     auto field = [&](uint32_t index) { return memory::Read32(init + index * 4); };
@@ -152,10 +336,15 @@ PPC_FUNC(__imp__XMAInitializeContext)
     ctx.r3.u64 = 0;
 }
 
-// El hardware real se arranca y se para con estas dos; sin decodificador no hacen nada.
+// Arrancan y paran el decodificador de un contexto.
 PPC_FUNC(__imp__XMAEnableContext)
 {
     (void)base;
+    {
+        std::lock_guard lock(gLock);
+        if (IndexOf(ctx.r3.u32) < kContextCount)
+            gDecoders[IndexOf(ctx.r3.u32)].enabled = true;
+    }
     if (std::getenv("PROSTREET_TRACE"))
     {
         std::fprintf(stderr, "[xma] activar 0x%08X:", ctx.r3.u32);
@@ -169,6 +358,11 @@ PPC_FUNC(__imp__XMAEnableContext)
 PPC_FUNC(__imp__XMADisableContext)
 {
     (void)base;
+    {
+        std::lock_guard lock(gLock);
+        if (IndexOf(ctx.r3.u32) < kContextCount)
+            gDecoders[IndexOf(ctx.r3.u32)].enabled = false;
+    }
     if (std::getenv("PROSTREET_TRACE"))
         std::fprintf(stderr, "[xma] desactivar 0x%08X\n", ctx.r3.u32);
     ctx.r3.u64 = 0;
@@ -178,6 +372,7 @@ PPC_FUNC(__imp__XMADisableContext)
 PPC_FUNC(__imp__XMASetInputBuffer0)
 {
     (void)base;
+    std::lock_guard lock(gLock);
     if (std::getenv("PROSTREET_TRACE"))
         std::fprintf(stderr, "[xma] entrada0 0x%08X: 0x%08X %u paq.\n", ctx.r3.u32, ctx.r4.u32, ctx.r5.u32);
     Set(ctx.r3.u32, kInput0Pointer, ctx.r4.u32);
@@ -188,6 +383,7 @@ PPC_FUNC(__imp__XMASetInputBuffer0)
 PPC_FUNC(__imp__XMASetInputBuffer1)
 {
     (void)base;
+    std::lock_guard lock(gLock);
     Set(ctx.r3.u32, kInput1Pointer, ctx.r4.u32);
     Set(ctx.r3.u32, kInput1PacketCount, ctx.r5.u32);
     ctx.r3.u64 = 0;
@@ -196,18 +392,21 @@ PPC_FUNC(__imp__XMASetInputBuffer1)
 PPC_FUNC(__imp__XMAIsInputBuffer0Valid)
 {
     (void)base;
+    std::lock_guard lock(gLock);
     ctx.r3.u64 = Get(ctx.r3.u32, kInput0Valid);
 }
 
 PPC_FUNC(__imp__XMAIsInputBuffer1Valid)
 {
     (void)base;
+    std::lock_guard lock(gLock);
     ctx.r3.u64 = Get(ctx.r3.u32, kInput1Valid);
 }
 
 PPC_FUNC(__imp__XMASetInputBuffer0Valid)
 {
     (void)base;
+    std::lock_guard lock(gLock);
     Set(ctx.r3.u32, kInput0Valid, 1);
     ctx.r3.u64 = 0;
 }
@@ -215,6 +414,7 @@ PPC_FUNC(__imp__XMASetInputBuffer0Valid)
 PPC_FUNC(__imp__XMASetInputBuffer1Valid)
 {
     (void)base;
+    std::lock_guard lock(gLock);
     Set(ctx.r3.u32, kInput1Valid, 1);
     ctx.r3.u64 = 0;
 }
@@ -222,6 +422,7 @@ PPC_FUNC(__imp__XMASetInputBuffer1Valid)
 PPC_FUNC(__imp__XMASetInputBufferReadOffset)
 {
     (void)base;
+    std::lock_guard lock(gLock);
     Set(ctx.r3.u32, kInputReadOffset, ctx.r4.u32);
     ctx.r3.u64 = 0;
 }
@@ -230,18 +431,21 @@ PPC_FUNC(__imp__XMASetInputBufferReadOffset)
 PPC_FUNC(__imp__XMAGetOutputBufferWriteOffset)
 {
     (void)base;
+    std::lock_guard lock(gLock);
     ctx.r3.u64 = Get(ctx.r3.u32, kOutputWriteOffset);
 }
 
 PPC_FUNC(__imp__XMAGetOutputBufferReadOffset)
 {
     (void)base;
+    std::lock_guard lock(gLock);
     ctx.r3.u64 = Get(ctx.r3.u32, kOutputReadOffset);
 }
 
 PPC_FUNC(__imp__XMASetOutputBufferReadOffset)
 {
     (void)base;
+    std::lock_guard lock(gLock);
     Set(ctx.r3.u32, kOutputReadOffset, ctx.r4.u32);
     ctx.r3.u64 = 0;
 }
@@ -249,12 +453,14 @@ PPC_FUNC(__imp__XMASetOutputBufferReadOffset)
 PPC_FUNC(__imp__XMAIsOutputBufferValid)
 {
     (void)base;
+    std::lock_guard lock(gLock);
     ctx.r3.u64 = Get(ctx.r3.u32, kOutputValid);
 }
 
 PPC_FUNC(__imp__XMASetOutputBufferValid)
 {
     (void)base;
+    std::lock_guard lock(gLock);
     Set(ctx.r3.u32, kOutputValid, 1);
     ctx.r3.u64 = 0;
 }
