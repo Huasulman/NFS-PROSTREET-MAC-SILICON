@@ -125,14 +125,19 @@ namespace platform
         static const bool stats = std::getenv("PROSTREET_AUDIO_STATS") != nullptr;
         if (stats)
         {
-            static float peak = 0.0f;
+            static float peak = 0.0f, channelPeak[kAudioChannels] = {};
             static uint32_t frames = 0;
             for (float sample : stereo)
                 peak = std::max(peak, std::fabs(sample));
+            for (uint32_t c = 0; c < kAudioChannels; c++)
+                for (uint32_t i = 0; i < kAudioFrameSamples; i++)
+                    channelPeak[c] = std::max(channelPeak[c], std::fabs(planar[c * kAudioFrameSamples + i]));
             if (++frames == uint32_t(kSampleRate / kAudioFrameSamples))
             {
-                std::fprintf(stderr, "[audio] pico %.3f\n", peak);
+                std::fprintf(stderr, "[audio] pico %.3f (canales %.3f %.3f %.3f %.3f %.3f %.3f)\n", peak, channelPeak[0],
+                    channelPeak[1], channelPeak[2], channelPeak[3], channelPeak[4], channelPeak[5]);
                 peak = 0.0f;
+                std::fill(std::begin(channelPeak), std::end(channelPeak), 0.0f);
                 frames = 0;
             }
         }

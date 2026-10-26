@@ -1,5 +1,6 @@
 // Funciones de xam.xex implementadas por el runtime. Convención: argumentos en r3..r10, resultado en r3.
 
+#include <atomic>
 #include <cstdio>
 #include <chrono>
 #include <cstdlib>
@@ -180,11 +181,14 @@ PPC_FUNC(__imp__XAudioSubmitRenderDriverFrame)
     ctx.r3.u64 = 0;
 }
 
-// uint32_t XAudioGetVoiceCategoryVolumeChangeMask(driver, uint32_t* mask): sin cambios.
+// uint32_t XAudioGetVoiceCategoryVolumeChangeMask(driver, uint32_t* mask): qué categorías de
+// voces (efectos, música, voz...) han cambiado de volumen. La primera vez, todas: así XAudio lee
+// su volumen (máximo) en vez de quedarse con el inicial.
 PPC_FUNC(__imp__XAudioGetVoiceCategoryVolumeChangeMask)
 {
     (void)base;
-    memory::Write32(ctx.r4.u32, 0);
+    static std::atomic<bool> first{true};
+    memory::Write32(ctx.r4.u32, first.exchange(false) ? 0xFFFFFFFFu : 0);
     ctx.r3.u64 = 0;
 }
 
@@ -192,6 +196,8 @@ PPC_FUNC(__imp__XAudioGetVoiceCategoryVolumeChangeMask)
 PPC_FUNC(__imp__XAudioGetVoiceCategoryVolume)
 {
     (void)base;
+    if (std::getenv("PROSTREET_TRACE"))
+        std::fprintf(stderr, "[xam] XAudioGetVoiceCategoryVolume(categoría %u)\n", ctx.r3.u32);
     const float volume = 1.0f;
     uint32_t bits;
     std::memcpy(&bits, &volume, 4);

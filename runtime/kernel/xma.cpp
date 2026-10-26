@@ -16,6 +16,7 @@ extern "C"
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -99,12 +100,15 @@ namespace
     struct Decoder
     {
         bool enabled = false;
+        bool kicked = false; // activado y aún sin su pasada de Work
         AVCodecContext* codec = nullptr;
         AVPacket* packet = nullptr;
         AVFrame* frame = nullptr;
         std::vector<uint8_t> pending;
         bool failed = false;
         uint32_t packets = 0, samples = 0; // para la traza
+        float peak = 0.0f;
+        uint32_t consumed = 0, kicks = 0; // avances del puntero de lectura de salida, activaciones
     };
     Decoder gDecoders[kContextCount];
 
@@ -119,6 +123,8 @@ namespace
         decoder.pending.clear();
         decoder.failed = false;
         decoder.packets = decoder.samples = 0;
+        decoder.peak = 0.0f;
+        decoder.consumed = decoder.kicks = 0;
     }
 
     bool Open(Decoder& decoder, uint32_t context)
@@ -178,6 +184,7 @@ namespace
                 for (int c = 0; c < channels; c++)
                 {
                     const float value = reinterpret_cast<const float*>(decoder.frame->extended_data[c])[i];
+                    decoder.peak = std::max(decoder.peak, std::fabs(value));
                     const int16_t sample = int16_t(std::clamp(value, -1.0f, 1.0f) * 32767.0f);
                     *out++ = uint8_t(uint16_t(sample) >> 8);
                     *out++ = uint8_t(sample);
@@ -186,9 +193,17 @@ namespace
         }
     }
 
-    // Lo que hace el hardware con un contexto activo en cada pasada (con gLock tomado).
+    // Lo que hace el hardware cada vez que se activa un contexto (con gLock tomado), como Xenia:
+    // llena la salida con frames enteros mientras haya entrada; el anillo puede llenarse del todo
+    // (escritura == lectura) y entonces, o si se acaba la entrada, borra output_buffer_valid, que
+    // es la señal que espera el juego para recoger el PCM y darle otro hueco.
     void Work(uint32_t context, Decoder& decoder)
     {
+        if (!Get(context, kInput0Valid) && !Get(context, kInput1Valid))
+        {
+            Set(context, kOutputValid, 0);
+            return;
+        }
         if (!Get(context, kOutputValid))
             return;
         if (!decoder.codec && (decoder.failed || !Open(decoder, context)))
@@ -196,48 +211,59 @@ namespace
             decoder.failed = true;
             return;
         }
-        const uint32_t blocks = Get(context, kOutputBlockCount);
+        const uint32_t capacity = Get(context, kOutputBlockCount) * kBlockBytes;
+        if (capacity == 0)
+            return;
         uint8_t* output = Physical(Get(context, kOutputPointer));
-        for (int guard = 0; guard < 64; guard++)
-        {
-            // 1. Lo pendiente, a la salida, en bloques enteros y dejando uno libre.
-            uint32_t write = Get(context, kOutputWriteOffset);
-            const uint32_t read = Get(context, kOutputReadOffset);
-            uint32_t free = (read + blocks - write - 1) % blocks;
-            while (free > 0 && decoder.pending.size() >= kBlockBytes)
-            {
-                std::memcpy(output + write * kBlockBytes, decoder.pending.data(), kBlockBytes);
-                decoder.pending.erase(decoder.pending.begin(), decoder.pending.begin() + kBlockBytes);
-                write = (write + 1) % blocks;
-                free--;
-            }
-            Set(context, kOutputWriteOffset, write);
-            if (decoder.pending.size() >= kBlockBytes || free == 0)
-                return; // la salida está llena: se sigue en la próxima pasada
+        uint32_t write = Get(context, kOutputWriteOffset) * kBlockBytes;
+        const uint32_t read = Get(context, kOutputReadOffset) * kBlockBytes;
+        uint32_t room = read == write ? capacity : (write < read ? read - write : capacity - write + read);
+        const uint32_t frameBytes = 512 * 2 * uint32_t(decoder.codec->ch_layout.nb_channels);
+        room -= room % frameBytes;
 
-            // 2. El siguiente paquete del búfer de entrada actual.
-            const uint32_t current = Get(context, kCurrentBuffer);
-            const Field& valid = current ? kInput1Valid : kInput0Valid;
-            if (!Get(context, valid))
-                return; // el juego aún no ha dado más datos
-            const uint32_t packets = Get(context, current ? kInput1PacketCount : kInput0PacketCount);
-            const uint32_t packet = Get(context, kInputReadOffset) / (kPacketBytes * 8);
-            if (packet < packets)
-                DecodePacket(decoder, Physical(Get(context, current ? kInput1Pointer : kInput0Pointer)) + packet * kPacketBytes);
-            if (packet + 1 < packets)
+        while (room >= frameBytes)
+        {
+            // Un frame de PCM: lo pendiente o, si no llega, el siguiente paquete de entrada.
+            while (decoder.pending.size() < frameBytes)
             {
-                Set(context, kInputReadOffset, (packet + 1) * kPacketBytes * 8 + kPacketHeaderBits);
+                const uint32_t current = Get(context, kCurrentBuffer);
+                const Field& valid = current ? kInput1Valid : kInput0Valid;
+                if (!Get(context, valid))
+                    break;
+                const uint32_t packets = Get(context, current ? kInput1PacketCount : kInput0PacketCount);
+                const uint32_t packet = Get(context, kInputReadOffset) / (kPacketBytes * 8);
+                if (packet < packets)
+                    DecodePacket(decoder, Physical(Get(context, current ? kInput1Pointer : kInput0Pointer)) + packet * kPacketBytes);
+                if (packet + 1 < packets)
+                {
+                    Set(context, kInputReadOffset, (packet + 1) * kPacketBytes * 8 + kPacketHeaderBits);
+                }
+                else
+                {
+                    // Búfer agotado: se devuelve al juego y se pasa al otro.
+                    Set(context, valid, 0);
+                    Set(context, kCurrentBuffer, current ^ 1);
+                    Set(context, kInputReadOffset, kPacketHeaderBits);
+                }
             }
-            else
+            if (decoder.pending.size() < frameBytes)
+                break; // sin más entrada: el juego dará más y volverá a activar el contexto
+            for (uint32_t done = 0; done < frameBytes;)
             {
-                // Búfer agotado: se devuelve al juego y se pasa al otro.
-                Set(context, valid, 0);
-                Set(context, kCurrentBuffer, current ^ 1);
-                Set(context, kInputReadOffset, kPacketHeaderBits);
+                const uint32_t chunk = std::min(frameBytes - done, capacity - write);
+                std::memcpy(output + write, decoder.pending.data() + done, chunk);
+                done += chunk;
+                write = (write + chunk) % capacity;
             }
+            decoder.pending.erase(decoder.pending.begin(), decoder.pending.begin() + frameBytes);
+            room -= frameBytes;
         }
+        Set(context, kOutputWriteOffset, write / kBlockBytes);
+        if (write == read)
+            Set(context, kOutputValid, 0);
     }
 
+    // Cada activación (XMAEnableContext) pide una pasada de Work, como un "kick" del hardware.
     void DecoderThread()
     {
         for (;;)
@@ -245,10 +271,13 @@ namespace
             {
                 std::lock_guard lock(gLock);
                 for (uint32_t index = 0; index < kContextCount; index++)
-                    if (gDecoders[index].enabled)
+                    if (gDecoders[index].kicked)
+                    {
+                        gDecoders[index].kicked = false;
                         Work(gContexts + index * kContextSize, gDecoders[index]);
+                    }
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            std::this_thread::sleep_for(std::chrono::microseconds(500));
         }
     }
 }
@@ -351,7 +380,11 @@ PPC_FUNC(__imp__XMAEnableContext)
         // (frames a caballo entre paquetes, PCM que aún no ha cabido). Los sonidos nuevos pasan
         // por XMAInitializeContext, que sí lo reinicia.
         if (IndexOf(ctx.r3.u32) < kContextCount)
+        {
             gDecoders[IndexOf(ctx.r3.u32)].enabled = true;
+            gDecoders[IndexOf(ctx.r3.u32)].kicked = true;
+            gDecoders[IndexOf(ctx.r3.u32)].kicks++;
+        }
     }
     if (std::getenv("PROSTREET_TRACE"))
     {
@@ -372,8 +405,11 @@ PPC_FUNC(__imp__XMADisableContext)
         {
             Decoder& decoder = gDecoders[IndexOf(ctx.r3.u32)];
             if (decoder.enabled && std::getenv("PROSTREET_TRACE"))
-                std::fprintf(stderr, "[xma] fin 0x%08X: %u paquetes, %u muestras, %s\n", ctx.r3.u32, decoder.packets,
-                    decoder.samples, Get(ctx.r3.u32, kStereo) ? "estéreo" : "mono");
+                std::fprintf(stderr, "[xma] fin 0x%08X: %u paquetes, %u muestras, pico %.3f, %s, %u Hz, %u activaciones, "
+                    "%u lecturas de salida (escritura %u, lectura %u, válida %u)\n", ctx.r3.u32, decoder.packets, decoder.samples,
+                    decoder.peak, Get(ctx.r3.u32, kStereo) ? "estéreo" : "mono", decoder.codec ? decoder.codec->sample_rate : 0,
+                    decoder.kicks, decoder.consumed, Get(ctx.r3.u32, kOutputWriteOffset), Get(ctx.r3.u32, kOutputReadOffset),
+                    Get(ctx.r3.u32, kOutputValid));
             decoder.enabled = false;
         }
     }
@@ -460,6 +496,8 @@ PPC_FUNC(__imp__XMASetOutputBufferReadOffset)
 {
     (void)base;
     std::lock_guard lock(gLock);
+    if (IndexOf(ctx.r3.u32) < kContextCount && Get(ctx.r3.u32, kOutputReadOffset) != ctx.r4.u32)
+        gDecoders[IndexOf(ctx.r3.u32)].consumed++;
     Set(ctx.r3.u32, kOutputReadOffset, ctx.r4.u32);
     ctx.r3.u64 = 0;
 }
