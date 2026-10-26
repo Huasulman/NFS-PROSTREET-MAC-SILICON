@@ -104,6 +104,7 @@ namespace
         AVFrame* frame = nullptr;
         std::vector<uint8_t> pending;
         bool failed = false;
+        uint32_t packets = 0, samples = 0; // para la traza
     };
     Decoder gDecoders[kContextCount];
 
@@ -117,6 +118,7 @@ namespace
         avcodec_free_context(&decoder.codec);
         decoder.pending.clear();
         decoder.failed = false;
+        decoder.packets = decoder.samples = 0;
     }
 
     bool Open(Decoder& decoder, uint32_t context)
@@ -164,9 +166,11 @@ namespace
             decoder.failed = true;
             return;
         }
+        decoder.packets++;
         while (avcodec_receive_frame(decoder.codec, decoder.frame) == 0)
         {
             const int channels = decoder.frame->ch_layout.nb_channels, samples = decoder.frame->nb_samples;
+            decoder.samples += uint32_t(samples);
             const size_t start = decoder.pending.size();
             decoder.pending.resize(start + size_t(samples) * channels * 2);
             uint8_t* out = decoder.pending.data() + start;
@@ -342,8 +346,13 @@ PPC_FUNC(__imp__XMAEnableContext)
     (void)base;
     {
         std::lock_guard lock(gLock);
-        if (IndexOf(ctx.r3.u32) < kContextCount)
+        // Un contexto que se vuelve a activar suele ser otro sonido con los datos ya cambiados
+        // (sin XMAInitializeContext): el decodificador empieza de cero.
+        if (IndexOf(ctx.r3.u32) < kContextCount && !gDecoders[IndexOf(ctx.r3.u32)].enabled)
+        {
+            Reset(gDecoders[IndexOf(ctx.r3.u32)]);
             gDecoders[IndexOf(ctx.r3.u32)].enabled = true;
+        }
     }
     if (std::getenv("PROSTREET_TRACE"))
     {
@@ -361,7 +370,13 @@ PPC_FUNC(__imp__XMADisableContext)
     {
         std::lock_guard lock(gLock);
         if (IndexOf(ctx.r3.u32) < kContextCount)
-            gDecoders[IndexOf(ctx.r3.u32)].enabled = false;
+        {
+            Decoder& decoder = gDecoders[IndexOf(ctx.r3.u32)];
+            if (decoder.enabled && std::getenv("PROSTREET_TRACE"))
+                std::fprintf(stderr, "[xma] fin 0x%08X: %u paquetes, %u muestras, %s\n", ctx.r3.u32, decoder.packets,
+                    decoder.samples, Get(ctx.r3.u32, kStereo) ? "estéreo" : "mono");
+            decoder.enabled = false;
+        }
     }
     if (std::getenv("PROSTREET_TRACE"))
         std::fprintf(stderr, "[xma] desactivar 0x%08X\n", ctx.r3.u32);
