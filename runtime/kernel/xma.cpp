@@ -11,6 +11,7 @@ extern "C"
 {
 #include <libavcodec/avcodec.h>
 #include <libavutil/channel_layout.h>
+#include <libavutil/log.h>
 #include <libavutil/mem.h>
 }
 
@@ -293,6 +294,7 @@ void XmaInitialize()
     memory::Allocate(memory::kPhysicalBase, memory::kPhysicalEnd, 0x10000, 0x1000);
     gContexts = memory::Allocate(memory::kPhysicalBase, memory::kPhysicalEnd, kContextSize * kContextCount, 0x1000);
     memory::Write32(kRegisterBase + kRegContextArrayAddress, __builtin_bswap32(gContexts & 0x1FFFFFFF));
+    av_log_set_level(AV_LOG_ERROR); // sin marcas de tiempo, FFmpeg avisa en cada sonido: no hace falta
     std::thread(DecoderThread).detach();
 }
 
