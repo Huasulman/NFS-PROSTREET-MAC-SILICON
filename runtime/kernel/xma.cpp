@@ -346,19 +346,12 @@ PPC_FUNC(__imp__XMAEnableContext)
     (void)base;
     {
         std::lock_guard lock(gLock);
-        // Al reactivar un contexto, el decodificador solo empieza de cero si el contexto está al
-        // principio de un sonido (otro sonido, a veces sin XMAInitializeContext): lectura en el
-        // primer paquete del búfer 0 y salida vacía. La música en streaming para y reactiva su
-        // contexto en mitad de la canción para cambiar búferes, y ahí hay que seguir donde iba.
-        const uint32_t context = ctx.r3.u32;
-        if (IndexOf(context) < kContextCount && !gDecoders[IndexOf(context)].enabled)
-        {
-            const bool atStart = Get(context, kInputReadOffset) == kPacketHeaderBits && Get(context, kCurrentBuffer) == 0 &&
-                Get(context, kOutputWriteOffset) == 0 && Get(context, kOutputReadOffset) == 0;
-            if (atStart)
-                Reset(gDecoders[IndexOf(context)]);
-            gDecoders[IndexOf(context)].enabled = true;
-        }
+        // Reactivar no reinicia el decodificador: la música en streaming para y reactiva su
+        // contexto en cada ciclo, dejándolo como recién empezado, y hay que seguir donde iba
+        // (frames a caballo entre paquetes, PCM que aún no ha cabido). Los sonidos nuevos pasan
+        // por XMAInitializeContext, que sí lo reinicia.
+        if (IndexOf(ctx.r3.u32) < kContextCount)
+            gDecoders[IndexOf(ctx.r3.u32)].enabled = true;
     }
     if (std::getenv("PROSTREET_TRACE"))
     {
