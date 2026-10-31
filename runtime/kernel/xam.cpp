@@ -325,7 +325,9 @@ namespace
 {
     constexpr uint32_t kAppXmp = 0xFA;
     constexpr uint32_t kXmpGetPlaybackController = 0x0007001B;
-    constexpr uint32_t kXmpControllerTitle = 1; // 0 = usuario, 1 = juego (como Xenia)
+    // El juego (sub_82A41010) entiende "la música es mía" solo si controlador == 0 y no está
+    // bloqueado; con otro valor cree que suena la del usuario y apaga la banda sonora.
+    constexpr uint32_t kXmpControllerTitle = 0;
 
     uint32_t DispatchMessage(uint32_t app, uint32_t message, uint32_t buffer)
     {

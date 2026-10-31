@@ -6,6 +6,9 @@
 // paquetes XMA (2 KB) del búfer de entrada actual, los decodifica con FFmpeg y escribe el PCM
 // (16 bits big-endian) en el anillo de salida. Al acabar un búfer de entrada lo marca como no
 // válido y pasa al otro, y el juego lo va rellenando: así llegan la música y los sonidos de menú.
+//
+// PROSTREET_XMA_DUMP=<carpeta>: guarda el PCM decodificado de cada contexto en
+// <carpeta>/xma_<contexto>_<canales>ch.raw (16 bits little-endian, 48 kHz si no se indica otra).
 
 extern "C"
 {
@@ -110,6 +113,7 @@ namespace
         uint32_t packets = 0, samples = 0; // para la traza
         float peak = 0.0f;
         uint32_t consumed = 0, kicks = 0; // avances del puntero de lectura de salida, activaciones
+        FILE* dump = nullptr; // PROSTREET_XMA_DUMP: PCM decodificado (16 bits little-endian)
     };
     Decoder gDecoders[kContextCount];
 
@@ -174,6 +178,14 @@ namespace
             return;
         }
         decoder.packets++;
+        static const char* dump = std::getenv("PROSTREET_XMA_DUMP"); // carpeta
+        if (dump && !decoder.dump)
+        {
+            char name[512];
+            std::snprintf(name, sizeof(name), "%s/xma_%03d_%dch.raw", dump, int(&decoder - gDecoders),
+                decoder.codec->ch_layout.nb_channels);
+            decoder.dump = std::fopen(name, "ab");
+        }
         while (avcodec_receive_frame(decoder.codec, decoder.frame) == 0)
         {
             const int channels = decoder.frame->ch_layout.nb_channels, samples = decoder.frame->nb_samples;
@@ -189,6 +201,8 @@ namespace
                     const int16_t sample = int16_t(std::clamp(value, -1.0f, 1.0f) * 32767.0f);
                     *out++ = uint8_t(uint16_t(sample) >> 8);
                     *out++ = uint8_t(sample);
+                    if (decoder.dump)
+                        std::fwrite(&sample, 2, 1, decoder.dump);
                 }
             av_frame_unref(decoder.frame);
         }
