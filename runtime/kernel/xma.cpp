@@ -162,7 +162,43 @@ namespace
         return true;
     }
 
-    // Decodifica un paquete y deja el PCM (16 bits big-endian, entrelazado) en `pending`.
+    // Pasa a `pending` (16 bits big-endian, entrelazado) los frames que FFmpeg tenga listos.
+    void ReceiveFrames(Decoder& decoder)
+    {
+        while (avcodec_receive_frame(decoder.codec, decoder.frame) == 0)
+        {
+            const int channels = decoder.frame->ch_layout.nb_channels, samples = decoder.frame->nb_samples;
+            decoder.samples += uint32_t(samples);
+            const size_t start = decoder.pending.size();
+            decoder.pending.resize(start + size_t(samples) * channels * 2);
+            uint8_t* out = decoder.pending.data() + start;
+            for (int i = 0; i < samples; i++)
+                for (int c = 0; c < channels; c++)
+                {
+                    const float value = reinterpret_cast<const float*>(decoder.frame->extended_data[c])[i];
+                    decoder.peak = std::max(decoder.peak, std::fabs(value));
+                    const int16_t sample = int16_t(std::clamp(value, -1.0f, 1.0f) * 32767.0f);
+                    *out++ = uint8_t(uint16_t(sample) >> 8);
+                    *out++ = uint8_t(sample);
+                    if (decoder.dump)
+                        std::fwrite(&sample, 2, 1, decoder.dump);
+                }
+            av_frame_unref(decoder.frame);
+        }
+    }
+
+    // FFmpeg retiene los frames del último paquete hasta ver el siguiente; al acabarse la entrada
+    // (fin de un sonido) se le piden y se reinicia. Sin esto, los sonidos de un solo paquete (como
+    // el de "atrás" en los menús) no producen nada.
+    void Drain(Decoder& decoder)
+    {
+        if (!decoder.codec || avcodec_send_packet(decoder.codec, nullptr) < 0)
+            return;
+        ReceiveFrames(decoder);
+        avcodec_flush_buffers(decoder.codec);
+    }
+
+    // Decodifica un paquete y deja el PCM en `pending`.
     void DecodePacket(Decoder& decoder, const uint8_t* data)
     {
         if (av_new_packet(decoder.packet, kPacketBytes) < 0)
@@ -186,26 +222,7 @@ namespace
                 decoder.codec->ch_layout.nb_channels);
             decoder.dump = std::fopen(name, "ab");
         }
-        while (avcodec_receive_frame(decoder.codec, decoder.frame) == 0)
-        {
-            const int channels = decoder.frame->ch_layout.nb_channels, samples = decoder.frame->nb_samples;
-            decoder.samples += uint32_t(samples);
-            const size_t start = decoder.pending.size();
-            decoder.pending.resize(start + size_t(samples) * channels * 2);
-            uint8_t* out = decoder.pending.data() + start;
-            for (int i = 0; i < samples; i++)
-                for (int c = 0; c < channels; c++)
-                {
-                    const float value = reinterpret_cast<const float*>(decoder.frame->extended_data[c])[i];
-                    decoder.peak = std::max(decoder.peak, std::fabs(value));
-                    const int16_t sample = int16_t(std::clamp(value, -1.0f, 1.0f) * 32767.0f);
-                    *out++ = uint8_t(uint16_t(sample) >> 8);
-                    *out++ = uint8_t(sample);
-                    if (decoder.dump)
-                        std::fwrite(&sample, 2, 1, decoder.dump);
-                }
-            av_frame_unref(decoder.frame);
-        }
+        ReceiveFrames(decoder);
     }
 
     // Lo que hace el hardware cada vez que se activa un contexto (con gLock tomado), como Xenia:
@@ -259,6 +276,8 @@ namespace
                     Set(context, valid, 0);
                     Set(context, kCurrentBuffer, current ^ 1);
                     Set(context, kInputReadOffset, kPacketHeaderBits);
+                    if (!Get(context, current ? kInput0Valid : kInput1Valid))
+                        Drain(decoder);
                 }
             }
             if (decoder.pending.size() < frameBytes)
