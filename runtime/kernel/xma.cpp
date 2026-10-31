@@ -204,13 +204,20 @@ namespace
         if (av_new_packet(decoder.packet, kPacketBytes) < 0)
             return;
         std::memcpy(decoder.packet->data, data, kPacketBytes);
-        const int sent = avcodec_send_packet(decoder.codec, decoder.packet);
+        int sent = avcodec_send_packet(decoder.codec, decoder.packet);
+        if (sent < 0)
+        {
+            // Pasa si el paquete no continúa al anterior (p. ej. tras vaciar el decodificador al
+            // final de un sonido, o un contexto reutilizado): se empieza de cero en este paquete.
+            avcodec_flush_buffers(decoder.codec);
+            sent = avcodec_send_packet(decoder.codec, decoder.packet);
+        }
         av_packet_unref(decoder.packet);
         if (sent < 0)
         {
-            if (!decoder.failed)
-                std::fprintf(stderr, "[xma] paquete rechazado por FFmpeg (%d)\n", sent);
-            decoder.failed = true;
+            static int reported = 0;
+            if (reported++ < 10)
+                std::fprintf(stderr, "[xma] paquete rechazado por FFmpeg (%d): se salta\n", sent);
             return;
         }
         decoder.packets++;
@@ -327,7 +334,7 @@ void XmaInitialize()
     memory::Allocate(memory::kPhysicalBase, memory::kPhysicalEnd, 0x10000, 0x1000);
     gContexts = memory::Allocate(memory::kPhysicalBase, memory::kPhysicalEnd, kContextSize * kContextCount, 0x1000);
     memory::Write32(kRegisterBase + kRegContextArrayAddress, __builtin_bswap32(gContexts & 0x1FFFFFFF));
-    av_log_set_level(AV_LOG_ERROR); // sin marcas de tiempo, FFmpeg avisa en cada sonido: no hace falta
+    av_log_set_level(AV_LOG_FATAL); // sus avisos (marcas de tiempo, paquetes que no continúan) no hacen falta
     std::thread(DecoderThread).detach();
 }
 
