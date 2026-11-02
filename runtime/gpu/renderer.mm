@@ -61,6 +61,8 @@ namespace gpu
         // Como la EDRAM, cabe cualquier superficie del juego: la pantalla (1280x720) y el mapa de
         // sombras (1600x1600, solo profundidad).
         constexpr uint32_t kTargetWidth = 2048, kTargetHeight = 2048;
+        // Destino con MSAA: la escena del juego (1280x720, que con 4 muestras va por franjas).
+        constexpr uint32_t kMsaaWidth = 1280, kMsaaHeight = 720;
         // Las ranuras de textura de un shader llevan este bit si las lee como mapa cúbico.
         constexpr uint32_t kCubeSlot = 0x100;
 
@@ -146,16 +148,32 @@ namespace gpu
             id<MTLDevice> device;
             id<MTLCommandQueue> queue;
             id<MTLBuffer> memory;      // memoria física del juego, sin copia
-            id<MTLTexture> target;     // la "EDRAM": destino de dibujo
-            id<MTLTexture> depth;      // y su profundidad / stencil
-            bool depthClearPending = true;
-            double clearDepth = 1.0;
-            uint8_t clearStencil = 0;
+            // La "EDRAM": destinos de dibujo. El 0 es sin MSAA y cabe cualquier superficie; el 1 es para
+            // las superficies con MSAA (RB_SURFACE_INFO bits 16-17, p. ej. la escena a 1280 de ancho):
+            // se dibuja con 4 muestras y al cerrar cada pasada se resuelve en color/depth, que es lo que
+            // leen los resolves. PROSTREET_NO_MSAA=1: todo al destino 0.
+            struct RenderSet
+            {
+                id<MTLTexture> color, depth;     // 1 muestra
+                id<MTLTexture> colorMS, depthMS; // con MSAA: donde se dibuja
+                uint32_t width = 0, height = 0, samples = 1;
+                bool clearPending = true, depthClearPending = true;
+                MTLClearColor clearColor = MTLClearColorMake(0, 0, 0, 1);
+                double clearDepth = 1.0;
+                uint8_t clearStencil = 0;
+            };
+            RenderSet sets[2];
+            uint32_t passSet = 0; // el de la pasada abierta
+            const bool msaaEnabled = std::getenv("PROSTREET_NO_MSAA") == nullptr;
+
+            uint32_t SetFor(const uint32_t* registers) const
+            {
+                const uint32_t info = registers[kRegSurfaceInfo];
+                return msaaEnabled && sets[1].color && ((info >> 16) & 3) && (info & 0x3FFF) <= sets[1].width ? 1 : 0;
+            }
             std::unordered_map<uint64_t, id<MTLDepthStencilState>> depthStates;
             id<MTLCommandBuffer> commands;
             id<MTLRenderCommandEncoder> encoder;
-            bool clearPending = true;
-            MTLClearColor clearColor = MTLClearColorMake(0, 0, 0, 1);
 
             std::unordered_map<uint64_t, id<MTLFunction>> functions;
             std::unordered_map<uint64_t, bool> failedShaders;
@@ -270,16 +288,35 @@ namespace gpu
                 memory = [device newBufferWithBytesNoCopy:memory::Translate(memory::kPhysicalBase) length:memory::kPhysicalSize
                     options:MTLResourceStorageModeShared deallocator:nil];
 
-                MTLTextureDescriptor* descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
-                    width:kTargetWidth height:kTargetHeight mipmapped:NO];
-                descriptor.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
-                descriptor.storageMode = MTLStorageModeShared;
-                target = [device newTextureWithDescriptor:descriptor];
-                MTLTextureDescriptor* depthDescriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:kDepthFormat
-                    width:kTargetWidth height:kTargetHeight mipmapped:NO];
-                depthDescriptor.usage = MTLTextureUsageRenderTarget;
-                depthDescriptor.storageMode = MTLStorageModePrivate;
-                depth = [device newTextureWithDescriptor:depthDescriptor];
+                auto createSet = [&](RenderSet& set, uint32_t width, uint32_t height, uint32_t samples) {
+                    set.width = width;
+                    set.height = height;
+                    set.samples = samples;
+                    MTLTextureDescriptor* descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                        width:width height:height mipmapped:NO];
+                    descriptor.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+                    descriptor.storageMode = MTLStorageModeShared; // los resolves inmediatos la leen
+                    set.color = [device newTextureWithDescriptor:descriptor];
+                    MTLTextureDescriptor* depthDescriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:kDepthFormat
+                        width:width height:height mipmapped:NO];
+                    depthDescriptor.usage = MTLTextureUsageRenderTarget;
+                    depthDescriptor.storageMode = MTLStorageModePrivate;
+                    set.depth = [device newTextureWithDescriptor:depthDescriptor];
+                    if (samples > 1)
+                    {
+                        descriptor.textureType = MTLTextureType2DMultisample;
+                        descriptor.sampleCount = samples;
+                        descriptor.usage = MTLTextureUsageRenderTarget;
+                        descriptor.storageMode = MTLStorageModePrivate;
+                        set.colorMS = [device newTextureWithDescriptor:descriptor];
+                        depthDescriptor.textureType = MTLTextureType2DMultisample;
+                        depthDescriptor.sampleCount = samples;
+                        set.depthMS = [device newTextureWithDescriptor:depthDescriptor];
+                    }
+                };
+                createSet(sets[0], kTargetWidth, kTargetHeight, 1);
+                if (msaaEnabled && [device supportsTextureSampleCount:4])
+                    createSet(sets[1], kMsaaWidth, kMsaaHeight, 4);
 
                 // Textura de 1x1 magenta para formatos aún no soportados (se ven enseguida).
                 MTLTextureDescriptor* small = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:1 height:1 mipmapped:NO];
@@ -300,7 +337,7 @@ namespace gpu
                 depthStaging = [device newBufferWithLength:size_t(kTargetWidth) * kTargetHeight * 4 options:MTLResourceStorageModePrivate];
                 constantRing = [device newBufferWithLength:kRingSize options:MTLResourceStorageModeShared];
                 std::fprintf(stderr, "[render] Metal: %s\n", device.name.UTF8String);
-                return memory != nil && target != nil;
+                return memory != nil && sets[0].color != nil;
             }
 
             id<MTLFunction> Function(const Shader& shader, bool pixel, std::vector<uint32_t>* slots)
@@ -382,6 +419,10 @@ namespace gpu
                 key = key * 1000003 + blend;
                 key = key * 17 + mask;
                 key = key * 3 + (draw.depthOnly ? 1 : 0);
+                // Con MSAA, alpha-to-mask (RB_COLORCONTROL bit 4) es la cobertura por alfa de Metal.
+                const RenderSet& set = sets[SetFor(draw.registers)];
+                const bool alphaToCoverage = set.samples > 1 && (draw.registers[kRegColorControl] & 0x10);
+                key = key * 7 + set.samples * 2 + (alphaToCoverage ? 1 : 0);
                 if (key == lastPipelineKey && lastPipeline) // lo más habitual: el mismo que el dibujo anterior
                 {
                     slots = lastPipelineSlots;
@@ -405,7 +446,9 @@ namespace gpu
                 descriptor.vertexFunction = vertex;
                 descriptor.fragmentFunction = fragment;
                 MTLRenderPipelineColorAttachmentDescriptor* color = descriptor.colorAttachments[0];
-                color.pixelFormat = target.pixelFormat;
+                color.pixelFormat = set.color.pixelFormat;
+                descriptor.rasterSampleCount = set.samples;
+                descriptor.alphaToCoverageEnabled = alphaToCoverage;
                 descriptor.depthAttachmentPixelFormat = kDepthFormat;
                 descriptor.stencilAttachmentPixelFormat = kDepthFormat;
                 color.writeMask = draw.depthOnly ? MTLColorWriteMaskNone : (mask & 1 ? MTLColorWriteMaskRed : 0) | (mask & 2 ? MTLColorWriteMaskGreen : 0) |
@@ -826,26 +869,43 @@ namespace gpu
                 return sampler;
             }
 
-            void BeginPass()
+            void BeginPass(uint32_t setIndex)
             {
-                if (encoder)
+                if (encoder && passSet == setIndex)
                     return;
+                EndPass(false);
+                passSet = setIndex;
+                RenderSet& set = sets[setIndex];
                 commands = [queue commandBuffer];
                 MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
-                pass.colorAttachments[0].texture = target;
-                pass.colorAttachments[0].loadAction = clearPending ? MTLLoadActionClear : MTLLoadActionLoad;
-                pass.colorAttachments[0].clearColor = clearColor;
-                pass.colorAttachments[0].storeAction = MTLStoreActionStore;
-                pass.depthAttachment.texture = depth;
-                pass.depthAttachment.loadAction = depthClearPending ? MTLLoadActionClear : MTLLoadActionLoad;
-                pass.depthAttachment.clearDepth = clearDepth;
-                pass.depthAttachment.storeAction = MTLStoreActionStore;
-                pass.stencilAttachment.texture = depth;
-                pass.stencilAttachment.loadAction = depthClearPending ? MTLLoadActionClear : MTLLoadActionLoad;
-                pass.stencilAttachment.clearStencil = clearStencil;
+                const bool msaa = set.samples > 1;
+                pass.colorAttachments[0].texture = msaa ? set.colorMS : set.color;
+                pass.colorAttachments[0].loadAction = set.clearPending ? MTLLoadActionClear : MTLLoadActionLoad;
+                pass.colorAttachments[0].clearColor = set.clearColor;
+                pass.depthAttachment.texture = msaa ? set.depthMS : set.depth;
+                pass.depthAttachment.loadAction = set.depthClearPending ? MTLLoadActionClear : MTLLoadActionLoad;
+                pass.depthAttachment.clearDepth = set.clearDepth;
+                pass.stencilAttachment.texture = msaa ? set.depthMS : set.depth;
+                pass.stencilAttachment.loadAction = set.depthClearPending ? MTLLoadActionClear : MTLLoadActionLoad;
+                pass.stencilAttachment.clearStencil = set.clearStencil;
                 pass.stencilAttachment.storeAction = MTLStoreActionStore;
-                clearPending = false;
-                depthClearPending = false;
+                if (msaa)
+                {
+                    // Se guardan las muestras (la pasada siguiente sigue encima) y se resuelve (muestra 0
+                    // para la profundidad) en las texturas de una muestra.
+                    pass.colorAttachments[0].resolveTexture = set.color;
+                    pass.colorAttachments[0].storeAction = MTLStoreActionStoreAndMultisampleResolve;
+                    pass.depthAttachment.resolveTexture = set.depth;
+                    pass.depthAttachment.depthResolveFilter = MTLMultisampleDepthResolveFilterSample0;
+                    pass.depthAttachment.storeAction = MTLStoreActionStoreAndMultisampleResolve;
+                }
+                else
+                {
+                    pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+                    pass.depthAttachment.storeAction = MTLStoreActionStore;
+                }
+                set.clearPending = false;
+                set.depthClearPending = false;
                 encoder = [commands renderCommandEncoderWithDescriptor:pass];
             }
 
@@ -885,7 +945,8 @@ namespace gpu
                 }
 
                 const ConstantOffsets constants = UploadConstants(draw);
-                BeginPass();
+                const uint32_t setIndex = SetFor(draw.registers);
+                BeginPass(setIndex);
                 [encoder setRenderPipelineState:pipeline];
                 [encoder setCullMode:MTLCullModeNone];
                 [encoder setDepthStencilState:DepthState(draw.registers)];
@@ -906,14 +967,16 @@ namespace gpu
                     state.viewportScale[i] = AsFloat(draw.registers[kRegViewportXScale + i * 2]);
                     state.viewportOffset[i] = AsFloat(draw.registers[kRegViewportXScale + i * 2 + 1]);
                 }
-                state.targetSize[0] = kTargetWidth;
-                state.targetSize[1] = kTargetHeight;
+                state.targetSize[0] = sets[setIndex].width;
+                state.targetSize[1] = sets[setIndex].height;
                 int32_t windowX, windowY;
                 WindowOffset(draw.registers, windowX, windowY);
                 state.windowOffset[0] = float(windowX);
                 state.windowOffset[1] = float(windowY);
                 std::memcpy(state.bools, &draw.registers[kRegBoolConstants], sizeof(state.bools));
                 state.alphaTest = draw.registers[kRegColorControl] & 0x1F;
+                if (sets[setIndex].samples > 1)
+                    state.alphaTest &= ~0x10u; // alpha-to-mask: lo hace la cobertura por alfa del pipeline
                 state.alphaRef = AsFloat(draw.registers[kRegAlphaRef]);
 
                 const uint32_t* fetchConstants = &draw.registers[kRegFetchConstants];
@@ -1033,7 +1096,7 @@ namespace gpu
             }
 
             // Copia en la GPU de lo que acaba de escribir un resolve (ver ResolvedSurface).
-            void UpdateSurface(uint32_t base, uint32_t pitch, uint32_t height, uint32_t endian,
+            void UpdateSurface(id<MTLTexture> source, uint32_t base, uint32_t pitch, uint32_t height, uint32_t endian,
                 uint32_t left, uint32_t top, uint32_t width, uint32_t rows, bool deferred)
             {
                 // ¿Es una franja de una imagen ya conocida? Las filas de 32 en 32 son contiguas.
@@ -1085,7 +1148,7 @@ namespace gpu
 
                 id<MTLCommandBuffer> copy = [queue commandBuffer];
                 id<MTLBlitCommandEncoder> blit = [copy blitCommandEncoder];
-                [blit copyFromTexture:target sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(left, top, 0)
+                [blit copyFromTexture:source sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(left, top, 0)
                     sourceSize:MTLSizeMake(width, rows, 1) toTexture:surface->texture destinationSlice:0 destinationLevel:0
                     destinationOrigin:MTLOriginMake(left, offsetY + top, 0)];
                 [blit endEncoding];
@@ -1147,6 +1210,7 @@ namespace gpu
             // la EDRAM y a la franja de destino (cuya base ya apunta a ella).
             void ResolveDepth(const uint32_t* registers, uint32_t base, uint32_t pitch, uint32_t height)
             {
+                const RenderSet& set = sets[SetFor(registers)];
                 const uint32_t vertices = 0xA0000000 | (registers[kRegFetchConstants] & 0x1FFFFFFC);
                 float minX = 1e9f, minY = 1e9f, maxX = -1e9f, maxY = -1e9f;
                 for (int i = 0; i < 3; i++)
@@ -1162,8 +1226,8 @@ namespace gpu
                 int32_t windowX, windowY;
                 WindowOffset(registers, windowX, windowY);
                 const int32_t left = std::max(int32_t(minX) + windowX, 0), top = std::max(int32_t(minY) + windowY, 0);
-                const int32_t right = std::min({ int32_t(maxX) + windowX, int32_t(pitch), int32_t(kTargetWidth) });
-                const int32_t bottom = std::min({ int32_t(maxY) + windowY, int32_t(height), int32_t(kTargetHeight) });
+                const int32_t right = std::min({ int32_t(maxX) + windowX, int32_t(pitch), int32_t(set.width) });
+                const int32_t bottom = std::min({ int32_t(maxY) + windowY, int32_t(height), int32_t(set.height) });
                 if (right <= left || bottom <= top || pitch == 0 || height == 0)
                     return;
 
@@ -1204,7 +1268,7 @@ namespace gpu
                 const uint32_t width = right - left, rows = bottom - top;
                 id<MTLCommandBuffer> copy = [queue commandBuffer];
                 id<MTLBlitCommandEncoder> blit = [copy blitCommandEncoder];
-                [blit copyFromTexture:depth sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(left, top, 0)
+                [blit copyFromTexture:set.depth sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(left, top, 0)
                     sourceSize:MTLSizeMake(width, rows, 1) toBuffer:depthStaging destinationOffset:0
                     destinationBytesPerRow:width * 4 destinationBytesPerImage:size_t(width) * rows * 4
                     options:MTLBlitOptionDepthFromDepthStencil];
@@ -1245,10 +1309,11 @@ namespace gpu
                 // Copiar la EDRAM a memoria (solo color, formato 8_8_8_8 por ahora). El rectángulo
                 // está en coordenadas de pantalla: con el desplazamiento de ventana pasa a las de
                 // la EDRAM, que son también las del destino (cuya base ya apunta a la franja).
+                RenderSet& set = sets[SetFor(registers)];
                 uint32_t left = 0, top = 0, right = destPitch, bottom = destHeight;
                 ResolveRect(registers, left, top, right, bottom);
-                right = std::min({right, destPitch, kTargetWidth});
-                bottom = std::min({bottom, destHeight, kTargetHeight});
+                right = std::min({right, destPitch, set.width});
+                bottom = std::min({bottom, destHeight, set.height});
                 if (immediateWriteback)
                     epoch++; // la memoria cambia en el acto
                 if (source == 4 && destBase)
@@ -1257,14 +1322,14 @@ namespace gpu
                 {
                     // Solo en la GPU: la memoria se escribe cuando alguien la necesita (WritebackSurface).
                     EndPass(false);
-                    UpdateSurface(destBase & 0x1FFFFFFF, destPitch, destHeight, destEndian, left, top, right - left, bottom - top, true);
+                    UpdateSurface(set.color, destBase & 0x1FFFFFFF, destPitch, destHeight, destEndian, left, top, right - left, bottom - top, true);
                 }
                 else if (source < 4 && destFormat == 6 && destBase && right > left && bottom > top)
                 {
                     EndPass(true);
                     const uint32_t width = right - left, height = bottom - top;
                     std::vector<uint32_t> pixels(size_t(width) * height);
-                    [target getBytes:pixels.data() bytesPerRow:width * 4 fromRegion:MTLRegionMake2D(left, top, width, height) mipmapLevel:0];
+                    [set.color getBytes:pixels.data() bytesPerRow:width * 4 fromRegion:MTLRegionMake2D(left, top, width, height) mipmapLevel:0];
                     auto* dest = static_cast<uint8_t*>(memory::Translate(0xA0000000 | (destBase & 0x1FFFFFFF)));
                     for (uint32_t y = 0; y < height; y++)
                     {
@@ -1283,7 +1348,7 @@ namespace gpu
                             std::memcpy(dest + TiledOffset(left + x, top + y, destPitch, 2), &value, 4);
                         }
                     }
-                    UpdateSurface(destBase & 0x1FFFFFFF, destPitch, destHeight, destEndian, left, top, width, height, false);
+                    UpdateSurface(set.color, destBase & 0x1FFFFFFF, destPitch, destHeight, destEndian, left, top, width, height, false);
                 }
 
                 // Borrado tras la copia (RB_COPY_CONTROL bit 8): en la siguiente pasada.
@@ -1291,9 +1356,9 @@ namespace gpu
                 {
                     EndPass(false);
                     const uint32_t clear = registers[kRegColorClear];
-                    clearColor = MTLClearColorMake(((clear >> 16) & 0xFF) / 255.0, ((clear >> 8) & 0xFF) / 255.0,
+                    set.clearColor = MTLClearColorMake(((clear >> 16) & 0xFF) / 255.0, ((clear >> 8) & 0xFF) / 255.0,
                         (clear & 0xFF) / 255.0, ((clear >> 24) & 0xFF) / 255.0);
-                    clearPending = true;
+                    set.clearPending = true;
                 }
                 // Borrado de profundidad / stencil (bit 9). D24S8 o D24FS8 (20e4) según RB_DEPTH_INFO.
                 if (control & 0x200)
@@ -1303,15 +1368,15 @@ namespace gpu
                     if (registers[kRegDepthInfo] & 0x10000)
                     {
                         const uint32_t exponent = value >> 20, mantissa = value & 0xFFFFF;
-                        clearDepth = exponent ? std::ldexp(1.0 + mantissa / 1048576.0, int(exponent) - 15) : std::ldexp(mantissa / 1048576.0, -14);
-                        clearDepth = std::min(clearDepth, 1.0);
+                        set.clearDepth = exponent ? std::ldexp(1.0 + mantissa / 1048576.0, int(exponent) - 15) : std::ldexp(mantissa / 1048576.0, -14);
+                        set.clearDepth = std::min(set.clearDepth, 1.0);
                     }
                     else
                     {
-                        clearDepth = value / 16777215.0;
+                        set.clearDepth = value / 16777215.0;
                     }
-                    clearStencil = uint8_t(clear & 0xFF);
-                    depthClearPending = true;
+                    set.clearStencil = uint8_t(clear & 0xFF);
+                    set.depthClearPending = true;
                 }
             }
         };
