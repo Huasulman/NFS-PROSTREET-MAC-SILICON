@@ -94,6 +94,15 @@ namespace gpu
             bool pending = false;
             uint64_t validEpoch = 0; // época en la que su memoria se comprobó (hash) por última vez
             uint32_t pendingLeft = 0, pendingTop = 0, pendingRight = 0, pendingBottom = 0;
+            uint64_t version = 0;    // cambia con cada resolve que la escribe
+        };
+
+        // Mapa cúbico montado en la GPU con las 6 imágenes que han dejado los resolves (p. ej. el de
+        // los reflejos, que se redibuja en cada fotograma): así no hay que leerlas de la GPU.
+        struct SurfaceCube
+        {
+            id<MTLTexture> texture, view; // view: con R y B cambiados, como ResolvedSurface::view
+            uint64_t versions[6] = {};
         };
 
         // Profundidad que ha copiado un resolve (fuente 4). Solo está en la GPU (R32Float): el juego
@@ -155,6 +164,8 @@ namespace gpu
             std::unordered_map<uint64_t, id<MTLRenderPipelineState>> pipelines;
             std::unordered_map<uint64_t, Texture> textures;
             std::vector<ResolvedSurface> surfaces;
+            std::unordered_map<uint32_t, SurfaceCube> surfaceCubes;
+            uint64_t surfaceVersions = 0;
             std::vector<DepthSurface> depthSurfaces;
             id<MTLBuffer> depthStaging; // profundidad de camino a una DepthSurface
 
@@ -453,6 +464,63 @@ namespace gpu
                 return state;
             }
 
+            // Cubo con las caras en [base + cara * faceStride] si las 6 son imágenes de resolves vigentes
+            // (su memoria no ha cambiado desde entonces). Si alguna ha cambiado, se monta un cubo nuevo (el
+            // anterior puede usarlo un dibujo aún sin enviar); la copia va antes que el trabajo pendiente.
+            id<MTLTexture> CubeFromSurfaces(uint32_t base, size_t faceStride, uint32_t pitch, uint32_t size, uint32_t endian)
+            {
+                ResolvedSurface* faces[6];
+                for (uint32_t face = 0; face < 6; face++)
+                {
+                    faces[face] = nullptr;
+                    for (ResolvedSurface& surface : surfaces)
+                        if (surface.base == base + face * faceStride && surface.pitch == pitch && surface.height == size &&
+                            surface.endian == endian && size <= surface.pitch)
+                        {
+                            faces[face] = &surface;
+                            break;
+                        }
+                    ResolvedSurface* surface = faces[face];
+                    if (!surface)
+                        return nil;
+                    if (surface->validEpoch != epoch)
+                    {
+                        const auto* memoryStart = static_cast<const uint8_t*>(memory::Translate(0xA0000000 | surface->base));
+                        if (surface->hash != HashMemory(memoryStart, std::min<size_t>(TiledSize(surface->pitch, surface->height, 4),
+                            0x20000000 - surface->base)))
+                            return nil;
+                        surface->validEpoch = epoch;
+                    }
+                }
+                SurfaceCube& cube = surfaceCubes[base];
+                bool changed = !cube.texture || cube.texture.width != size;
+                for (uint32_t face = 0; face < 6; face++)
+                    changed |= cube.versions[face] != faces[face]->version;
+                if (!changed)
+                    return cube.view;
+                MTLTextureDescriptor* descriptor = [MTLTextureDescriptor textureCubeDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                    size:size mipmapped:NO];
+                descriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
+                descriptor.storageMode = MTLStorageModePrivate;
+                cube.texture = [device newTextureWithDescriptor:descriptor];
+                cube.view = [cube.texture newTextureViewWithPixelFormat:MTLPixelFormatRGBA8Unorm textureType:MTLTextureTypeCube
+                    levels:NSMakeRange(0, 1) slices:NSMakeRange(0, 6)
+                    swizzle:MTLTextureSwizzleChannelsMake(MTLTextureSwizzleBlue, MTLTextureSwizzleGreen,
+                        MTLTextureSwizzleRed, MTLTextureSwizzleAlpha)];
+                id<MTLCommandBuffer> copy = [queue commandBuffer];
+                id<MTLBlitCommandEncoder> blit = [copy blitCommandEncoder];
+                for (uint32_t face = 0; face < 6; face++)
+                {
+                    [blit copyFromTexture:faces[face]->texture sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
+                        sourceSize:MTLSizeMake(size, size, 1) toTexture:cube.texture destinationSlice:face destinationLevel:0
+                        destinationOrigin:MTLOriginMake(0, 0, 0)];
+                    cube.versions[face] = faces[face]->version;
+                }
+                [blit endEncoding];
+                [copy commit];
+                return cube.view;
+            }
+
             // Textura a partir de una constante de fetch (6 palabras). cube: el shader la lee como mapa
             // cúbico (entonces hay que darle uno, aunque sea el de relleno).
             id<MTLTexture> TextureFor(const uint32_t* fetch, bool cube)
@@ -632,16 +700,30 @@ namespace gpu
                                 return surface.view;
                             }
                         }
+                if (format == 6 && tiled && cube && levels == 1)
+                    if (id<MTLTexture> view = CubeFromSurfaces(base & 0x1FFFFFFF, faceStride, pitchBlocks, width, endian))
+                        return view;
                 const uint64_t key = (uint64_t(base) << 32) ^ (uint64_t(format) << 26) ^ (uint64_t(width) << 13) ^ height ^ (uint64_t(cube) << 63) ^
                                      (uint64_t(mipAddress) * 0x9E3779B1ull) ^ (uint64_t(levels) << 58);
                 Texture& cached = textures[key];
                 if (cached.texture && cached.epoch == epoch)
                     return cached.texture;
-                const uint64_t hash = HashMemory(source, rawSize) ^ (mipSize ? HashMemory(mipSource, mipSize) * 31 : 0);
                 // Si la textura cae sobre un resolve aún no escrito en memoria (y no ha podido usar su
                 // copia), se escribe ahora para leer lo que toca.
                 if (WritebackOverlapping(base & 0x1FFFFFFF, rawSize) || (mipSize && WritebackOverlapping(mipAddress & 0x1FFFFFFF, mipSize)))
                     return TextureFor(fetch, cube);
+                // Sin escrituras en su memoria desde que se leyó (páginas vigiladas): no hace falta mirarla.
+                if (cached.texture && memory::Unchanged(base & 0x1FFFFFFF, uint32_t(rawSize)) &&
+                    (!mipSize || memory::Unchanged(mipAddress & 0x1FFFFFFF, uint32_t(mipSize))))
+                {
+                    cached.epoch = epoch;
+                    return cached.texture;
+                }
+                // Se vigila antes de leerla: una escritura posterior la marcará como cambiada.
+                memory::Watch(base & 0x1FFFFFFF, uint32_t(rawSize));
+                if (mipSize)
+                    memory::Watch(mipAddress & 0x1FFFFFFF, uint32_t(mipSize));
+                const uint64_t hash = HashMemory(source, rawSize) ^ (mipSize ? HashMemory(mipSource, mipSize) * 31 : 0);
                 if (cached.texture && cached.hash == hash)
                 {
                     cached.epoch = epoch;
@@ -999,6 +1081,7 @@ namespace gpu
                     offsetY = 0;
                 }
                 surface->endian = endian;
+                surface->version = ++surfaceVersions; // único entre todas: una imagen nueva no repite número
 
                 id<MTLCommandBuffer> copy = [queue commandBuffer];
                 id<MTLBlitCommandEncoder> blit = [copy blitCommandEncoder];

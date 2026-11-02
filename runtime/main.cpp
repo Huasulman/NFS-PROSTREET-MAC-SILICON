@@ -141,6 +141,9 @@ namespace
 
     void OnCrash(int signal, siginfo_t* info, void* context)
     {
+        // Escritura en una página vigilada (memoria de texturas): se abre y se reintenta.
+        if ((signal == SIGBUS || signal == SIGSEGV) && memory::HandleWriteFault(info->si_addr))
+            return;
         const auto* address = static_cast<const uint8_t*>(info->si_addr);
         char message[256];
         int length;

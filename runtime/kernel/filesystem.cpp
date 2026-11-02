@@ -411,6 +411,7 @@ PPC_FUNC(__imp__NtReadFile)
     uint64_t offset = file->position;
     if (offsetPtr && Read64(offsetPtr) != ~0ull) // -1 = "posición actual"
         offset = Read64(offsetPtr);
+    memory::PrepareHostWrite(buffer, length); // páginas vigiladas (texturas): pread no puede escribir en ellas
     const ssize_t read = pread(file->fd, memory::Translate(buffer), length, off_t(offset));
     const uint32_t status = read < 0 ? kStatusAccessDenied : (read == 0 && length > 0) ? kStatusEndOfFile : kStatusSuccess;
     if (read > 0)
