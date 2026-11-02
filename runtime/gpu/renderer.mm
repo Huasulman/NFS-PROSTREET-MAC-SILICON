@@ -25,6 +25,8 @@ namespace gpu
         constexpr uint32_t kRegIndexOffset = 0x2102;  // VGT_INDX_OFFSET
         constexpr uint32_t kRegViewportXScale = 0x210F; // PA_CL_VPORT_XSCALE (y luego XOFFSET, YSCALE...)
         constexpr uint32_t kRegBlendControl0 = 0x2201; // RB_BLENDCONTROL0
+        constexpr uint32_t kRegColorControl = 0x2202;  // RB_COLORCONTROL (prueba alfa)
+        constexpr uint32_t kRegAlphaRef = 0x210E;      // RB_ALPHA_REF
         constexpr uint32_t kRegVteControl = 0x2206;   // PA_CL_VTE_CNTL
         constexpr uint32_t kRegWindowOffset = 0x2080; // PA_SC_WINDOW_OFFSET
         constexpr uint32_t kRegModeControl = 0x2205;  // PA_SU_SC_MODE_CNTL
@@ -522,14 +524,102 @@ namespace gpu
                 while ((1u << log2Bytes) < bytesPerBlock)
                     log2Bytes++;
 
+                // Niveles de mipmap (como Xenia): el 0 está en la base; del 1 en adelante, seguidos desde
+                // mip_address (palabra 5), cada uno con el tamaño de la potencia de dos siguiente a la base
+                // dividida entre 2^nivel y alineado a bloques de 32x32 (o filas de 256 bytes sin mosaico).
+                // Con packed_mips, los niveles cuyo lado menor es de 16 texels o menos comparten un mismo
+                // bloque de 32x32 (la "cola"), cada uno en su desplazamiento.
+                const uint32_t mipAddress = fetch[5] & 0xFFFFF000;
+                const bool packedMips = (fetch[5] >> 11) & 1;
+                auto log2Ceil = [](uint32_t value) { uint32_t n = 0; while ((1u << n) < value) n++; return n; };
+                const uint32_t fullChain = log2Ceil(std::max(width, height)) + 1;
+                const uint32_t maxLevel = (fetch[4] >> 6) & 0xF;
+                const uint32_t levels = mipAddress ? std::min(maxLevel + 1, fullChain) : 1;
+                const uint32_t packedLevel = packedMips ? (log2Ceil(std::min(width, height)) > 4 ? log2Ceil(std::min(width, height)) - 4 : 0) : ~0u;
+                auto nextPow2 = [&](uint32_t value) { return 1u << log2Ceil(value); };
+                struct Level
+                {
+                    uint32_t width, height;      // texels
+                    uint32_t blocksX, blocksY;
+                    uint32_t address;             // dirección física de su memoria (o de la cola)
+                    uint32_t pitchBlocks;         // de la memoria (bloques por fila)
+                    uint32_t offsetX = 0, offsetY = 0; // en bloques, dentro de la cola
+                    size_t sliceStride;           // entre caras
+                    size_t size;                  // de una cara
+                };
+                std::vector<Level> levelInfo;
+                size_t mipOffset = 0;
+                for (uint32_t level = 0; level < levels; level++)
+                {
+                    Level info;
+                    info.width = std::max(width >> level, 1u);
+                    info.height = std::max(height >> level, 1u);
+                    info.blocksX = (info.width + blockSize - 1) / blockSize;
+                    info.blocksY = (info.height + blockSize - 1) / blockSize;
+                    const bool inTail = level >= packedLevel;
+                    const uint32_t storageLevel = inTail ? packedLevel : level; // el nivel cuya memoria se lee
+                    uint32_t strideBlocksX, strideBlocksY;
+                    if (storageLevel == 0)
+                    {
+                        strideBlocksX = pitchBlocks;
+                        strideBlocksY = blocksY;
+                    }
+                    else
+                    {
+                        strideBlocksX = (std::max(nextPow2(width) >> storageLevel, 1u) + blockSize - 1) / blockSize;
+                        strideBlocksY = (std::max(nextPow2(height) >> storageLevel, 1u) + blockSize - 1) / blockSize;
+                    }
+                    if (tiled)
+                    {
+                        strideBlocksX = (strideBlocksX + 31) & ~31u;
+                        info.size = TiledSize(strideBlocksX, strideBlocksY, bytesPerBlock);
+                    }
+                    else
+                    {
+                        if (storageLevel != 0)
+                            strideBlocksX = ((strideBlocksX * bytesPerBlock + 255) & ~255u) / bytesPerBlock;
+                        info.size = size_t(strideBlocksX) * ((strideBlocksY + 31) & ~31u) * bytesPerBlock;
+                    }
+                    info.pitchBlocks = strideBlocksX;
+                    info.sliceStride = (info.size + 4095) & ~size_t(4095);
+                    if (inTail && level != packedLevel)
+                        info.address = levelInfo[packedLevel].address;
+                    else if (level == 0)
+                        info.address = base & 0x1FFFFFFF;
+                    else
+                    {
+                        info.address = (mipAddress & 0x1FFFFFFF) + uint32_t(mipOffset);
+                        mipOffset += info.sliceStride * faces;
+                    }
+                    if (inTail) // desplazamiento dentro de la cola (GetPackedMipOffset de Xenia)
+                    {
+                        const uint32_t log2Width = log2Ceil(width), log2Height = log2Ceil(height);
+                        const uint32_t packedMip = level - packedLevel;
+                        uint32_t x = 0, y = 0;
+                        if (packedMip < 3)
+                            (log2Width > log2Height ? y : x) = 16 >> packedMip;
+                        else
+                        {
+                            const uint32_t offset = (1u << ((log2Width > log2Height ? log2Width : log2Height) - packedLevel)) >> (packedMip - 2);
+                            (log2Width > log2Height ? x : y) = offset;
+                        }
+                        info.offsetX = x / blockSize;
+                        info.offsetY = y / blockSize;
+                        info.size = levelInfo.empty() || level == packedLevel ? info.size : levelInfo[packedLevel].size;
+                    }
+                    levelInfo.push_back(info);
+                }
+
                 // ¿Ha cambiado? Se mira la memoria original (con mosaico, las filas van de 32 en 32).
                 const auto* source = static_cast<const uint8_t*>(memory::Translate(0xA0000000 | (base & 0x1FFFFFFF)));
-                const size_t faceSize = tiled ? TiledSize(pitchBlocks, blocksY, bytesPerBlock) : size_t(pitchBlocks) * blocksY * bytesPerBlock;
-                const size_t faceStride = (faceSize + 4095) & ~size_t(4095); // las caras van alineadas a 4 KB
+                const size_t faceSize = levelInfo[0].size;
+                const size_t faceStride = levelInfo[0].sliceStride; // las caras van alineadas a 4 KB
                 const size_t rawSize = std::min<size_t>(faceStride * (faces - 1) + faceSize, 0x20000000 - (base & 0x1FFFFFFF));
+                const size_t mipSize = std::min<size_t>(mipOffset, 0x20000000 - (mipAddress & 0x1FFFFFFF));
+                const auto* mipSource = static_cast<const uint8_t*>(memory::Translate(0xA0000000 | (mipAddress & 0x1FFFFFFF)));
                 // ¿Es la imagen de un resolve? Entonces se usa su copia en la GPU, mientras la memoria no
                 // haya cambiado desde el resolve (se comprueba una vez por época).
-                if (format == 6 && tiled && !cube)
+                if (format == 6 && tiled && !cube && levels == 1)
                     for (ResolvedSurface& surface : surfaces)
                         if (surface.base == (base & 0x1FFFFFFF) && surface.pitch == pitchBlocks && surface.height == height &&
                             surface.endian == endian && width <= surface.pitch)
@@ -542,14 +632,15 @@ namespace gpu
                                 return surface.view;
                             }
                         }
-                const uint64_t key = (uint64_t(base) << 32) ^ (uint64_t(format) << 26) ^ (uint64_t(width) << 13) ^ height ^ (uint64_t(cube) << 63);
+                const uint64_t key = (uint64_t(base) << 32) ^ (uint64_t(format) << 26) ^ (uint64_t(width) << 13) ^ height ^ (uint64_t(cube) << 63) ^
+                                     (uint64_t(mipAddress) * 0x9E3779B1ull) ^ (uint64_t(levels) << 58);
                 Texture& cached = textures[key];
                 if (cached.texture && cached.epoch == epoch)
                     return cached.texture;
-                const uint64_t hash = HashMemory(source, rawSize);
+                const uint64_t hash = HashMemory(source, rawSize) ^ (mipSize ? HashMemory(mipSource, mipSize) * 31 : 0);
                 // Si la textura cae sobre un resolve aún no escrito en memoria (y no ha podido usar su
                 // copia), se escribe ahora para leer lo que toca.
-                if (WritebackOverlapping(base & 0x1FFFFFFF, rawSize))
+                if (WritebackOverlapping(base & 0x1FFFFFFF, rawSize) || (mipSize && WritebackOverlapping(mipAddress & 0x1FFFFFFF, mipSize)))
                     return TextureFor(fetch, cube);
                 if (cached.texture && cached.hash == hash)
                 {
@@ -557,50 +648,58 @@ namespace gpu
                     return cached.texture;
                 }
 
-                // Lectura (quitando el mosaico) e intercambio de bytes.
-                const size_t imageBytes = size_t(blocksX) * blocksY * bytesPerBlock;
-                std::vector<uint8_t> data(imageBytes * faces);
-                for (uint32_t face = 0; face < faces; face++)
-                {
-                    const uint8_t* faceSource = source + face * faceStride;
-                    if (face * faceStride + faceSize > rawSize)
-                        break; // se sale de la memoria
-                    for (uint32_t by = 0; by < blocksY; by++)
-                    {
-                        for (uint32_t bx = 0; bx < blocksX; bx++)
-                        {
-                            const uint32_t offset = tiled ? TiledOffset(bx, by, pitchBlocks, log2Bytes) : (by * pitchBlocks + bx) * bytesPerBlock;
-                            std::memcpy(&data[face * imageBytes + (size_t(by) * blocksX + bx) * bytesPerBlock], faceSource + offset, bytesPerBlock);
-                        }
-                    }
-                }
-                for (size_t i = 0; i + 3 < data.size(); i += 4)
-                {
-                    uint32_t word;
-                    std::memcpy(&word, &data[i], 4);
-                    switch (endian)
-                    {
-                    case 1: word = ((word & 0x00FF00FF) << 8) | ((word >> 8) & 0x00FF00FF); break;
-                    case 2: word = __builtin_bswap32(word); break;
-                    case 3: word = (word << 16) | (word >> 16); break;
-                    default: break;
-                    }
-                    std::memcpy(&data[i], &word, 4);
-                }
-
                 // Textura nueva (no se reescribe la anterior: puede usarla un dibujo aún sin enviar).
                 MTLTextureDescriptor* descriptor = cube ?
-                    [MTLTextureDescriptor textureCubeDescriptorWithPixelFormat:pixelFormat size:width mipmapped:NO] :
-                    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pixelFormat width:width height:height mipmapped:NO];
+                    [MTLTextureDescriptor textureCubeDescriptorWithPixelFormat:pixelFormat size:width mipmapped:levels > 1] :
+                    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pixelFormat width:width height:height mipmapped:levels > 1];
+                descriptor.mipmapLevelCount = levels;
                 cached.texture = [device newTextureWithDescriptor:descriptor];
-                for (uint32_t face = 0; face < faces; face++)
-                    [cached.texture replaceRegion:MTLRegionMake2D(0, 0, width, height) mipmapLevel:0 slice:face
-                        withBytes:data.data() + face * imageBytes bytesPerRow:blocksX * bytesPerBlock bytesPerImage:imageBytes];
+
+                // Lectura de cada nivel y cara (quitando el mosaico) e intercambio de bytes.
+                std::vector<uint8_t> data;
+                for (uint32_t level = 0; level < levels; level++)
+                {
+                    const Level& info = levelInfo[level];
+                    const size_t imageBytes = size_t(info.blocksX) * info.blocksY * bytesPerBlock;
+                    for (uint32_t face = 0; face < faces; face++)
+                    {
+                        data.assign(imageBytes, 0);
+                        const size_t start = size_t(info.address) + face * info.sliceStride;
+                        if (start + info.size > 0x20000000)
+                            break; // se sale de la memoria
+                        const auto* levelSource = static_cast<const uint8_t*>(memory::Translate(0xA0000000 | uint32_t(start)));
+                        for (uint32_t by = 0; by < info.blocksY; by++)
+                        {
+                            for (uint32_t bx = 0; bx < info.blocksX; bx++)
+                            {
+                                const uint32_t x = bx + info.offsetX, y = by + info.offsetY;
+                                const size_t offset = tiled ? TiledOffset(x, y, info.pitchBlocks, log2Bytes) : (size_t(y) * info.pitchBlocks + x) * bytesPerBlock;
+                                if (offset + bytesPerBlock <= info.size)
+                                    std::memcpy(&data[(size_t(by) * info.blocksX + bx) * bytesPerBlock], levelSource + offset, bytesPerBlock);
+                            }
+                        }
+                        for (size_t i = 0; i + 3 < data.size(); i += 4)
+                        {
+                            uint32_t word;
+                            std::memcpy(&word, &data[i], 4);
+                            switch (endian)
+                            {
+                            case 1: word = ((word & 0x00FF00FF) << 8) | ((word >> 8) & 0x00FF00FF); break;
+                            case 2: word = __builtin_bswap32(word); break;
+                            case 3: word = (word << 16) | (word >> 16); break;
+                            default: break;
+                            }
+                            std::memcpy(&data[i], &word, 4);
+                        }
+                        [cached.texture replaceRegion:MTLRegionMake2D(0, 0, info.width, info.height) mipmapLevel:level slice:face
+                            withBytes:data.data() bytesPerRow:info.blocksX * bytesPerBlock bytesPerImage:imageBytes];
+                    }
+                }
                 cached.hash = hash;
                 cached.epoch = epoch;
                 if (Trace())
-                    std::fprintf(stderr, "[render] textura 0x%08X %ux%u formato %u%s%s\n", base, width, height, format, tiled ? " (mosaico)" : "",
-                        cube ? " (cubo)" : "");
+                    std::fprintf(stderr, "[render] textura 0x%08X %ux%u formato %u, %u niveles%s%s%s\n", base, width, height, format, levels,
+                        packedMips ? " (cola empaquetada)" : "", tiled ? " (mosaico)" : "", cube ? " (cubo)" : "");
                 return cached.texture;
             }
 
@@ -608,7 +707,8 @@ namespace gpu
             {
                 // clamp_x/y: bits 10-12 y 13-15 de la palabra 0; filtros mag/min: bits 19-20 y 21-22 de la palabra 3;
                 // color del borde: bits 0-1 de la palabra 5 (0 = negro transparente, 1 = blanco).
-                const uint32_t key = ((fetch[0] >> 10) & 0x3F) | (((fetch[3] >> 19) & 0xF) << 6) | ((fetch[5] & 3) << 10);
+                // Filtro entre mipmaps: bits 23-24 de la palabra 3; anisótropo: bits 25-27.
+                const uint32_t key = ((fetch[0] >> 10) & 0x3F) | (((fetch[3] >> 19) & 0x1FF) << 6) | ((fetch[5] & 3) << 15);
                 auto it = samplers.find(key);
                 if (it != samplers.end())
                     return it->second;
@@ -631,6 +731,14 @@ namespace gpu
                 descriptor.borderColor = (fetch[5] & 3) == 1 ? MTLSamplerBorderColorOpaqueWhite : MTLSamplerBorderColorTransparentBlack;
                 descriptor.magFilter = ((fetch[3] >> 19) & 3) ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
                 descriptor.minFilter = ((fetch[3] >> 21) & 3) ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
+                // 0 = el más cercano, 1 = lineal, 2 = solo la base, 3 = lo que diga la instrucción (aquí lineal).
+                const uint32_t mipFilter = (fetch[3] >> 23) & 3;
+                descriptor.mipFilter = mipFilter == 0 ? MTLSamplerMipFilterNearest :
+                                       mipFilter == 2 ? MTLSamplerMipFilterNotMipmapped : MTLSamplerMipFilterLinear;
+                // Anisótropo: 0 = no, 1-5 = hasta 1, 2, 4, 8 y 16 muestras (6 y 7: de la instrucción; aquí 1).
+                const uint32_t aniso = (fetch[3] >> 25) & 7;
+                if (aniso >= 2 && aniso <= 5 && descriptor.minFilter == MTLSamplerMinMagFilterLinear)
+                    descriptor.maxAnisotropy = 1u << (aniso - 1);
                 id<MTLSamplerState> sampler = [device newSamplerStateWithDescriptor:descriptor];
                 samplers[key] = sampler;
                 return sampler;
@@ -723,6 +831,8 @@ namespace gpu
                 state.windowOffset[0] = float(windowX);
                 state.windowOffset[1] = float(windowY);
                 std::memcpy(state.bools, &draw.registers[kRegBoolConstants], sizeof(state.bools));
+                state.alphaTest = draw.registers[kRegColorControl] & 0x1F;
+                state.alphaRef = AsFloat(draw.registers[kRegAlphaRef]);
 
                 const uint32_t* fetchConstants = &draw.registers[kRegFetchConstants];
                 [encoder setVertexBuffer:memory offset:0 atIndex:0];

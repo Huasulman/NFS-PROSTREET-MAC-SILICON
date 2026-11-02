@@ -1,5 +1,6 @@
 #include "shader_translator.h"
 
+#include <cmath>
 #include <cstdio>
 #include <set>
 #include <sstream>
@@ -16,7 +17,33 @@ struct DrawState
 {
     uint primitive; uint indexSize; uint indexBase; uint indexEndian; uint indexOffset; uint vte;
     float viewportScale[4]; float viewportOffset[4]; float targetSize[2]; float windowOffset[2]; uint bools[8];
+    uint alphaTest; float alphaRef;
 };
+
+// Prueba alfa de Xenos (fija, no del shader). Las funciones van en el orden de las de profundidad.
+// Alpha-to-mask sin MSAA: cubre el píxel si alfa >= 0,5.
+inline bool alpha_test_fails(constant DrawState& st, float alpha)
+{
+    if (st.alphaTest & 16)
+    {
+        if (alpha < 0.5f)
+            return true;
+    }
+    if (!(st.alphaTest & 8))
+        return false;
+    float ref = st.alphaRef;
+    switch (st.alphaTest & 7)
+    {
+    case 0: return true;
+    case 1: return !(alpha < ref);
+    case 2: return !(alpha == ref);
+    case 3: return !(alpha <= ref);
+    case 4: return !(alpha > ref);
+    case 5: return !(alpha != ref);
+    case 6: return !(alpha >= ref);
+    default: return false;
+    }
+}
 
 struct VSOut
 {
@@ -184,7 +211,9 @@ inline bool bool_constant(constant DrawState& st, uint index) { return (st.bools
 
             // Operando de la ALU: registro temporal (con valor absoluto opcional, bit 7 del registro) o
             // constante (con valor absoluto si la instrucción lleva abs_constants).
-            std::string Source(uint32_t reg, bool temporary, uint32_t swizzle, bool negate, bool absConstants)
+            // relative: la constante se indexa con a0 (c[reg + a0]; con aL, que siempre vale 0 al no haber
+            // bucles, queda como absoluta). Entonces puede leer cualquier constante: se suben todas.
+            std::string Source(uint32_t reg, bool temporary, uint32_t swizzle, bool negate, bool absConstants, bool relative = false)
             {
                 std::string name;
                 if (temporary)
@@ -195,8 +224,17 @@ inline bool bool_constant(constant DrawState& st, uint index) { return (st.bools
                 }
                 else
                 {
-                    name = "c[" + std::to_string(reg) + "]";
-                    constants.insert(reg);
+                    if (relative)
+                    {
+                        name = "c[clamp(" + std::to_string(reg) + " + a0, 0, 255)]";
+                        for (uint32_t i = 0; i < 256; i++)
+                            constants.insert(i);
+                    }
+                    else
+                    {
+                        name = "c[" + std::to_string(reg) + "]";
+                        constants.insert(reg);
+                    }
                     if (absConstants)
                         name = "fabs(" + name + ")";
                 }
@@ -241,6 +279,14 @@ inline bool bool_constant(constant DrawState& st, uint index) { return (st.bools
                 const uint32_t reg3 = Bits(w2, 0, 8), swizzle3 = Bits(w1, 0, 8);
                 const bool temporary3 = Bits(w2, 29, 1), negate3 = Bits(w1, 24, 1);
                 const bool absConstants = Bits(w0, 7, 1);
+                // Direccionamiento relativo de constantes (palabra 1): const_0_rel_abs (31) vale para la primera
+                // constante de la instrucción y const_1_rel_abs (30) para las siguientes; el bit 29 dice si es
+                // relativo a a0 (si no, a aL).
+                const bool temporary1 = Bits(w2, 31, 1), temporary2 = Bits(w2, 30, 1);
+                const bool a0Relative = Bits(w1, 29, 1);
+                const bool relative1 = a0Relative && Bits(w1, 31, 1);
+                const bool relative2 = a0Relative && Bits(w1, temporary1 ? 31 : 30, 1);
+                const bool relative3 = a0Relative && Bits(w1, (temporary1 && temporary2) ? 31 : 30, 1);
 
                 const bool predicated = Bits(w1, 28, 1);
                 if (predicated)
@@ -249,9 +295,9 @@ inline bool bool_constant(constant DrawState& st, uint index) { return (st.bools
                 }
                 Line() << "{\n";
                 indent++;
-                Line() << "float4 s1 = " << Source(Bits(w2, 16, 8), Bits(w2, 31, 1), Bits(w1, 16, 8), Bits(w1, 26, 1), absConstants) << ";\n";
-                Line() << "float4 s2 = " << Source(Bits(w2, 8, 8), Bits(w2, 30, 1), Bits(w1, 8, 8), Bits(w1, 25, 1), absConstants) << ";\n";
-                Line() << "float4 s3 = " << Source(reg3, temporary3, swizzle3, negate3, absConstants) << ";\n";
+                Line() << "float4 s1 = " << Source(Bits(w2, 16, 8), temporary1, Bits(w1, 16, 8), Bits(w1, 26, 1), absConstants, relative1) << ";\n";
+                Line() << "float4 s2 = " << Source(Bits(w2, 8, 8), temporary2, Bits(w1, 8, 8), Bits(w1, 25, 1), absConstants, relative2) << ";\n";
+                Line() << "float4 s3 = " << Source(reg3, temporary3, swizzle3, negate3, absConstants, relative3) << ";\n";
 
                 // Parte vectorial.
                 std::string v;
@@ -367,8 +413,16 @@ inline bool bool_constant(constant DrawState& st, uint index) { return (st.bools
                         return negate3 ? "(-" + magnitude + ")" : magnitude;
                     };
                     const std::string other = modifiers("r[" + std::to_string(temp) + "]." + std::string(1, kComponents[AluComponent(swizzle3, 0)]));
-                    constants.insert(reg3);
-                    Line() << "float sc = " << modifiers("c[" + std::to_string(reg3) + "]." + kComponents[AluComponent(swizzle3, 3)]) << ";\n";
+                    std::string constant = "c[" + std::to_string(reg3) + "]";
+                    if (a0Relative && Bits(w1, 30, 1)) // src3 es la primera constante solo si src1 y src2 son temporales
+                    {
+                        constant = "c[clamp(" + std::to_string(reg3) + " + a0, 0, 255)]";
+                        for (uint32_t i = 0; i < 256; i++)
+                            constants.insert(i);
+                    }
+                    else
+                        constants.insert(reg3);
+                    Line() << "float sc = " << modifiers(constant + "." + kComponents[AluComponent(swizzle3, 3)]) << ";\n";
                     const char* op = scalarOp <= 43 ? " * " : (scalarOp <= 45 ? " + " : " - ");
                     s = std::string("sc") + op + other;
                     break;
@@ -422,14 +476,22 @@ inline bool bool_constant(constant DrawState& st, uint index) { return (st.bools
                     if (stride == 0)
                         stride = lastStride; // "mini fetch": mismo vértice que la lectura anterior
                     lastStride = stride;
-                    const uint32_t offset = Bits(w2, 8, 22) * 4;
+                    const int32_t offset = (int32_t(Bits(w2, 8, 23) << 9) >> 9) * 4; // en palabras, con signo
+                    const int32_t expAdjust = int32_t(Bits(w1, 24, 6) << 26) >> 26;  // el resultado se multiplica por 2^exp_adjust
                     Line() << "{\n";
                     indent++;
                     Line() << "uint index = uint(int(round(r[" << source << "]." << component << ")));\n";
                     Line() << "uint2 vf = uint2(fc[" << constant * 2 << "], fc[" << constant * 2 + 1 << "]);\n";
-                    Line() << "float4 f = fetch_vertex(mem, (vf.x & 0x1FFFFFFCu) + index * " << stride << "u + " << offset
-                           << "u, vf.y & 3u, " << Bits(w1, 16, 6) << "u, " << (Bits(w1, 14, 1) ? "true" : "false") << ", "
+                    // Bit 12: con signo (format_comp_all); bit 13: entero, sin normalizar (num_format_all).
+                    Line() << "float4 f = fetch_vertex(mem, uint(int((vf.x & 0x1FFFFFFCu) + index * " << stride << "u) + (" << offset
+                           << ")), vf.y & 3u, " << Bits(w1, 16, 6) << "u, " << (Bits(w1, 12, 1) ? "true" : "false") << ", "
                            << (Bits(w1, 13, 1) ? "true" : "false") << ");\n";
+                    if (expAdjust)
+                    {
+                        char scale[32];
+                        std::snprintf(scale, sizeof(scale), "%.9g", std::ldexp(1.0, expAdjust));
+                        Line() << "f *= " << scale << "f;\n";
+                    }
                     WriteFetch(dest, Bits(w1, 0, 12));
                     indent--;
                     Line() << "}\n";
@@ -684,6 +746,7 @@ inline bool bool_constant(constant DrawState& st, uint index) { return (st.bools
     int a0 = 0;
 )MSL";
                     out << body.str();
+                    out << "    if (alpha_test_fails(st, oc[0].w)) discard_fragment();\n";
                     out << "    return oc[0];\n}\n";
                 }
                 return true;

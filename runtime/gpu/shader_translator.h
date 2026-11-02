@@ -44,5 +44,7 @@ namespace gpu
         float targetSize[2];    // tamaño del destino de dibujo, en píxeles
         float windowOffset[2];  // PA_SC_WINDOW_OFFSET si PA_SU_SC_MODE_CNTL lo activa
         uint32_t bools[8];      // constantes booleanas (256 bits)
+        uint32_t alphaTest;     // RB_COLORCONTROL: función 0-2, prueba activa 3, alpha-to-mask 4
+        float alphaRef;         // RB_ALPHA_REF
     };
 }
