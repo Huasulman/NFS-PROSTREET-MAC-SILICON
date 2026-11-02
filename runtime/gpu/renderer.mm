@@ -2,6 +2,7 @@
 
 #include "renderer.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cmath>
 #include <cstdlib>
@@ -54,7 +55,11 @@ namespace gpu
         constexpr uint32_t kRegFetchConstants = 0x4800;
         constexpr uint32_t kRegBoolConstants = 0x4900;
 
-        constexpr uint32_t kTargetWidth = 1280, kTargetHeight = 720;
+        // Como la EDRAM, cabe cualquier superficie del juego: la pantalla (1280x720) y el mapa de
+        // sombras (1600x1600, solo profundidad).
+        constexpr uint32_t kTargetWidth = 2048, kTargetHeight = 2048;
+        // Las ranuras de textura de un shader llevan este bit si las lee como mapa cúbico.
+        constexpr uint32_t kCubeSlot = 0x100;
 
         bool Trace() { return std::getenv("PROSTREET_TRACE") != nullptr; }
 
@@ -86,6 +91,15 @@ namespace gpu
             bool pending = false;
             uint64_t validEpoch = 0; // época en la que su memoria se comprobó (hash) por última vez
             uint32_t pendingLeft = 0, pendingTop = 0, pendingRight = 0, pendingBottom = 0;
+        };
+
+        // Profundidad que ha copiado un resolve (fuente 4). Solo está en la GPU (R32Float): el juego
+        // la lee como textura 24_8 en la misma dirección. Con predicated tiling, cada franja
+        // llega con su propia dirección dentro de la imagen.
+        struct DepthSurface
+        {
+            uint32_t base = 0, pitch = 0, height = 0;
+            id<MTLTexture> texture;
         };
 
         // Bytes de la memoria original de una imagen con mosaico (las filas van de 32 en 32).
@@ -138,6 +152,8 @@ namespace gpu
             std::unordered_map<uint64_t, id<MTLRenderPipelineState>> pipelines;
             std::unordered_map<uint64_t, Texture> textures;
             std::vector<ResolvedSurface> surfaces;
+            std::vector<DepthSurface> depthSurfaces;
+            id<MTLBuffer> depthStaging; // profundidad de camino a una DepthSurface
 
             // Por ranura de textura: la última constante de fetch vista, su textura, su sampler y en
             // qué época. Muchos dibujos seguidos usan las mismas texturas.
@@ -145,6 +161,7 @@ namespace gpu
             {
                 uint32_t fetch[6] = {};
                 uint64_t epoch = 0;
+                bool cube = false;
                 id<MTLTexture> texture;
                 id<MTLSamplerState> sampler;
             };
@@ -160,6 +177,9 @@ namespace gpu
             const bool immediateWriteback = std::getenv("PROSTREET_RESOLVE_WRITEBACK") != nullptr;
             std::unordered_map<uint32_t, id<MTLSamplerState>> samplers;
             id<MTLTexture> missingTexture;
+            id<MTLTexture> missingCube;    // lo mismo, para un shader que espera un mapa cúbico
+            id<MTLTexture> blackTexture;   // (0, 0, 0, 0): constante de fetch sin textura (formato 0)
+            id<MTLTexture> farDepthTexture; // profundidad 1 (lejos): 24_8 sin resolve que la haya escrito
 
             uint64_t draws = 0, skipped = 0, resolves = 0;
 
@@ -252,6 +272,18 @@ namespace gpu
                 missingTexture = [device newTextureWithDescriptor:small];
                 const uint32_t magenta = 0xFFFF00FF;
                 [missingTexture replaceRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:0 withBytes:&magenta bytesPerRow:4];
+                missingCube = [device newTextureWithDescriptor:[MTLTextureDescriptor textureCubeDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                    size:1 mipmapped:NO]];
+                for (NSUInteger face = 0; face < 6; face++)
+                    [missingCube replaceRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:0 slice:face withBytes:&magenta bytesPerRow:4 bytesPerImage:4];
+                blackTexture = [device newTextureWithDescriptor:small];
+                const uint32_t black = 0;
+                [blackTexture replaceRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:0 withBytes:&black bytesPerRow:4];
+                farDepthTexture = [device newTextureWithDescriptor:[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR32Float
+                    width:1 height:1 mipmapped:NO]];
+                const float far = 1.0f;
+                [farDepthTexture replaceRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:0 withBytes:&far bytesPerRow:4];
+                depthStaging = [device newBufferWithLength:size_t(kTargetWidth) * kTargetHeight * 4 options:MTLResourceStorageModePrivate];
                 constantRing = [device newBufferWithLength:kRingSize options:MTLResourceStorageModeShared];
                 std::fprintf(stderr, "[render] Metal: %s\n", device.name.UTF8String);
                 return memory != nil && target != nil;
@@ -281,11 +313,15 @@ namespace gpu
                 }
                 if (!translated.warnings.empty())
                     std::fprintf(stderr, "[render] %s: %s\n", translated.entry.c_str(), translated.warnings.c_str());
+                std::vector<uint32_t> shaderSlots = translated.textures;
+                for (uint32_t& slot : shaderSlots)
+                    if (std::find(translated.cubeTextures.begin(), translated.cubeTextures.end(), slot) != translated.cubeTextures.end())
+                        slot |= kCubeSlot;
                 functions[shader.hash] = function;
-                textureSlots[shader.hash] = translated.textures;
+                textureSlots[shader.hash] = shaderSlots;
                 constantRanges[shader.hash] = translated.constantRanges;
                 if (slots)
-                    *slots = translated.textures;
+                    *slots = shaderSlots;
                 return function;
             }
 
@@ -414,8 +450,9 @@ namespace gpu
                 return state;
             }
 
-            // Textura a partir de una constante de fetch (6 palabras).
-            id<MTLTexture> TextureFor(const uint32_t* fetch)
+            // Textura a partir de una constante de fetch (6 palabras). cube: el shader la lee como mapa
+            // cúbico (entonces hay que darle uno, aunque sea el de relleno).
+            id<MTLTexture> TextureFor(const uint32_t* fetch, bool cube)
             {
                 const bool tiled = fetch[0] >> 31;
                 const uint32_t pitch = ((fetch[0] >> 22) & 0x1FF) * 32;
@@ -426,6 +463,35 @@ namespace gpu
                 const uint32_t dimension = (fetch[5] >> 9) & 3;
                 const uint32_t width = dimension == 2 ? (fetch[2] & 0x7FF) + 1 : (fetch[2] & 0x1FFF) + 1;
                 const uint32_t height = dimension == 2 ? ((fetch[2] >> 11) & 0x7FF) + 1 : ((fetch[2] >> 13) & 0x1FFF) + 1;
+                if (cube && dimension != 3)
+                {
+                    static bool reported = false;
+                    if (!reported)
+                        std::fprintf(stderr, "[render] un shader lee como cubo una textura de dimensión %u (se ve magenta)\n", dimension);
+                    reported = true;
+                    return missingCube;
+                }
+                // Un mapa cúbico tiene sus 6 caras seguidas; leído como 2D se usa la primera.
+                const uint32_t faces = cube ? 6 : 1;
+
+                if (format == 22 || format == 23) // 24_8 y 24_8_FLOAT: profundidad
+                {
+                    if (cube)
+                        return missingCube;
+                    for (const DepthSurface& surface : depthSurfaces)
+                        if (surface.base == (base & 0x1FFFFFFF))
+                            return surface.texture;
+                    return farDepthTexture;
+                }
+                if (format == 0) // 1_REVERSE: en la práctica, una constante sin textura
+                {
+                    static bool reported = false;
+                    if (!reported)
+                        std::fprintf(stderr, "[render] textura de formato 0 (%08X %08X %08X %08X %08X %08X): se lee como (0, 0, 0, 0)\n",
+                            fetch[0], fetch[1], fetch[2], fetch[3], fetch[4], fetch[5]);
+                    reported = true;
+                    return cube ? missingCube : blackTexture;
+                }
 
                 MTLPixelFormat pixelFormat;
                 uint32_t blockSize = 1, bytesPerBlock;
@@ -443,11 +509,11 @@ namespace gpu
                     static std::unordered_map<uint32_t, int> reported;
                     if (!reported[format]++)
                         std::fprintf(stderr, "[render] formato de textura %u aún no soportado (se ve magenta)\n", format);
-                    return missingTexture;
+                    return cube ? missingCube : missingTexture;
                 }
                 }
-                if (base == 0 || width > 8192 || height > 8192)
-                    return missingTexture;
+                if (base == 0 || width > 8192 || height > 8192 || (cube && width != height))
+                    return cube ? missingCube : missingTexture;
 
                 const uint32_t blocksX = (width + blockSize - 1) / blockSize, blocksY = (height + blockSize - 1) / blockSize;
                 const uint32_t pitchBlocks = std::max(pitch / blockSize, blocksX);
@@ -457,11 +523,12 @@ namespace gpu
 
                 // ¿Ha cambiado? Se mira la memoria original (con mosaico, las filas van de 32 en 32).
                 const auto* source = static_cast<const uint8_t*>(memory::Translate(0xA0000000 | (base & 0x1FFFFFFF)));
-                const size_t rawSize = std::min<size_t>(tiled ? TiledSize(pitchBlocks, blocksY, bytesPerBlock) :
-                    size_t(pitchBlocks) * blocksY * bytesPerBlock, 0x20000000 - (base & 0x1FFFFFFF));
+                const size_t faceSize = tiled ? TiledSize(pitchBlocks, blocksY, bytesPerBlock) : size_t(pitchBlocks) * blocksY * bytesPerBlock;
+                const size_t faceStride = (faceSize + 4095) & ~size_t(4095); // las caras van alineadas a 4 KB
+                const size_t rawSize = std::min<size_t>(faceStride * (faces - 1) + faceSize, 0x20000000 - (base & 0x1FFFFFFF));
                 // ¿Es la imagen de un resolve? Entonces se usa su copia en la GPU, mientras la memoria no
                 // haya cambiado desde el resolve (se comprueba una vez por época).
-                if (format == 6 && tiled)
+                if (format == 6 && tiled && !cube)
                     for (ResolvedSurface& surface : surfaces)
                         if (surface.base == (base & 0x1FFFFFFF) && surface.pitch == pitchBlocks && surface.height == height &&
                             surface.endian == endian && width <= surface.pitch)
@@ -474,7 +541,7 @@ namespace gpu
                                 return surface.view;
                             }
                         }
-                const uint64_t key = (uint64_t(base) << 32) ^ (uint64_t(format) << 26) ^ (uint64_t(width) << 13) ^ height;
+                const uint64_t key = (uint64_t(base) << 32) ^ (uint64_t(format) << 26) ^ (uint64_t(width) << 13) ^ height ^ (uint64_t(cube) << 63);
                 Texture& cached = textures[key];
                 if (cached.texture && cached.epoch == epoch)
                     return cached.texture;
@@ -482,7 +549,7 @@ namespace gpu
                 // Si la textura cae sobre un resolve aún no escrito en memoria (y no ha podido usar su
                 // copia), se escribe ahora para leer lo que toca.
                 if (WritebackOverlapping(base & 0x1FFFFFFF, rawSize))
-                    return TextureFor(fetch);
+                    return TextureFor(fetch, cube);
                 if (cached.texture && cached.hash == hash)
                 {
                     cached.epoch = epoch;
@@ -490,13 +557,20 @@ namespace gpu
                 }
 
                 // Lectura (quitando el mosaico) e intercambio de bytes.
-                std::vector<uint8_t> data(size_t(blocksX) * blocksY * bytesPerBlock);
-                for (uint32_t by = 0; by < blocksY; by++)
+                const size_t imageBytes = size_t(blocksX) * blocksY * bytesPerBlock;
+                std::vector<uint8_t> data(imageBytes * faces);
+                for (uint32_t face = 0; face < faces; face++)
                 {
-                    for (uint32_t bx = 0; bx < blocksX; bx++)
+                    const uint8_t* faceSource = source + face * faceStride;
+                    if (face * faceStride + faceSize > rawSize)
+                        break; // se sale de la memoria
+                    for (uint32_t by = 0; by < blocksY; by++)
                     {
-                        const uint32_t offset = tiled ? TiledOffset(bx, by, pitchBlocks, log2Bytes) : (by * pitchBlocks + bx) * bytesPerBlock;
-                        std::memcpy(&data[(size_t(by) * blocksX + bx) * bytesPerBlock], source + offset, bytesPerBlock);
+                        for (uint32_t bx = 0; bx < blocksX; bx++)
+                        {
+                            const uint32_t offset = tiled ? TiledOffset(bx, by, pitchBlocks, log2Bytes) : (by * pitchBlocks + bx) * bytesPerBlock;
+                            std::memcpy(&data[face * imageBytes + (size_t(by) * blocksX + bx) * bytesPerBlock], faceSource + offset, bytesPerBlock);
+                        }
                     }
                 }
                 for (size_t i = 0; i + 3 < data.size(); i += 4)
@@ -514,15 +588,18 @@ namespace gpu
                 }
 
                 // Textura nueva (no se reescribe la anterior: puede usarla un dibujo aún sin enviar).
-                MTLTextureDescriptor* descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pixelFormat
-                    width:width height:height mipmapped:NO];
+                MTLTextureDescriptor* descriptor = cube ?
+                    [MTLTextureDescriptor textureCubeDescriptorWithPixelFormat:pixelFormat size:width mipmapped:NO] :
+                    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pixelFormat width:width height:height mipmapped:NO];
                 cached.texture = [device newTextureWithDescriptor:descriptor];
-                [cached.texture replaceRegion:MTLRegionMake2D(0, 0, width, height) mipmapLevel:0 withBytes:data.data()
-                    bytesPerRow:blocksX * bytesPerBlock];
+                for (uint32_t face = 0; face < faces; face++)
+                    [cached.texture replaceRegion:MTLRegionMake2D(0, 0, width, height) mipmapLevel:0 slice:face
+                        withBytes:data.data() + face * imageBytes bytesPerRow:blocksX * bytesPerBlock bytesPerImage:imageBytes];
                 cached.hash = hash;
                 cached.epoch = epoch;
                 if (Trace())
-                    std::fprintf(stderr, "[render] textura 0x%08X %ux%u formato %u%s\n", base, width, height, format, tiled ? " (mosaico)" : "");
+                    std::fprintf(stderr, "[render] textura 0x%08X %ux%u formato %u%s%s\n", base, width, height, format, tiled ? " (mosaico)" : "",
+                        cube ? " (cubo)" : "");
                 return cached.texture;
             }
 
@@ -648,16 +725,19 @@ namespace gpu
                 [encoder setFragmentBuffer:constantRing offset:constants.pixel atIndex:1];
                 [encoder setFragmentBuffer:constantRing offset:constants.fetch atIndex:2];
                 [encoder setFragmentBytes:&state length:sizeof(state) atIndex:3];
-                for (uint32_t slot : textureSlots)
+                for (uint32_t entry : textureSlots)
                 {
+                    const uint32_t slot = entry & 31;
+                    const bool cube = entry & kCubeSlot;
                     const uint32_t* fetch = &fetchConstants[slot * 6];
-                    SlotMemo& memo = slotMemos[slot & 31];
-                    if (memo.epoch != epoch || std::memcmp(memo.fetch, fetch, sizeof(memo.fetch)) != 0)
+                    SlotMemo& memo = slotMemos[slot];
+                    if (memo.epoch != epoch || memo.cube != cube || std::memcmp(memo.fetch, fetch, sizeof(memo.fetch)) != 0)
                     {
-                        memo.texture = TextureFor(fetch);
+                        memo.texture = TextureFor(fetch, cube);
                         memo.sampler = SamplerFor(fetch);
                         std::memcpy(memo.fetch, fetch, sizeof(memo.fetch));
                         memo.epoch = epoch;
+                        memo.cube = cube;
                     }
                     [encoder setFragmentTexture:memo.texture atIndex:slot];
                     [encoder setFragmentSamplerState:memo.sampler atIndex:slot];
@@ -849,6 +929,80 @@ namespace gpu
                 right = uint32_t(maxX); bottom = uint32_t(maxY);
             }
 
+            // Copia la profundidad (en la GPU) a la DepthSurface de su dirección. El rectángulo es el de
+            // los vértices recortado por PA_SC_WINDOW_SCISSOR, y con el desplazamiento de ventana pasa a
+            // la EDRAM y a la franja de destino (cuya base ya apunta a ella).
+            void ResolveDepth(const uint32_t* registers, uint32_t base, uint32_t pitch, uint32_t height)
+            {
+                const uint32_t vertices = 0xA0000000 | (registers[kRegFetchConstants] & 0x1FFFFFFC);
+                float minX = 1e9f, minY = 1e9f, maxX = -1e9f, maxY = -1e9f;
+                for (int i = 0; i < 3; i++)
+                {
+                    const float x = AsFloat(__builtin_bswap32(*static_cast<const uint32_t*>(memory::Translate(vertices + i * 8))));
+                    const float y = AsFloat(__builtin_bswap32(*static_cast<const uint32_t*>(memory::Translate(vertices + i * 8 + 4))));
+                    minX = std::min(minX, x); maxX = std::max(maxX, x);
+                    minY = std::min(minY, y); maxY = std::max(maxY, y);
+                }
+                const uint32_t scissorTL = registers[0x2081], scissorBR = registers[0x2082];
+                minX = std::max(minX, float(scissorTL & 0x7FFF)); minY = std::max(minY, float((scissorTL >> 16) & 0x7FFF));
+                maxX = std::min(maxX, float(scissorBR & 0x7FFF)); maxY = std::min(maxY, float((scissorBR >> 16) & 0x7FFF));
+                int32_t windowX, windowY;
+                WindowOffset(registers, windowX, windowY);
+                const int32_t left = std::max(int32_t(minX) + windowX, 0), top = std::max(int32_t(minY) + windowY, 0);
+                const int32_t right = std::min({ int32_t(maxX) + windowX, int32_t(pitch), int32_t(kTargetWidth) });
+                const int32_t bottom = std::min({ int32_t(maxY) + windowY, int32_t(height), int32_t(kTargetHeight) });
+                if (right <= left || bottom <= top || pitch == 0 || height == 0)
+                    return;
+
+                // ¿Una franja de una imagen ya conocida?
+                DepthSurface* surface = nullptr;
+                uint32_t offsetY = 0;
+                for (DepthSurface& candidate : depthSurfaces)
+                    if (candidate.pitch == pitch && base >= candidate.base && base < candidate.base + candidate.pitch * 4 * candidate.height &&
+                        (base - candidate.base) % (pitch * 4) == 0)
+                    {
+                        surface = &candidate;
+                        offsetY = (base - candidate.base) / (pitch * 4);
+                        break;
+                    }
+                if (!surface || offsetY + bottom > surface->height)
+                {
+                    if (surface)
+                        depthSurfaces.erase(depthSurfaces.begin() + (surface - depthSurfaces.data()));
+                    if (depthSurfaces.size() >= 8)
+                        depthSurfaces.erase(depthSurfaces.begin());
+                    DepthSurface created;
+                    created.base = base;
+                    created.pitch = pitch;
+                    created.height = height;
+                    MTLTextureDescriptor* descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR32Float
+                        width:std::min(pitch, kTargetWidth) height:std::min(height, kTargetHeight) mipmapped:NO];
+                    descriptor.usage = MTLTextureUsageShaderRead;
+                    descriptor.storageMode = MTLStorageModePrivate;
+                    created.texture = [device newTextureWithDescriptor:descriptor];
+                    depthSurfaces.push_back(created);
+                    surface = &depthSurfaces.back();
+                    offsetY = 0;
+                }
+                if (offsetY + bottom > surface->texture.height)
+                    return;
+
+                EndPass(false);
+                const uint32_t width = right - left, rows = bottom - top;
+                id<MTLCommandBuffer> copy = [queue commandBuffer];
+                id<MTLBlitCommandEncoder> blit = [copy blitCommandEncoder];
+                [blit copyFromTexture:depth sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(left, top, 0)
+                    sourceSize:MTLSizeMake(width, rows, 1) toBuffer:depthStaging destinationOffset:0
+                    destinationBytesPerRow:width * 4 destinationBytesPerImage:size_t(width) * rows * 4
+                    options:MTLBlitOptionDepthFromDepthStencil];
+                [blit copyFromBuffer:depthStaging sourceOffset:0 sourceBytesPerRow:width * 4 sourceBytesPerImage:size_t(width) * rows * 4
+                    sourceSize:MTLSizeMake(width, rows, 1) toTexture:surface->texture destinationSlice:0 destinationLevel:0
+                    destinationOrigin:MTLOriginMake(left, offsetY + top, 0)];
+                [blit endEncoding];
+                [copy commit];
+                lastCommit = copy;
+            }
+
             void Resolve(const uint32_t* registers)
             {
                 resolves++;
@@ -884,7 +1038,9 @@ namespace gpu
                 bottom = std::min({bottom, destHeight, kTargetHeight});
                 if (immediateWriteback)
                     epoch++; // la memoria cambia en el acto
-                if (source < 4 && destFormat == 6 && destBase && right > left && bottom > top && !immediateWriteback)
+                if (source == 4 && destBase)
+                    ResolveDepth(registers, destBase & 0x1FFFFFFF, destPitch, destHeight);
+                else if (source < 4 && destFormat == 6 && destBase && right > left && bottom > top && !immediateWriteback)
                 {
                     // Solo en la GPU: la memoria se escribe cuando alguien la necesita (WritebackSurface).
                     EndPass(false);

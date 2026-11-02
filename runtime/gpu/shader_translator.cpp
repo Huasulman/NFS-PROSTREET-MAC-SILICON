@@ -114,6 +114,32 @@ float4 fetch_swizzle(float4 v, uint swizzle)
     return r;
 }
 
+// Dirección de un mapa cúbico a partir de lo que deja CUBEv (y el shader): SC y TC en 1...2 y la
+// cara en z (como Xenia, al revés que la instrucción de la ALU).
+float3 cube_direction(float3 coordinates)
+{
+    float s = coordinates.x * 2.0f - 3.0f, t = coordinates.y * 2.0f - 3.0f;
+    uint face = uint(clamp(floor(coordinates.z), 0.0f, 5.0f));
+    bool negative = face & 1;
+    switch (face >> 1)
+    {
+    case 0: return float3(negative ? -1.0f : 1.0f, -t, negative ? s : -s);
+    case 1: return float3(s, negative ? -1.0f : 1.0f, negative ? -t : t);
+    default: return float3(negative ? -s : s, -t, negative ? -1.0f : 1.0f);
+    }
+}
+
+// CUBEv: con src1 = dirección.z_xy da (TC, SC, 2 * eje mayor, cara).
+float4 cube_vector(float4 s1)
+{
+    float x = s1.z, y = s1.w, z = s1.x;
+    if (abs(z) >= abs(x) && abs(z) >= abs(y))
+        return float4(-y, z < 0.0f ? -x : x, 2.0f * z, z < 0.0f ? 5.0f : 4.0f);
+    if (abs(y) >= abs(x))
+        return float4(y < 0.0f ? -z : z, x, 2.0f * y, y < 0.0f ? 3.0f : 2.0f);
+    return float4(-y, x < 0.0f ? z : -z, 2.0f * x, x < 0.0f ? 1.0f : 0.0f);
+}
+
 inline bool bool_constant(constant DrawState& st, uint index) { return (st.bools[index >> 5] >> (index & 31)) & 1; }
 )MSL";
 
@@ -142,6 +168,7 @@ inline bool bool_constant(constant DrawState& st, uint index) { return (st.bools
             std::ostringstream out;
             std::ostringstream warnings;
             std::set<uint32_t> textures;
+            std::set<uint32_t> cubeTextures; // de las anteriores, las que se leen como mapa cúbico
             std::set<uint32_t> constants;
             uint32_t lastStride = 0;
             int indent = 1;
@@ -244,6 +271,7 @@ inline bool bool_constant(constant DrawState& st, uint index) { return (st.bools
                 case 15: v = "float4(dot(s1, s2))"; break;
                 case 16: v = "float4(dot(s1.xyz, s2.xyz))"; break;
                 case 17: v = "float4(s1.x * s2.x + s1.y * s2.y + s3.x)"; break;
+                case 18: v = "cube_vector(s1)"; break;
                 case 19: v = "float4(max(max(s1.x, s1.y), max(s1.z, s1.w)))"; break;
                 case 28: v = "float4(1.0f, s1.y * s2.y, s1.z, s2.w)"; break;
                 case 29: // maxa: además fija el registro de direcciones
@@ -373,6 +401,9 @@ inline bool bool_constant(constant DrawState& st, uint index) { return (st.bools
                 const uint32_t w0 = w[0], w1 = w[1], w2 = w[2];
                 const uint32_t opcode = Bits(w0, 0, 5);
                 const uint32_t source = Bits(w0, 5, 6), dest = Bits(w0, 12, 6);
+                // Predicación (pred_select en la palabra 1, pred_condition en la 2), igual en todos los fetch.
+                if (Bits(w1, 31, 1))
+                    Line() << "if (p == " << (Bits(w2, 31, 1) ? "true" : "false") << ")\n";
                 if (opcode == 0) // vfetch
                 {
                     const uint32_t constant = Bits(w0, 20, 5) * 3 + Bits(w0, 25, 2);
@@ -394,17 +425,25 @@ inline bool bool_constant(constant DrawState& st, uint index) { return (st.bools
                     Line() << "}\n";
                     return;
                 }
+                const std::string sourceRegister = "r[" + std::to_string(source) + "].";
                 if (opcode == 1) // tfetch
                 {
                     const uint32_t constant = Bits(w0, 20, 5);
                     if (!pixel)
                     {
                         warnings << "lectura de textura en un shader de vértices; ";
+                        Line() << "{}\n";
                         return;
                     }
                     textures.insert(constant);
-                    std::string coordinates = "float2(r[" + std::to_string(source) + "]." + kComponents[Bits(w0, 26, 2)] + ", r[" +
-                                              std::to_string(source) + "]." + kComponents[Bits(w0, 28, 2)] + ")";
+                    std::string coordinates = "float2(" + sourceRegister + kComponents[Bits(w0, 26, 2)] + ", " + sourceRegister +
+                                              kComponents[Bits(w0, 28, 2)] + ")";
+                    if (Bits(w2, 14, 2) == 3) // cubo: SC, TC y cara
+                    {
+                        cubeTextures.insert(constant);
+                        coordinates = "cube_direction(float3(" + sourceRegister + kComponents[Bits(w0, 26, 2)] + ", " +
+                                      sourceRegister + kComponents[Bits(w0, 28, 2)] + ", " + sourceRegister + kComponents[Bits(w0, 30, 2)] + "))";
+                    }
                     Line() << "{\n";
                     indent++;
                     Line() << "float4 f = fetch_swizzle(t" << constant << ".sample(s" << constant << ", " << coordinates
@@ -414,7 +453,26 @@ inline bool bool_constant(constant DrawState& st, uint index) { return (st.bools
                     Line() << "}\n";
                     return;
                 }
+                if (opcode == 18) // getGradients: (ddx(x), ddy(x), ddx(y), ddy(y)) de las coordenadas
+                {
+                    const std::string x = sourceRegister + kComponents[Bits(w0, 26, 2)], y = sourceRegister + kComponents[Bits(w0, 28, 2)];
+                    Line() << "{\n";
+                    indent++;
+                    Line() << "float4 f = float4(dfdx(" << x << "), dfdy(" << x << "), dfdx(" << y << "), dfdy(" << y << "));\n";
+                    WriteFetch(dest, Bits(w1, 0, 12));
+                    indent--;
+                    Line() << "}\n";
+                    return;
+                }
+                // setTextureLod y setTextureGradientsHorz/Vert: las texturas aún no tienen mipmaps, así que
+                // el nivel que fijan no cambia nada.
+                if (opcode == 24 || opcode == 25 || opcode == 26)
+                {
+                    Line() << "{}\n";
+                    return;
+                }
                 warnings << "fetch " << opcode << " no soportado; ";
+                Line() << "{}\n";
             }
 
             bool Translate(uint64_t hash, std::string& entry)
@@ -587,7 +645,7 @@ inline bool bool_constant(constant DrawState& st, uint index) { return (st.bools
                     out << "fragment float4 " << entry << "(VSOut in [[stage_in]], device const uint* mem [[buffer(0)]],\n"
                         << "    constant float4* c [[buffer(1)]], constant uint* fc [[buffer(2)]], constant DrawState& st [[buffer(3)]]";
                     for (uint32_t t : textures)
-                        out << ",\n    texture2d<float> t" << t << " [[texture(" << t << ")]], sampler s" << t << " [[sampler(" << t << ")]]";
+                        out << ",\n    " << (cubeTextures.count(t) ? "texturecube" : "texture2d") << "<float> t" << t << " [[texture(" << t << ")]], sampler s" << t << " [[sampler(" << t << ")]]";
                     out << ")\n{\n";
                     out << R"MSL(    float4 r[64];
     for (int i = 0; i < 64; i++) r[i] = float4(0);
@@ -618,6 +676,7 @@ inline bool bool_constant(constant DrawState& st, uint index) { return (st.bools
         result.source = std::string(kPrelude) + "\n" + translator.out.str();
         result.warnings = translator.warnings.str();
         result.textures.assign(translator.textures.begin(), translator.textures.end());
+        result.cubeTextures.assign(translator.cubeTextures.begin(), translator.cubeTextures.end());
         for (uint32_t reg : translator.constants)
         {
             auto& ranges = result.constantRanges;

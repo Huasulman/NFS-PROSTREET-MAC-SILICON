@@ -22,6 +22,7 @@ namespace gpu
         std::string entry;            // nombre de la función
         std::string warnings;         // instrucciones no soportadas, etc.
         std::vector<uint32_t> textures; // constantes de fetch de textura que usa
+        std::vector<uint32_t> cubeTextures; // de ellas, las que lee como mapa cúbico (texturecube)
         // Constantes ALU que usa, como rangos (primera, cuántas) en orden; los huecos pequeños se
         // incluyen para que haya pocos rangos.
         std::vector<std::pair<uint32_t, uint32_t>> constantRanges;
