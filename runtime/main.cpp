@@ -15,6 +15,7 @@
 #include <cstring>
 #include <fstream>
 #include <pthread.h>
+#include <string>
 #include <thread>
 #include <unistd.h>
 #include <vector>
@@ -220,7 +221,32 @@ int main(int argc, char** argv)
     // queda para la ventana (macOS exige que la interfaz vaya en él); al cerrarla, termina todo.
     // Con PROSTREET_NO_WINDOW=1 no hay ventana y el programa espera al hilo del juego.
     std::printf("Arrancando: punto de entrada 0x%08X\n\n", kEntryPoint);
+    XmaInitialize();
     auto mainThread = kernel::CreateThread(kEntryPoint, 0, 0, kMainStackSize, false);
+
+    // PROSTREET_XMA_WATCH: anota las escrituras del juego en los registros del decodificador XMA.
+    if (std::getenv("PROSTREET_XMA_WATCH"))
+    {
+        std::thread([] {
+            constexpr uint32_t kStart = 0x7FEA1800, kWords = 0x100;
+            uint32_t previous[kWords] = {};
+            int reported = 0;
+            while (reported < 400)
+            {
+                for (uint32_t i = 0; i < kWords; i++)
+                {
+                    const uint32_t value = memory::Read32(kStart + i * 4);
+                    if (value != previous[i])
+                    {
+                        std::fprintf(stderr, "[xma-mmio] 0x%08X = 0x%08X (antes 0x%08X)\n", kStart + i * 4, value, previous[i]);
+                        previous[i] = value;
+                        reported++;
+                    }
+                }
+                std::this_thread::sleep_for(std::chrono::microseconds(200));
+            }
+        }).detach();
+    }
 
     // PROSTREET_THREADS=N: cada N segundos, la última llamada (lr) de cada hilo del juego, para
     // ver dónde se queda atascado.
@@ -236,7 +262,8 @@ int main(int argc, char** argv)
                     if (auto thread = kernel::FindThreadById(id); thread && thread->ctx && !thread->exited)
                     {
                         std::fprintf(stderr, " %u:%08X", id, uint32_t(thread->ctx->lr));
-                        if (id == 1)
+                        static const char* stackOf = std::getenv("PROSTREET_THREADS_STACK");
+                        if (id == 1 || (stackOf && std::strstr(stackOf, (std::string(",") + std::to_string(id) + ",").c_str())))
                         {
                             // Pila del invitado: r1 apunta a la cadena de marcos; el lr guardado
                             // de cada llamante está en (marco anterior - 8).

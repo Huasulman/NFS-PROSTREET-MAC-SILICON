@@ -185,6 +185,8 @@ PPC_FUNC(__imp__XamUserReadProfileSettings)
     {
         const uint32_t id = memory::Read32(settingIds + i * 4);
         found[i] = LoadSetting(id, values[i]);
+        if (std::getenv("PROSTREET_TRACE"))
+            std::fprintf(stderr, "[xam] ajuste de perfil 0x%08X: %s\n", id, found[i] ? "guardado" : "no existe");
         if (found[i] && (SettingType(id) == kTypeBinary || SettingType(id) == kTypeUnicode))
             required += (uint32_t(values[i].size()) + 3) & ~3u;
     }

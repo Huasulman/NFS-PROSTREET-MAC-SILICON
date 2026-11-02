@@ -43,3 +43,25 @@ PPC_FUNC(sub_824C8138)
     }
     __imp__sub_824C8138(ctx, base);
 }
+
+// PROSTREET_XMA_TRACE: llamadas a las funciones del decodificador XMA del motor de audio de EA.
+extern "C" PPC_FUNC(__imp__sub_8280EE68);
+extern "C" PPC_FUNC(__imp__sub_8280F0F0);
+extern "C" PPC_FUNC(__imp__sub_828103C8);
+
+namespace
+{
+    const bool gXmaTrace = std::getenv("PROSTREET_XMA_TRACE") != nullptr;
+
+    void XmaTrace(const char* name, const PPCContext& ctx)
+    {
+        static std::atomic<int> count{0};
+        if (gXmaTrace && count++ < 50)
+            std::fprintf(stderr, "[rwac] %s(r3=0x%08X r4=0x%08X r5=0x%08X) lr 0x%08X\n", name, ctx.r3.u32, ctx.r4.u32,
+                ctx.r5.u32, uint32_t(ctx.lr));
+    }
+}
+
+PPC_FUNC(sub_8280EE68) { XmaTrace("inicia_contexto", ctx); __imp__sub_8280EE68(ctx, base); }
+PPC_FUNC(sub_8280F0F0) { XmaTrace("sub_8280F0F0", ctx); __imp__sub_8280F0F0(ctx, base); }
+PPC_FUNC(sub_828103C8) { XmaTrace("sub_828103C8", ctx); __imp__sub_828103C8(ctx, base); }

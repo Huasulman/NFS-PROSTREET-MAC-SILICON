@@ -204,6 +204,22 @@ namespace kernel
             *static_cast<uint8_t*>(memory::Translate(thread.pcr + kPcrCurrentCpu)) = uint8_t(__builtin_ctz(affinity & 0x3F));
     }
 
+    void PrintGuestStack(const PPCContext& ctx, const char* label)
+    {
+        const Thread* thread = CurrentThread();
+        std::fprintf(stderr, "[pila] %s (hilo %u): lr 0x%08X", label, thread ? thread->id : 0, uint32_t(ctx.lr));
+        uint32_t frame = ctx.r1.u32;
+        for (int depth = 0; thread && depth < 16 && frame > thread->stackEnd && frame < thread->stackBase; depth++)
+        {
+            const uint32_t previous = memory::Read32(frame);
+            if (previous <= frame || previous >= thread->stackBase)
+                break;
+            std::fprintf(stderr, " %08X", memory::Read32(previous - 8));
+            frame = previous;
+        }
+        std::fprintf(stderr, "\n");
+    }
+
     std::shared_ptr<Thread> CreateHostThread(std::function<void(PPCContext&, uint8_t*)> body)
     {
         // Se crea suspendido para fijar el cuerpo antes de que arranque.

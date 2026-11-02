@@ -1,5 +1,6 @@
 // Funciones de xam.xex implementadas por el runtime. Convención: argumentos en r3..r10, resultado en r3.
 
+#include <atomic>
 #include <cstdio>
 #include <chrono>
 #include <cstdlib>
@@ -13,6 +14,7 @@
 #include "objects.h"
 #include "threads.h"
 #include "../memory.h"
+#include "../platform/audio.h"
 
 using namespace kernel;
 
@@ -127,7 +129,8 @@ PPC_FUNC(__imp__XGetLanguage)
 // El cliente es una función del juego (callback[0]) con su contexto (callback[1]) que el sistema
 // de audio llama cada vez que necesita más muestras: cada 256 muestras a 48 kHz (5,33 ms). El
 // motor de audio del juego (y lo que se sincroniza con él, como los vídeos) avanza con esas
-// llamadas. Todavía no hay salida de sonido: lo que entrega XAudioSubmitRenderDriverFrame se descarta.
+// llamadas. Con salida de sonido, el ritmo lo marca ella (se llama cuando cabe otro bloque);
+// sin ella, un temporizador.
 PPC_FUNC(__imp__XAudioRegisterRenderDriverClient)
 {
     (void)base;
@@ -143,10 +146,14 @@ PPC_FUNC(__imp__XAudioRegisterRenderDriverClient)
         *static_cast<uint8_t*>(memory::Translate(thread.r13.u32 + 0x10C)) = cpu;
         using Clock = std::chrono::steady_clock;
         constexpr auto kPeriod = std::chrono::microseconds(5333); // 256 muestras a 48 kHz
+        const bool audio = platform::StartAudio();
         auto next = Clock::now() + kPeriod;
         while (true)
         {
-            std::this_thread::sleep_until(next);
+            if (audio)
+                platform::WaitForAudioSpace();
+            else
+                std::this_thread::sleep_until(next);
             thread.r3.u64 = context;
             CallGuest(*CurrentThread(), callback);
             next += kPeriod;
@@ -159,11 +166,29 @@ PPC_FUNC(__imp__XAudioRegisterRenderDriverClient)
     ctx.r3.u64 = 0;
 }
 
-// uint32_t XAudioGetVoiceCategoryVolumeChangeMask(driver, uint32_t* mask): sin cambios.
+// NTSTATUS XAudioSubmitRenderDriverFrame(driver, float* samples): un bloque mezclado por el
+// juego, 6 canales x 256 muestras en coma flotante big-endian (un canal detrás de otro).
+PPC_FUNC(__imp__XAudioSubmitRenderDriverFrame)
+{
+    (void)base;
+    float samples[platform::kAudioFrameSamples * platform::kAudioChannels];
+    for (uint32_t i = 0; i < platform::kAudioFrameSamples * platform::kAudioChannels; i++)
+    {
+        const uint32_t bits = memory::Read32(ctx.r4.u32 + i * 4);
+        std::memcpy(&samples[i], &bits, 4);
+    }
+    platform::SubmitAudioFrame(samples);
+    ctx.r3.u64 = 0;
+}
+
+// uint32_t XAudioGetVoiceCategoryVolumeChangeMask(driver, uint32_t* mask): qué categorías de
+// voces (efectos, música, voz...) han cambiado de volumen. La primera vez, todas: así XAudio lee
+// su volumen (máximo) en vez de quedarse con el inicial.
 PPC_FUNC(__imp__XAudioGetVoiceCategoryVolumeChangeMask)
 {
     (void)base;
-    memory::Write32(ctx.r4.u32, 0);
+    static std::atomic<bool> first{true};
+    memory::Write32(ctx.r4.u32, first.exchange(false) ? 0xFFFFFFFFu : 0);
     ctx.r3.u64 = 0;
 }
 
@@ -171,6 +196,8 @@ PPC_FUNC(__imp__XAudioGetVoiceCategoryVolumeChangeMask)
 PPC_FUNC(__imp__XAudioGetVoiceCategoryVolume)
 {
     (void)base;
+    if (std::getenv("PROSTREET_TRACE"))
+        std::fprintf(stderr, "[xam] XAudioGetVoiceCategoryVolume(categoría %u)\n", ctx.r3.u32);
     const float volume = 1.0f;
     uint32_t bits;
     std::memcpy(&bits, &volume, 4);
@@ -287,4 +314,71 @@ PPC_FUNC(__imp__NetDll_XNetGetEthernetLinkStatus)
 {
     (void)base;
     ctx.r3.u64 = 0;
+}
+
+// --- Mensajes a aplicaciones del sistema (XMsg) -------------------------------------------------
+// La única que usa el juego es el reproductor de música de la consola (XMP, aplicación 0xFA), para
+// saber si la música la pone el juego o el usuario (su propia música): si cree que es el usuario,
+// apaga la banda sonora.
+
+namespace
+{
+    constexpr uint32_t kAppXmp = 0xFA;
+    constexpr uint32_t kXmpGetPlaybackController = 0x0007001B;
+    // El juego (sub_82A41010) entiende "la música es mía" solo si controlador == 0 y no está
+    // bloqueado; con otro valor cree que suena la del usuario y apaga la banda sonora.
+    constexpr uint32_t kXmpControllerTitle = 0;
+
+    uint32_t DispatchMessage(uint32_t app, uint32_t message, uint32_t buffer)
+    {
+        if (app == kAppXmp && message == kXmpGetPlaybackController && buffer)
+        {
+            // {cliente, uint32_t* controlador, uint32_t* bloqueado}
+            if (const uint32_t controller = memory::Read32(buffer + 4))
+                memory::Write32(controller, kXmpControllerTitle);
+            if (const uint32_t locked = memory::Read32(buffer + 8))
+                memory::Write32(locked, 0);
+        }
+        else if (std::getenv("PROSTREET_TRACE"))
+        {
+            std::fprintf(stderr, "[xam] mensaje 0x%08X a la aplicación 0x%X: se acepta sin más\n", message, app);
+        }
+        return 0;
+    }
+}
+
+// uint32_t XMsgInProcessCall(uint32_t app, uint32_t message, void* buffer, uint32_t length)
+PPC_FUNC(__imp__XMsgInProcessCall)
+{
+    (void)base;
+    ctx.r3.u64 = DispatchMessage(ctx.r3.u32, ctx.r4.u32, ctx.r5.u32);
+}
+
+// uint32_t XMsgStartIORequestEx(uint32_t app, uint32_t message, XOVERLAPPED* overlapped,
+//     void* buffer, uint32_t length, ...)
+PPC_FUNC(__imp__XMsgStartIORequestEx)
+{
+    (void)base;
+    const uint32_t result = DispatchMessage(ctx.r3.u32, ctx.r4.u32, ctx.r6.u32);
+    if (const uint32_t overlapped = ctx.r5.u32)
+    {
+        CompleteOverlapped(overlapped, result);
+        ctx.r3.u64 = 0x3E5; // ERROR_IO_PENDING
+        return;
+    }
+    ctx.r3.u64 = result;
+}
+
+// uint32_t XMsgStartIORequest(uint32_t app, uint32_t message, XOVERLAPPED* overlapped, void* buffer, uint32_t length)
+PPC_FUNC(__imp__XMsgStartIORequest)
+{
+    (void)base;
+    const uint32_t result = DispatchMessage(ctx.r3.u32, ctx.r4.u32, ctx.r6.u32);
+    if (const uint32_t overlapped = ctx.r5.u32)
+    {
+        CompleteOverlapped(overlapped, result);
+        ctx.r3.u64 = 0x3E5;
+        return;
+    }
+    ctx.r3.u64 = result;
 }

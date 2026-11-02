@@ -8,6 +8,8 @@
 #import <QuartzCore/CAMetalLayer.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
+#include <cstdio>
+#include <cstdlib>
 #include <string>
 
 #include "input.h"
@@ -146,6 +148,15 @@ namespace gpu
 - (void)windowDidResignKey:(NSNotification*)notification
 {
     platform::ReleaseAllKeys();
+}
+
+// Al salir, los hilos del juego siguen vivos: si exit() destruyera los objetos globales del
+// runtime (mutex del audio, de la imagen...), alguno podría usarlos ya destruidos. Se sale sin más.
+- (void)applicationWillTerminate:(NSNotification*)notification
+{
+    std::fflush(stdout);
+    std::fflush(stderr);
+    std::_Exit(0);
 }
 
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication*)sender
