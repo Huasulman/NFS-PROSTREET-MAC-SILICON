@@ -1,5 +1,6 @@
 #include "command_processor.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -182,6 +183,23 @@ namespace gpu
             case 3: return 0x4908; // bucles
             default: return 0x2000; // registros de estado
             }
+        }
+
+        // PROSTREET_SKIP_PS=<hash>,<hash>...: no dibujar con esos shaders de píxeles (para ver qué pinta cada uno).
+        bool SkippedPixelShader(uint64_t hash)
+        {
+            static const std::vector<uint64_t> skipped = [] {
+                std::vector<uint64_t> list;
+                if (const char* text = std::getenv("PROSTREET_SKIP_PS"))
+                    for (const char* p = text; *p;)
+                    {
+                        char* end;
+                        list.push_back(std::strtoull(p, &end, 16));
+                        p = *end ? end + 1 : end;
+                    }
+                return list;
+            }();
+            return !skipped.empty() && std::find(skipped.begin(), skipped.end(), hash) != skipped.end();
         }
 
         void LoadShader(uint32_t type, std::vector<uint32_t> code)
@@ -428,11 +446,14 @@ namespace gpu
                         draw.indexBase = data(2);
                         draw.indexEndian = data(3) >> 30;
                     }
-                    if (source != 1) // índices inmediatos: aún no
+                    if (source != 1 && !SkippedPixelShader(gState.pixelShader.hash)) // índices inmediatos: aún no
                         RendererDraw(draw);
                 }
+                // PROSTREET_GPU_DRAWS: todos los dibujos; PROSTREET_GPU_DRAWS_FRAME=N: solo los del fotograma N.
                 static const bool kTraceDraws = std::getenv("PROSTREET_GPU_DRAWS") != nullptr;
-                if (kTraceDraws || kTracePackets)
+                static const uint64_t kTraceDrawsFrame = std::getenv("PROSTREET_GPU_DRAWS_FRAME") ?
+                    std::strtoull(std::getenv("PROSTREET_GPU_DRAWS_FRAME"), nullptr, 10) : ~0ull;
+                if (kTraceDraws || kTracePackets || gState.frames == kTraceDrawsFrame)
                 {
                     const auto& r = gState.registers;
                     const uint32_t initiator = opcode == 0x22 ? data(1) : data(0);

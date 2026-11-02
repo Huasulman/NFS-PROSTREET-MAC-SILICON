@@ -182,8 +182,9 @@ inline bool bool_constant(constant DrawState& st, uint index) { return (st.bools
                 return out;
             }
 
-            // Operando de la ALU: registro temporal (con valor absoluto opcional) o constante.
-            std::string Source(uint32_t reg, bool temporary, uint32_t swizzle, bool negate)
+            // Operando de la ALU: registro temporal (con valor absoluto opcional, bit 7 del registro) o
+            // constante (con valor absoluto si la instrucción lleva abs_constants).
+            std::string Source(uint32_t reg, bool temporary, uint32_t swizzle, bool negate, bool absConstants)
             {
                 std::string name;
                 if (temporary)
@@ -196,6 +197,8 @@ inline bool bool_constant(constant DrawState& st, uint index) { return (st.bools
                 {
                     name = "c[" + std::to_string(reg) + "]";
                     constants.insert(reg);
+                    if (absConstants)
+                        name = "fabs(" + name + ")";
                 }
                 return (negate ? "(-" : "(") + name + AluSwizzle(swizzle) + ")";
             }
@@ -237,6 +240,7 @@ inline bool bool_constant(constant DrawState& st, uint index) { return (st.bools
                 const bool vectorClamp = Bits(w0, 24, 1), scalarClamp = Bits(w0, 25, 1);
                 const uint32_t reg3 = Bits(w2, 0, 8), swizzle3 = Bits(w1, 0, 8);
                 const bool temporary3 = Bits(w2, 29, 1), negate3 = Bits(w1, 24, 1);
+                const bool absConstants = Bits(w0, 7, 1);
 
                 const bool predicated = Bits(w1, 28, 1);
                 if (predicated)
@@ -245,9 +249,9 @@ inline bool bool_constant(constant DrawState& st, uint index) { return (st.bools
                 }
                 Line() << "{\n";
                 indent++;
-                Line() << "float4 s1 = " << Source(Bits(w2, 16, 8), Bits(w2, 31, 1), Bits(w1, 16, 8), Bits(w1, 26, 1)) << ";\n";
-                Line() << "float4 s2 = " << Source(Bits(w2, 8, 8), Bits(w2, 30, 1), Bits(w1, 8, 8), Bits(w1, 25, 1)) << ";\n";
-                Line() << "float4 s3 = " << Source(reg3, temporary3, swizzle3, negate3) << ";\n";
+                Line() << "float4 s1 = " << Source(Bits(w2, 16, 8), Bits(w2, 31, 1), Bits(w1, 16, 8), Bits(w1, 26, 1), absConstants) << ";\n";
+                Line() << "float4 s2 = " << Source(Bits(w2, 8, 8), Bits(w2, 30, 1), Bits(w1, 8, 8), Bits(w1, 25, 1), absConstants) << ";\n";
+                Line() << "float4 s3 = " << Source(reg3, temporary3, swizzle3, negate3, absConstants) << ";\n";
 
                 // Parte vectorial.
                 std::string v;
@@ -300,9 +304,9 @@ inline bool bool_constant(constant DrawState& st, uint index) { return (st.bools
                 }
                 Line() << "float4 vr = " << v << ";\n";
 
-                // Parte escalar: operandos a = src3.(componente 0), b = src3.(componente 1).
-                const std::string a = "s3." + std::string(1, kComponents[0]);
-                const std::string b = "s3." + std::string(1, kComponents[1]);
+                // Parte escalar: operandos a = src3.w y b = src3.x, tras el swizzle (como Xenia).
+                const std::string a = "s3.w";
+                const std::string b = "s3.x";
                 std::string s;
                 switch (scalarOp)
                 {
@@ -356,9 +360,15 @@ inline bool bool_constant(constant DrawState& st, uint index) { return (st.bools
                     // número del temporal sale del código de operación, del bit de selección y de los
                     // bits 2-5 del swizzle (según Xenia). Quedan los bits 0-1 del swizzle para el
                     // componente del temporal y los bits 6-7 para el de la constante.
+                    // La negación de src3 y abs_constants valen para los dos operandos.
                     const uint32_t temp = (scalarOp & 1) | (uint32_t(temporary3) << 1) | (swizzle3 & 0x3C);
-                    const std::string other = "r[" + std::to_string(temp) + "]." + std::string(1, kComponents[AluComponent(swizzle3, 0)]);
-                    Line() << "float sc = c[" << reg3 << "]." << kComponents[AluComponent(swizzle3, 3)] << ";\n";
+                    auto modifiers = [&](const std::string& value) {
+                        const std::string magnitude = absConstants ? "fabs(" + value + ")" : value;
+                        return negate3 ? "(-" + magnitude + ")" : magnitude;
+                    };
+                    const std::string other = modifiers("r[" + std::to_string(temp) + "]." + std::string(1, kComponents[AluComponent(swizzle3, 0)]));
+                    constants.insert(reg3);
+                    Line() << "float sc = " << modifiers("c[" + std::to_string(reg3) + "]." + kComponents[AluComponent(swizzle3, 3)]) << ";\n";
                     const char* op = scalarOp <= 43 ? " * " : (scalarOp <= 45 ? " + " : " - ");
                     s = std::string("sc") + op + other;
                     break;
@@ -438,6 +448,21 @@ inline bool bool_constant(constant DrawState& st, uint index) { return (st.bools
                     textures.insert(constant);
                     std::string coordinates = "float2(" + sourceRegister + kComponents[Bits(w0, 26, 2)] + ", " + sourceRegister +
                                               kComponents[Bits(w0, 28, 2)] + ")";
+                    // Coordenadas sin normalizar (tx_coord_denorm) y desplazamiento de la instrucción, en medios
+                    // texels (offset_x/y: 5 bits con signo en la palabra 2; los usa, p. ej., el PCF de las sombras).
+                    const int32_t offsetX = int32_t(Bits(w2, 16, 5) << 27) >> 27, offsetY = int32_t(Bits(w2, 21, 5) << 27) >> 27;
+                    const bool unnormalized = Bits(w0, 25, 1);
+                    if (unnormalized || offsetX || offsetY)
+                    {
+                        const std::string size = "float2(t" + std::to_string(constant) + ".get_width(), t" + std::to_string(constant) + ".get_height())";
+                        std::string adjusted = coordinates;
+                        if (offsetX || offsetY)
+                            adjusted = "(" + adjusted + " + float2(" + std::to_string(offsetX * 0.5f) + "f, " + std::to_string(offsetY * 0.5f) +
+                                       "f)" + (unnormalized ? ")" : " / " + size + ")");
+                        if (unnormalized)
+                            adjusted = "(" + adjusted + " / " + size + ")";
+                        coordinates = adjusted;
+                    }
                     if (Bits(w2, 14, 2) == 3) // cubo: SC, TC y cara
                     {
                         cubeTextures.insert(constant);

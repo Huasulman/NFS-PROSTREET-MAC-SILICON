@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "presenter.h"
@@ -605,22 +606,29 @@ namespace gpu
 
             id<MTLSamplerState> SamplerFor(const uint32_t* fetch)
             {
-                // clamp_x/y: bits 10-12 y 13-15 de la palabra 0; filtros mag/min: bits 19-20 y 21-22 de la palabra 3.
-                const uint32_t key = ((fetch[0] >> 10) & 0x3F) | (((fetch[3] >> 19) & 0xF) << 6);
+                // clamp_x/y: bits 10-12 y 13-15 de la palabra 0; filtros mag/min: bits 19-20 y 21-22 de la palabra 3;
+                // color del borde: bits 0-1 de la palabra 5 (0 = negro transparente, 1 = blanco).
+                const uint32_t key = ((fetch[0] >> 10) & 0x3F) | (((fetch[3] >> 19) & 0xF) << 6) | ((fetch[5] & 3) << 10);
                 auto it = samplers.find(key);
                 if (it != samplers.end())
                     return it->second;
+                // Modos de Xenos: 0 repetir, 1 espejo, 2 último texel, 3 espejo una vez, 4 y 5 lo mismo hasta
+                // medio texel del borde (aquí como 2 y 3), 6 color del borde, 7 espejo y borde (aquí como 3).
                 auto address = [](uint32_t clamp) {
                     switch (clamp)
                     {
                     case 0: return MTLSamplerAddressModeRepeat;
                     case 1: return MTLSamplerAddressModeMirrorRepeat;
+                    case 3: case 5: case 7: return MTLSamplerAddressModeMirrorClampToEdge;
+                    case 6: return MTLSamplerAddressModeClampToBorderColor;
                     default: return MTLSamplerAddressModeClampToEdge;
                     }
                 };
                 MTLSamplerDescriptor* descriptor = [[MTLSamplerDescriptor alloc] init];
                 descriptor.sAddressMode = address((fetch[0] >> 10) & 7);
                 descriptor.tAddressMode = address((fetch[0] >> 13) & 7);
+                // El mapa de sombras, p. ej., usa borde blanco: fuera de él no hay sombra.
+                descriptor.borderColor = (fetch[5] & 3) == 1 ? MTLSamplerBorderColorOpaqueWhite : MTLSamplerBorderColorTransparentBlack;
                 descriptor.magFilter = ((fetch[3] >> 19) & 3) ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
                 descriptor.minFilter = ((fetch[3] >> 21) & 3) ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
                 id<MTLSamplerState> sampler = [device newSamplerStateWithDescriptor:descriptor];
@@ -738,6 +746,18 @@ namespace gpu
                         std::memcpy(memo.fetch, fetch, sizeof(memo.fetch));
                         memo.epoch = epoch;
                         memo.cube = cube;
+                    }
+                    static const bool traceDepth = Trace();
+                    if (traceDepth)
+                    {
+                        // Qué shaders de píxeles leen una profundidad (resolve de fuente 4) y en qué ranura.
+                        static std::unordered_set<uint64_t> reported;
+                        const uint32_t format = fetch[1] & 0x3F;
+                        if ((format == 22 || format == 23) && reported.insert(draw.pixelShader->hash * 32 + slot).second)
+                            std::fprintf(stderr, "[render] ps_%016llx lee profundidad en t%u (0x%08X, %s) fetch %08X %08X %08X %08X %08X %08X\n",
+                                (unsigned long long)draw.pixelShader->hash, slot, fetch[1] & 0xFFFFF000,
+                                memo.texture == farDepthTexture ? "sin resolve" : "resolve",
+                                fetch[0], fetch[1], fetch[2], fetch[3], fetch[4], fetch[5]);
                     }
                     [encoder setFragmentTexture:memo.texture atIndex:slot];
                     [encoder setFragmentSamplerState:memo.sampler atIndex:slot];
