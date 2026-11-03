@@ -3,6 +3,7 @@
 #include "renderer.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cmath>
 #include <cstdlib>
@@ -68,6 +69,9 @@ namespace gpu
 
         bool Trace() { return std::getenv("PROSTREET_TRACE") != nullptr; }
 
+        // Escala de resolución pedida (ver SetResolutionScale): el renderer la aplica al presentar.
+        std::atomic<float> gRequestedScale{ std::getenv("PROSTREET_SCALE") ? std::clamp(float(std::atof(std::getenv("PROSTREET_SCALE"))), 1.0f, 2.0f) : 1.0f };
+
         float AsFloat(uint32_t bits)
         {
             float value;
@@ -83,7 +87,7 @@ namespace gpu
         };
 
         // Imagen que ha escrito un resolve (con mosaico, 8_8_8_8): se guarda también una copia en
-        // la GPU. Si un dibujo la usa luego como textura y la memoria no ha cambiado, se usa esa
+        // la GPU (a la escala de resolución; base, pitch y height son los del juego). Si un dibujo la usa luego como textura y la memoria no ha cambiado, se usa esa
         // copia en vez de deshacer el mosaico y volver a subirla. Con predicated tiling, cada
         // franja se escribe en su parte de la misma imagen.
         struct ResolvedSurface
@@ -152,6 +156,8 @@ namespace gpu
             // las superficies con MSAA (RB_SURFACE_INFO bits 16-17, p. ej. la escena a 1280 de ancho):
             // se dibuja con 4 muestras y al cerrar cada pasada se resuelve en color/depth, que es lo que
             // leen los resolves. PROSTREET_NO_MSAA=1: todo al destino 0.
+            // Las texturas van a la escala de resolución; width y height son los del juego (los
+            // dibujos y resolves usan esas coordenadas y se pasan a las de las texturas con Scaled).
             struct RenderSet
             {
                 id<MTLTexture> color, depth;     // 1 muestra
@@ -165,6 +171,10 @@ namespace gpu
             RenderSet sets[2];
             uint32_t passSet = 0; // el de la pasada abierta
             const bool msaaEnabled = std::getenv("PROSTREET_NO_MSAA") == nullptr;
+            float scale = 1.0f; // escala de resolución en uso
+
+            // Coordenada del juego (píxeles de la EDRAM o de una imagen de resolve) en las texturas.
+            uint32_t Scaled(uint32_t value) const { return uint32_t(value * scale + 0.5f); }
 
             uint32_t SetFor(const uint32_t* registers) const
             {
@@ -279,26 +289,21 @@ namespace gpu
                 return constantOffsets;
             }
 
-            bool Initialize()
+            // Los destinos de dibujo (y el búfer de paso de la profundidad), a la escala actual.
+            void CreateTargets()
             {
-                device = MTLCreateSystemDefaultDevice();
-                if (!device)
-                    return false;
-                queue = [device newCommandQueue];
-                memory = [device newBufferWithBytesNoCopy:memory::Translate(memory::kPhysicalBase) length:memory::kPhysicalSize
-                    options:MTLResourceStorageModeShared deallocator:nil];
-
                 auto createSet = [&](RenderSet& set, uint32_t width, uint32_t height, uint32_t samples) {
                     set.width = width;
                     set.height = height;
                     set.samples = samples;
+                    set.clearPending = set.depthClearPending = true;
                     MTLTextureDescriptor* descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
-                        width:width height:height mipmapped:NO];
+                        width:Scaled(width) height:Scaled(height) mipmapped:NO];
                     descriptor.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
                     descriptor.storageMode = MTLStorageModeShared; // los resolves inmediatos la leen
                     set.color = [device newTextureWithDescriptor:descriptor];
                     MTLTextureDescriptor* depthDescriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:kDepthFormat
-                        width:width height:height mipmapped:NO];
+                        width:Scaled(width) height:Scaled(height) mipmapped:NO];
                     depthDescriptor.usage = MTLTextureUsageRenderTarget;
                     depthDescriptor.storageMode = MTLStorageModePrivate;
                     set.depth = [device newTextureWithDescriptor:depthDescriptor];
@@ -318,6 +323,40 @@ namespace gpu
                 if (msaaEnabled && [device supportsTextureSampleCount:4])
                     createSet(sets[1], kMsaaWidth, kMsaaHeight, 4);
 
+                depthStaging = [device newBufferWithLength:size_t(Scaled(kTargetWidth)) * Scaled(kTargetHeight) * 4 options:MTLResourceStorageModePrivate];
+            }
+
+            // Cambio de escala (al presentar: la EDRAM ya no hace falta). Lo que solo está en la GPU
+            // se escribe antes en la memoria del juego; las copias en la GPU se descartan.
+            void ApplyScale()
+            {
+                const float requested = gRequestedScale.load();
+                if (requested == scale)
+                    return;
+                EndPass(true);
+                for (ResolvedSurface& surface : surfaces)
+                    WritebackSurface(surface);
+                surfaces.clear();
+                surfaceCubes.clear();
+                depthSurfaces.clear();
+                scale = requested;
+                CreateTargets();
+                epoch++;
+                std::fprintf(stderr, "[render] escala de resolución %.2gx (%ux%u)\n", scale, Scaled(kMsaaWidth), Scaled(kMsaaHeight));
+            }
+
+            bool Initialize()
+            {
+                device = MTLCreateSystemDefaultDevice();
+                if (!device)
+                    return false;
+                queue = [device newCommandQueue];
+                memory = [device newBufferWithBytesNoCopy:memory::Translate(memory::kPhysicalBase) length:memory::kPhysicalSize
+                    options:MTLResourceStorageModeShared deallocator:nil];
+
+                scale = gRequestedScale.load();
+                CreateTargets();
+
                 // Textura de 1x1 magenta para formatos aún no soportados (se ven enseguida).
                 MTLTextureDescriptor* small = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:1 height:1 mipmapped:NO];
                 missingTexture = [device newTextureWithDescriptor:small];
@@ -334,7 +373,6 @@ namespace gpu
                     width:1 height:1 mipmapped:NO]];
                 const float far = 1.0f;
                 [farDepthTexture replaceRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:0 withBytes:&far bytesPerRow:4];
-                depthStaging = [device newBufferWithLength:size_t(kTargetWidth) * kTargetHeight * 4 options:MTLResourceStorageModePrivate];
                 constantRing = [device newBufferWithLength:kRingSize options:MTLResourceStorageModeShared];
                 std::fprintf(stderr, "[render] Metal: %s\n", device.name.UTF8String);
                 return memory != nil && sets[0].color != nil;
@@ -536,13 +574,14 @@ namespace gpu
                     }
                 }
                 SurfaceCube& cube = surfaceCubes[base];
-                bool changed = !cube.texture || cube.texture.width != size;
+                const uint32_t scaledSize = Scaled(size);
+                bool changed = !cube.texture || cube.texture.width != scaledSize;
                 for (uint32_t face = 0; face < 6; face++)
                     changed |= cube.versions[face] != faces[face]->version;
                 if (!changed)
                     return cube.view;
                 MTLTextureDescriptor* descriptor = [MTLTextureDescriptor textureCubeDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
-                    size:size mipmapped:NO];
+                    size:scaledSize mipmapped:NO];
                 descriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
                 descriptor.storageMode = MTLStorageModePrivate;
                 cube.texture = [device newTextureWithDescriptor:descriptor];
@@ -555,7 +594,7 @@ namespace gpu
                 for (uint32_t face = 0; face < 6; face++)
                 {
                     [blit copyFromTexture:faces[face]->texture sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
-                        sourceSize:MTLSizeMake(size, size, 1) toTexture:cube.texture destinationSlice:face destinationLevel:0
+                        sourceSize:MTLSizeMake(scaledSize, scaledSize, 1) toTexture:cube.texture destinationSlice:face destinationLevel:0
                         destinationOrigin:MTLOriginMake(0, 0, 0)];
                     cube.versions[face] = faces[face]->version;
                 }
@@ -1025,6 +1064,20 @@ namespace gpu
                 return true;
             }
 
+            // Lee de una textura a la escala de resolución el rectángulo que corresponde a uno del juego
+            // (left, top, width, height). El píxel (x, y) del juego es el (Scaled(x), Scaled(y)) leído.
+            void ReadScaled(id<MTLTexture> texture, uint32_t left, uint32_t top, uint32_t width, uint32_t height,
+                std::vector<uint32_t>& pixels, uint32_t& scaledLeft, uint32_t& scaledTop, uint32_t& scaledWidth)
+            {
+                scaledLeft = Scaled(left);
+                scaledTop = Scaled(top);
+                scaledWidth = std::min<uint32_t>(Scaled(left + width - 1) + 1, uint32_t(texture.width)) - scaledLeft;
+                const uint32_t scaledHeight = std::min<uint32_t>(Scaled(top + height - 1) + 1, uint32_t(texture.height)) - scaledTop;
+                pixels.assign(size_t(scaledWidth) * scaledHeight, 0);
+                [texture getBytes:pixels.data() bytesPerRow:scaledWidth * 4
+                    fromRegion:MTLRegionMake2D(scaledLeft, scaledTop, scaledWidth, scaledHeight) mipmapLevel:0];
+            }
+
             // Escribe en la memoria del juego (con mosaico y su orden de bytes) lo que un resolve
             // diferido dejó solo en la GPU.
             void WritebackSurface(ResolvedSurface& surface)
@@ -1036,13 +1089,14 @@ namespace gpu
                 [lastCommit waitUntilCompleted];
                 const uint32_t left = surface.pendingLeft, top = surface.pendingTop;
                 const uint32_t width = surface.pendingRight - left, height = surface.pendingBottom - top;
-                std::vector<uint32_t> pixels(size_t(width) * height);
-                [surface.texture getBytes:pixels.data() bytesPerRow:width * 4 fromRegion:MTLRegionMake2D(left, top, width, height) mipmapLevel:0];
+                std::vector<uint32_t> pixels;
+                uint32_t scaledLeft, scaledTop, scaledWidth;
+                ReadScaled(surface.texture, left, top, width, height, pixels, scaledLeft, scaledTop, scaledWidth);
                 auto* dest = static_cast<uint8_t*>(memory::Translate(0xA0000000 | surface.base));
                 for (uint32_t y = 0; y < height; y++)
                     for (uint32_t x = 0; x < width; x++)
                     {
-                        const uint32_t rgba = pixels[size_t(y) * width + x];
+                        const uint32_t rgba = pixels[size_t(Scaled(top + y) - scaledTop) * scaledWidth + Scaled(left + x) - scaledLeft];
                         uint32_t value = (rgba & 0xFF00FF00) | ((rgba & 0xFF) << 16) | ((rgba >> 16) & 0xFF);
                         switch (surface.endian)
                         {
@@ -1074,25 +1128,33 @@ namespace gpu
                 return wrote;
             }
 
-            // El front buffer para la ventana, directamente de la copia en la GPU (BGRA, sin mosaico).
-            bool ReadFrame(uint32_t base, uint32_t width, uint32_t height, uint32_t* pixels)
+            // El front buffer para la ventana, directamente de la copia en la GPU (BGRA, sin mosaico,
+            // a la escala de resolución). Después se aplica un cambio de escala pedido.
+            bool ReadFrame(uint32_t base, uint32_t width, uint32_t height, Frame& frame)
             {
                 epoch++;
+                bool found = false;
                 for (ResolvedSurface& surface : surfaces)
                 {
                     if (surface.base != base || surface.pitch != width || surface.height < height)
                         continue;
                     EndPass(false);
                     [lastCommit waitUntilCompleted];
-                    [surface.texture getBytes:pixels bytesPerRow:width * 4 fromRegion:MTLRegionMake2D(0, 0, width, height) mipmapLevel:0];
-                    for (size_t i = 0, n = size_t(width) * height; i < n; i++)
+                    frame.width = std::min<uint32_t>(Scaled(width), uint32_t(surface.texture.width));
+                    frame.height = std::min<uint32_t>(Scaled(height), uint32_t(surface.texture.height));
+                    frame.pixels.resize(size_t(frame.width) * frame.height);
+                    [surface.texture getBytes:frame.pixels.data() bytesPerRow:frame.width * 4
+                        fromRegion:MTLRegionMake2D(0, 0, frame.width, frame.height) mipmapLevel:0];
+                    for (uint32_t& pixel : frame.pixels)
                     {
-                        const uint32_t rgba = pixels[i];
-                        pixels[i] = (rgba & 0x0000FF00) | ((rgba & 0xFF) << 16) | ((rgba >> 16) & 0xFF) | 0xFF000000u;
+                        const uint32_t rgba = pixel;
+                        pixel = (rgba & 0x0000FF00) | ((rgba & 0xFF) << 16) | ((rgba >> 16) & 0xFF) | 0xFF000000u;
                     }
-                    return true;
+                    found = true;
+                    break;
                 }
-                return false;
+                ApplyScale();
+                return found;
             }
 
             // Copia en la GPU de lo que acaba de escribir un resolve (ver ResolvedSurface).
@@ -1127,7 +1189,7 @@ namespace gpu
                         surfaces.erase(surfaces.begin());
                     }
                     MTLTextureDescriptor* descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
-                        width:pitch height:height mipmapped:NO];
+                        width:Scaled(pitch) height:Scaled(height) mipmapped:NO];
                     descriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
                     descriptor.storageMode = MTLStorageModeShared; // se lee al escribir la memoria o presentar
                     ResolvedSurface created;
@@ -1146,11 +1208,19 @@ namespace gpu
                 surface->endian = endian;
                 surface->version = ++surfaceVersions; // único entre todas: una imagen nueva no repite número
 
+                // A la escala: el tamaño sale del destino (así las franjas seguidas no dejan huecos),
+                // recortado a las dos texturas.
+                const uint32_t sourceX = Scaled(left), sourceY = Scaled(top);
+                const uint32_t destY = Scaled(offsetY + top);
+                const uint32_t copyWidth = std::min({ Scaled(left + width) - sourceX, uint32_t(source.width) - sourceX,
+                    uint32_t(surface->texture.width) - sourceX });
+                const uint32_t copyRows = std::min({ Scaled(offsetY + top + rows) - destY, uint32_t(source.height) - sourceY,
+                    uint32_t(surface->texture.height) - destY });
                 id<MTLCommandBuffer> copy = [queue commandBuffer];
                 id<MTLBlitCommandEncoder> blit = [copy blitCommandEncoder];
-                [blit copyFromTexture:source sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(left, top, 0)
-                    sourceSize:MTLSizeMake(width, rows, 1) toTexture:surface->texture destinationSlice:0 destinationLevel:0
-                    destinationOrigin:MTLOriginMake(left, offsetY + top, 0)];
+                [blit copyFromTexture:source sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(sourceX, sourceY, 0)
+                    sourceSize:MTLSizeMake(copyWidth, copyRows, 1) toTexture:surface->texture destinationSlice:0 destinationLevel:0
+                    destinationOrigin:MTLOriginMake(sourceX, destY, 0)];
                 [blit endEncoding];
                 [copy commit];
                 lastCommit = copy;
@@ -1253,7 +1323,7 @@ namespace gpu
                     created.pitch = pitch;
                     created.height = height;
                     MTLTextureDescriptor* descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR32Float
-                        width:std::min(pitch, kTargetWidth) height:std::min(height, kTargetHeight) mipmapped:NO];
+                        width:Scaled(std::min(pitch, kTargetWidth)) height:Scaled(std::min(height, kTargetHeight)) mipmapped:NO];
                     descriptor.usage = MTLTextureUsageShaderRead;
                     descriptor.storageMode = MTLStorageModePrivate;
                     created.texture = [device newTextureWithDescriptor:descriptor];
@@ -1261,20 +1331,23 @@ namespace gpu
                     surface = &depthSurfaces.back();
                     offsetY = 0;
                 }
-                if (offsetY + bottom > surface->texture.height)
+                if (Scaled(offsetY + bottom) > surface->texture.height)
                     return;
 
                 EndPass(false);
-                const uint32_t width = right - left, rows = bottom - top;
+                // A la escala de resolución, como en UpdateSurface.
+                const uint32_t sourceX = Scaled(left), sourceY = Scaled(top), destY = Scaled(offsetY + top);
+                const uint32_t width = std::min({ Scaled(right) - sourceX, uint32_t(set.depth.width) - sourceX, uint32_t(surface->texture.width) - sourceX });
+                const uint32_t rows = std::min(Scaled(offsetY + bottom) - destY, uint32_t(set.depth.height) - sourceY);
                 id<MTLCommandBuffer> copy = [queue commandBuffer];
                 id<MTLBlitCommandEncoder> blit = [copy blitCommandEncoder];
-                [blit copyFromTexture:set.depth sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(left, top, 0)
+                [blit copyFromTexture:set.depth sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(sourceX, sourceY, 0)
                     sourceSize:MTLSizeMake(width, rows, 1) toBuffer:depthStaging destinationOffset:0
                     destinationBytesPerRow:width * 4 destinationBytesPerImage:size_t(width) * rows * 4
                     options:MTLBlitOptionDepthFromDepthStencil];
                 [blit copyFromBuffer:depthStaging sourceOffset:0 sourceBytesPerRow:width * 4 sourceBytesPerImage:size_t(width) * rows * 4
                     sourceSize:MTLSizeMake(width, rows, 1) toTexture:surface->texture destinationSlice:0 destinationLevel:0
-                    destinationOrigin:MTLOriginMake(left, offsetY + top, 0)];
+                    destinationOrigin:MTLOriginMake(sourceX, destY, 0)];
                 [blit endEncoding];
                 [copy commit];
                 lastCommit = copy;
@@ -1328,15 +1401,16 @@ namespace gpu
                 {
                     EndPass(true);
                     const uint32_t width = right - left, height = bottom - top;
-                    std::vector<uint32_t> pixels(size_t(width) * height);
-                    [set.color getBytes:pixels.data() bytesPerRow:width * 4 fromRegion:MTLRegionMake2D(left, top, width, height) mipmapLevel:0];
+                    std::vector<uint32_t> pixels;
+                    uint32_t scaledLeft, scaledTop, scaledWidth;
+                    ReadScaled(set.color, left, top, width, height, pixels, scaledLeft, scaledTop, scaledWidth);
                     auto* dest = static_cast<uint8_t*>(memory::Translate(0xA0000000 | (destBase & 0x1FFFFFFF)));
                     for (uint32_t y = 0; y < height; y++)
                     {
                         for (uint32_t x = 0; x < width; x++)
                         {
                             // RGBA8 de Metal (R en el byte bajo) -> palabra 0xAARRGGBB en memoria.
-                            const uint32_t rgba = pixels[size_t(y) * width + x];
+                            const uint32_t rgba = pixels[size_t(Scaled(top + y) - scaledTop) * scaledWidth + Scaled(left + x) - scaledLeft];
                             uint32_t value = (rgba & 0xFF00FF00) | ((rgba & 0xFF) << 16) | ((rgba >> 16) & 0xFF);
                             switch (destEndian)
                             {
@@ -1410,13 +1484,23 @@ namespace gpu
         }
     }
 
-    bool RendererReadFrame(uint32_t physical, uint32_t width, uint32_t height, uint32_t* pixels)
+    bool RendererReadFrame(uint32_t physical, uint32_t width, uint32_t height, Frame& frame)
     {
         @autoreleasepool
         {
             Renderer* renderer = Get();
-            return renderer && renderer->ReadFrame(physical & 0x1FFFFFFF, width, height, pixels);
+            return renderer && renderer->ReadFrame(physical & 0x1FFFFFFF, width, height, frame);
         }
+    }
+
+    void SetResolutionScale(float scale)
+    {
+        gRequestedScale = std::clamp(scale, 1.0f, 2.0f);
+    }
+
+    float ResolutionScale()
+    {
+        return gRequestedScale.load();
     }
 
     void RendererResolve(const uint32_t* registers)

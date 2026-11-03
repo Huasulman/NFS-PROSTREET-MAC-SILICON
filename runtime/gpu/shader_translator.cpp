@@ -45,6 +45,17 @@ inline bool alpha_test_fails(constant DrawState& st, float alpha)
     }
 }
 
+// Tamaño de la textura según su constante de fetch (13 + 13 bits en 2D; 11 + 11 en 3D). Es el que
+// usan las coordenadas sin normalizar: la textura de Metal puede ser mayor (resolves a la escala de
+// resolución).
+inline float2 fetch_size(constant uint* fc, uint constant_index)
+{
+    uint size = fc[constant_index * 6 + 2];
+    if (((fc[constant_index * 6 + 5] >> 9) & 3) == 2)
+        return float2((size & 0x7FF) + 1, ((size >> 11) & 0x7FF) + 1);
+    return float2((size & 0x1FFF) + 1, ((size >> 13) & 0x1FFF) + 1);
+}
+
 struct VSOut
 {
     float4 position [[position]];
@@ -516,7 +527,7 @@ inline bool bool_constant(constant DrawState& st, uint index) { return (st.bools
                     const bool unnormalized = Bits(w0, 25, 1);
                     if (unnormalized || offsetX || offsetY)
                     {
-                        const std::string size = "float2(t" + std::to_string(constant) + ".get_width(), t" + std::to_string(constant) + ".get_height())";
+                        const std::string size = "fetch_size(fc, " + std::to_string(constant) + ")";
                         std::string adjusted = coordinates;
                         if (offsetX || offsetY)
                             adjusted = "(" + adjusted + " + float2(" + std::to_string(offsetX * 0.5f) + "f, " + std::to_string(offsetY * 0.5f) +

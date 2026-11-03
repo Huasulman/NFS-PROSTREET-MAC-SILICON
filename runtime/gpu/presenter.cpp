@@ -32,21 +32,23 @@ namespace gpu
             return;
 
         Frame frame;
-        frame.width = width;
-        frame.height = height;
-        frame.pixels.resize(size_t(width) * height);
         const auto* source = static_cast<const uint8_t*>(memory::Translate(frontBufferGuest));
-        if (gLinear || !RendererReadFrame(frontBufferGuest, width, height, frame.pixels.data()))
-        for (uint32_t y = 0; y < height; y++)
+        if (gLinear || !RendererReadFrame(frontBufferGuest, width, height, frame))
         {
-            for (uint32_t x = 0; x < width; x++)
+            frame.width = width;
+            frame.height = height;
+            frame.pixels.resize(size_t(width) * height);
+            for (uint32_t y = 0; y < height; y++)
             {
-                const uint32_t offset = gLinear ? (y * width + x) * 4 : TiledOffset(x, y, width, 2);
-                // 8_8_8_8 como palabra little-endian 0xAARRGGBB (como lo escribe el resolve, sin
-                // intercambio de bytes): es directamente un píxel BGRA del Mac.
-                uint32_t value;
-                std::memcpy(&value, source + offset, 4);
-                frame.pixels[size_t(y) * width + x] = value | 0xFF000000u;
+                for (uint32_t x = 0; x < width; x++)
+                {
+                    const uint32_t offset = gLinear ? (y * width + x) * 4 : TiledOffset(x, y, width, 2);
+                    // 8_8_8_8 como palabra little-endian 0xAARRGGBB (como lo escribe el resolve, sin
+                    // intercambio de bytes): es directamente un píxel BGRA del Mac.
+                    uint32_t value;
+                    std::memcpy(&value, source + offset, 4);
+                    frame.pixels[size_t(y) * width + x] = value | 0xFF000000u;
+                }
             }
         }
 
