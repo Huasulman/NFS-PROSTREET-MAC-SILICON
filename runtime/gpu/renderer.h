@@ -41,4 +41,9 @@ namespace gpu
     // presentar el fotograma siguiente. Al empezar: PROSTREET_SCALE (por defecto 1).
     void SetResolutionScale(float scale);
     float ResolutionScale();
+
+    // Antialiasing (MSAA 4x en las superficies que lo piden). Como la escala: se aplica al presentar.
+    // Al empezar: activado salvo con PROSTREET_NO_MSAA.
+    void SetAntialiasing(bool enabled);
+    bool Antialiasing();
 }

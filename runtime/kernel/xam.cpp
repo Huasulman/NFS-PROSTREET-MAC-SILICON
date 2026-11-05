@@ -309,6 +309,47 @@ PPC_FUNC(__imp__NetDll_XNetGetTitleXnAddr)
     ctx.r3.u64 = 1;
 }
 
+// int NetDll_XNetStartup(uint32_t caller, XNetStartupParams* params): la pila de red "arranca"
+// (sin enlace, ver arriba).
+PPC_FUNC(__imp__NetDll_XNetStartup)
+{
+    (void)base;
+    ctx.r3.u64 = 0;
+}
+
+// int NetDll_WSAStartup(uint32_t caller, uint16_t version, WSADATA* data): se acepta la versión
+// pedida (wVersion y wHighVersion, al principio de WSADATA); el resto queda a cero.
+PPC_FUNC(__imp__NetDll_WSAStartup)
+{
+    (void)base;
+    const uint32_t data = ctx.r5.u32;
+    if (data)
+    {
+        std::memset(memory::Translate(data), 0, 400); // sizeof(WSADATA) en la consola
+        memory::Write16(data + 0, uint16_t(ctx.r4.u32));
+        memory::Write16(data + 2, 0x0202);
+    }
+    ctx.r3.u64 = 0;
+}
+
+// uint32_t XamGetSystemVersion(): la versión del sistema solo decide qué funciones nuevas usar.
+// Como Xenia, 0 (la más antigua).
+PPC_FUNC(__imp__XamGetSystemVersion)
+{
+    (void)base;
+    ctx.r3.u64 = 0;
+}
+
+// uint32_t XamLoaderGetLaunchDataSize(uint32_t* size): el juego no se lanzó con datos (desde otro
+// título o una demo): ERROR_NOT_FOUND.
+PPC_FUNC(__imp__XamLoaderGetLaunchDataSize)
+{
+    (void)base;
+    if (ctx.r3.u32)
+        memory::Write32(ctx.r3.u32, 0);
+    ctx.r3.u64 = 0x490;
+}
+
 // uint32_t NetDll_XNetGetEthernetLinkStatus(uint32_t caller): 0 = sin enlace.
 PPC_FUNC(__imp__NetDll_XNetGetEthernetLinkStatus)
 {

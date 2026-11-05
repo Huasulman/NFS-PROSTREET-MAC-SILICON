@@ -424,3 +424,89 @@ PPC_FUNC(__imp__DbgPrint)
     std::fprintf(stderr, "[juego] %s%s", out.c_str(), (!out.empty() && out.back() == '\n') ? "" : "\n");
     ctx.r3.u64 = 0;
 }
+
+// --- Sin efecto en el runtime -------------------------------------------------------------
+// Llamadas que en la consola configuran algo que aquí no existe (APC, privilegios de sistema,
+// notificaciones al cerrar el título) o liberan memoria que el runtime no recupera.
+
+// void KeEnterCriticalRegion(), KeLeaveCriticalRegion(): desactivan las APC del hilo.
+PPC_FUNC(__imp__KeEnterCriticalRegion)
+{
+    (void)base;
+}
+
+PPC_FUNC(__imp__KeLeaveCriticalRegion)
+{
+    (void)base;
+}
+
+// void KiApcNormalRoutineNop(...): rutina de APC vacía.
+PPC_FUNC(__imp__KiApcNormalRoutineNop)
+{
+    (void)base;
+}
+
+// void ExRegisterTitleTerminateNotification(X_EX_TITLE_TERMINATE_REGISTRATION* reg, uint32_t create)
+PPC_FUNC(__imp__ExRegisterTitleTerminateNotification)
+{
+    (void)base;
+}
+
+// uint32_t XexCheckExecutablePrivilege(uint32_t privilege): un título normal no tiene ninguno.
+PPC_FUNC(__imp__XexCheckExecutablePrivilege)
+{
+    (void)base;
+    ctx.r3.u64 = 0;
+}
+
+// void MmFreePhysicalMemory(uint32_t type, uint32_t address): la memoria no se reutiliza.
+PPC_FUNC(__imp__MmFreePhysicalMemory)
+{
+    (void)base;
+}
+
+// NTSTATUS NtFreeVirtualMemory(uint32_t* baseAddress, uint32_t* regionSize, uint32_t freeType, ...)
+PPC_FUNC(__imp__NtFreeVirtualMemory)
+{
+    (void)base;
+    ctx.r3.u64 = kStatusSuccess;
+}
+
+// uint32_t MmQueryAddressProtect(uint32_t address): toda la memoria del invitado existe y se puede
+// leer y escribir (PAGE_READWRITE), salvo la primera página (punteros nulos).
+PPC_FUNC(__imp__MmQueryAddressProtect)
+{
+    (void)base;
+    ctx.r3.u64 = ctx.r3.u32 >= 0x10000 ? 0x04 : 0x00;
+}
+
+// uint32_t RtlNtStatusToDosError(NTSTATUS status): los códigos que ve el juego (de archivos y
+// memoria). Sin equivalente: ERROR_MR_MID_NOT_FOUND, como Windows.
+PPC_FUNC(__imp__RtlNtStatusToDosError)
+{
+    (void)base;
+    const uint32_t status = ctx.r3.u32;
+    uint32_t error;
+    switch (status)
+    {
+    case 0x00000000: error = 0; break;      // STATUS_SUCCESS
+    case 0x00000103: error = 997; break;    // STATUS_PENDING -> ERROR_IO_PENDING
+    case 0x80000006: error = 18; break;     // STATUS_NO_MORE_FILES
+    case 0xC0000008: error = 6; break;      // STATUS_INVALID_HANDLE
+    case 0xC000000D: error = 87; break;     // STATUS_INVALID_PARAMETER
+    case 0xC000000F: error = 2; break;      // STATUS_NO_SUCH_FILE
+    case 0xC0000011: error = 38; break;     // STATUS_END_OF_FILE -> ERROR_HANDLE_EOF
+    case 0xC0000017: error = 8; break;      // STATUS_NO_MEMORY -> ERROR_NOT_ENOUGH_MEMORY
+    case 0xC0000022: error = 5; break;      // STATUS_ACCESS_DENIED
+    case 0xC0000033: error = 123; break;    // STATUS_OBJECT_NAME_INVALID -> ERROR_INVALID_NAME
+    case 0xC0000034: error = 2; break;      // STATUS_OBJECT_NAME_NOT_FOUND -> ERROR_FILE_NOT_FOUND
+    case 0xC0000035: error = 183; break;    // STATUS_OBJECT_NAME_COLLISION -> ERROR_ALREADY_EXISTS
+    case 0xC000003A: error = 3; break;      // STATUS_OBJECT_PATH_NOT_FOUND -> ERROR_PATH_NOT_FOUND
+    case 0xC000007F: error = 112; break;    // STATUS_DISK_FULL
+    case 0xC00000BA: error = 5; break;      // STATUS_FILE_IS_A_DIRECTORY -> ERROR_ACCESS_DENIED
+    case 0xC0000103: error = 267; break;    // STATUS_NOT_A_DIRECTORY -> ERROR_DIRECTORY
+    case 0xC000026E: error = 21; break;     // STATUS_VOLUME_DISMOUNTED -> ERROR_NOT_READY
+    default: error = (status & 0xFFFF0000) == 0x80070000 ? (status & 0xFFFF) : 317; break; // HRESULT de Win32 o ERROR_MR_MID_NOT_FOUND
+    }
+    ctx.r3.u64 = error;
+}
