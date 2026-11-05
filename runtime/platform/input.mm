@@ -26,10 +26,14 @@ namespace platform
 
         const auto gStart = std::chrono::steady_clock::now();
 
+        // Gatillos en el guion (no son bits de botones).
+        constexpr uint16_t kScriptRightTrigger = 1, kScriptLeftTrigger = 2;
+
         struct ScriptedPress
         {
             uint16_t buttons;
-            double time;
+            double time, end; // pulsado en [time, end)
+            uint16_t triggers = 0;
         };
 
         uint16_t ButtonByName(const std::string& name)
@@ -47,7 +51,8 @@ namespace platform
             return 0;
         }
 
-        // "A@30,START@35.5": botón@segundo, separados por comas.
+        // "A@30,START@35.5,RT@40-60": botón@segundo (pulsado 0,2 s) o botón@desde-hasta (mantenido),
+        // separados por comas. RT y LT son los gatillos.
         std::vector<ScriptedPress> ParseScript()
         {
             std::vector<ScriptedPress> presses;
@@ -64,7 +69,16 @@ namespace platform
                 const std::string item = text.substr(position, end - position);
                 const size_t at = item.find('@');
                 if (at != std::string::npos)
-                    presses.push_back({ButtonByName(item.substr(0, at)), std::strtod(item.c_str() + at + 1, nullptr)});
+                {
+                    const std::string name = item.substr(0, at);
+                    char* rest = nullptr;
+                    const double time = std::strtod(item.c_str() + at + 1, &rest);
+                    const double until = *rest == '-' ? std::strtod(rest + 1, nullptr) : time + 0.2;
+                    if (name == "RT" || name == "LT")
+                        presses.push_back({0, time, until, name == "RT" ? kScriptRightTrigger : kScriptLeftTrigger});
+                    else
+                        presses.push_back({ButtonByName(name), time, until});
+                }
                 position = end + 1;
             }
             return presses;
@@ -72,15 +86,20 @@ namespace platform
 
         const std::vector<ScriptedPress> gScript = ParseScript();
 
-        uint16_t ScriptedButtons()
+        // Botones (y gatillos, en `triggers`) que el guion tiene pulsados ahora.
+        uint16_t ScriptedButtons(uint16_t& triggers)
         {
+            triggers = 0;
             if (gScript.empty())
                 return 0;
             const double now = std::chrono::duration<double>(std::chrono::steady_clock::now() - gStart).count();
             uint16_t buttons = 0;
             for (const auto& press : gScript)
-                if (now >= press.time && now < press.time + 0.2)
+                if (now >= press.time && now < press.end)
+                {
                     buttons |= press.buttons;
+                    triggers |= press.triggers;
+                }
             return buttons;
         }
 
@@ -188,9 +207,10 @@ namespace platform
         std::lock_guard lock(gLock);
         const Gamepad keyboard = KeyboardGamepad();
         Gamepad pad;
-        pad.buttons = gController.buttons | keyboard.buttons | ScriptedButtons();
-        pad.leftTrigger = std::max(gController.leftTrigger, keyboard.leftTrigger);
-        pad.rightTrigger = std::max(gController.rightTrigger, keyboard.rightTrigger);
+        uint16_t scriptedTriggers;
+        pad.buttons = gController.buttons | keyboard.buttons | ScriptedButtons(scriptedTriggers);
+        pad.leftTrigger = std::max<uint8_t>({ gController.leftTrigger, keyboard.leftTrigger, uint8_t(scriptedTriggers & kScriptLeftTrigger ? 255 : 0) });
+        pad.rightTrigger = std::max<uint8_t>({ gController.rightTrigger, keyboard.rightTrigger, uint8_t(scriptedTriggers & kScriptRightTrigger ? 255 : 0) });
         pad.thumbLX = Combine(gController.thumbLX, keyboard.thumbLX);
         pad.thumbLY = Combine(gController.thumbLY, keyboard.thumbLY);
         pad.thumbRX = Combine(gController.thumbRX, keyboard.thumbRX);
