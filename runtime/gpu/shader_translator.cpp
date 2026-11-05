@@ -207,6 +207,7 @@ inline bool bool_constant(constant DrawState& st, uint index) { return (st.bools
             std::ostringstream warnings;
             std::set<uint32_t> textures;
             std::set<uint32_t> cubeTextures; // de las anteriores, las que se leen como mapa cúbico
+            std::set<uint32_t> volumeTextures; // y las que se leen como textura 3D
             std::set<uint32_t> constants;
             uint32_t lastStride = 0;
             int indent = 1;
@@ -536,6 +537,11 @@ inline bool bool_constant(constant DrawState& st, uint index) { return (st.bools
                             adjusted = "(" + adjusted + " / " + size + ")";
                         coordinates = adjusted;
                     }
+                    if (Bits(w2, 14, 2) == 2) // 3D: la tercera coordenada es la profundidad
+                    {
+                        volumeTextures.insert(constant);
+                        coordinates = "float3(" + coordinates + ", " + sourceRegister + kComponents[Bits(w0, 30, 2)] + ")";
+                    }
                     if (Bits(w2, 14, 2) == 3) // cubo: SC, TC y cara
                     {
                         cubeTextures.insert(constant);
@@ -763,7 +769,7 @@ inline bool bool_constant(constant DrawState& st, uint index) { return (st.bools
                     out << "fragment float4 " << entry << "(VSOut in [[stage_in]], device const uint* mem [[buffer(0)]],\n"
                         << "    constant float4* c [[buffer(1)]], constant uint* fc [[buffer(2)]], constant DrawState& st [[buffer(3)]]";
                     for (uint32_t t : textures)
-                        out << ",\n    " << (cubeTextures.count(t) ? "texturecube" : "texture2d") << "<float> t" << t << " [[texture(" << t << ")]], sampler s" << t << " [[sampler(" << t << ")]]";
+                        out << ",\n    " << (cubeTextures.count(t) ? "texturecube" : volumeTextures.count(t) ? "texture3d" : "texture2d") << "<float> t" << t << " [[texture(" << t << ")]], sampler s" << t << " [[sampler(" << t << ")]]";
                     out << ")\n{\n";
                     out << R"MSL(    float4 r[64];
     for (int i = 0; i < 64; i++) r[i] = float4(0);
@@ -796,6 +802,7 @@ inline bool bool_constant(constant DrawState& st, uint index) { return (st.bools
         result.warnings = translator.warnings.str();
         result.textures.assign(translator.textures.begin(), translator.textures.end());
         result.cubeTextures.assign(translator.cubeTextures.begin(), translator.cubeTextures.end());
+        result.volumeTextures.assign(translator.volumeTextures.begin(), translator.volumeTextures.end());
         for (uint32_t reg : translator.constants)
         {
             auto& ranges = result.constantRanges;

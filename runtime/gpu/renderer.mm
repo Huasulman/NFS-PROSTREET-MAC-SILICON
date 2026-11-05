@@ -72,6 +72,7 @@ namespace gpu
         constexpr uint32_t kMsaaWidth = 1280, kMsaaHeight = 720;
         // Las ranuras de textura de un shader llevan este bit si las lee como mapa cúbico.
         constexpr uint32_t kCubeSlot = 0x100;
+        constexpr uint32_t kVolumeSlot = 0x200; // ...o como textura 3D
 
         bool Trace() { return std::getenv("PROSTREET_TRACE") != nullptr; }
 
@@ -203,7 +204,7 @@ namespace gpu
             struct CompiledShader
             {
                 id<MTLFunction> function; // nil si no compila
-                std::vector<uint32_t> slots; // texturas que lee (con kCubeSlot si es un cubo)
+                std::vector<uint32_t> slots; // texturas que lee (con kCubeSlot o kVolumeSlot según el tipo)
                 std::vector<std::pair<uint32_t, uint32_t>> constantRanges;
             };
             // Lo que hace falta para crear un pipeline (copiado del dibujo que lo pide).
@@ -251,7 +252,7 @@ namespace gpu
             {
                 uint32_t fetch[6] = {};
                 uint64_t epoch = 0;
-                bool cube = false;
+                uint32_t kind = 0; // kCubeSlot, kVolumeSlot o 0
                 id<MTLTexture> texture;
                 id<MTLSamplerState> sampler;
             };
@@ -268,6 +269,7 @@ namespace gpu
             std::unordered_map<uint32_t, id<MTLSamplerState>> samplers;
             id<MTLTexture> missingTexture;
             id<MTLTexture> missingCube;    // lo mismo, para un shader que espera un mapa cúbico
+            id<MTLTexture> missingVolume;  // ...o una textura 3D
             id<MTLTexture> blackTexture;   // (0, 0, 0, 0): constante de fetch sin textura (formato 0)
             id<MTLTexture> farDepthTexture; // profundidad 1 (lejos): 24_8 sin resolve que la haya escrito
 
@@ -419,6 +421,12 @@ namespace gpu
                     size:1 mipmapped:NO]];
                 for (NSUInteger face = 0; face < 6; face++)
                     [missingCube replaceRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:0 slice:face withBytes:&magenta bytesPerRow:4 bytesPerImage:4];
+                MTLTextureDescriptor* smallVolume = [[MTLTextureDescriptor alloc] init];
+                smallVolume.textureType = MTLTextureType3D;
+                smallVolume.pixelFormat = MTLPixelFormatRGBA8Unorm;
+                smallVolume.width = smallVolume.height = smallVolume.depth = 1;
+                missingVolume = [device newTextureWithDescriptor:smallVolume];
+                [missingVolume replaceRegion:MTLRegionMake3D(0, 0, 0, 1, 1, 1) mipmapLevel:0 slice:0 withBytes:&magenta bytesPerRow:4 bytesPerImage:4];
                 blackTexture = [device newTextureWithDescriptor:small];
                 const uint32_t black = 0;
                 [blackTexture replaceRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:0 withBytes:&black bytesPerRow:4];
@@ -454,6 +462,9 @@ namespace gpu
                 for (uint32_t& slot : compiled->slots)
                     if (std::find(translated.cubeTextures.begin(), translated.cubeTextures.end(), slot) != translated.cubeTextures.end())
                         slot |= kCubeSlot;
+                for (uint32_t& slot : compiled->slots)
+                    if (std::find(translated.volumeTextures.begin(), translated.volumeTextures.end(), slot) != translated.volumeTextures.end())
+                        slot |= kVolumeSlot;
                 compiled->constantRanges = translated.constantRanges;
                 std::lock_guard lock(compileLock);
                 return compiledShaders.emplace(shader.hash, std::move(compiled)).first->second;
@@ -756,8 +767,8 @@ namespace gpu
                 const uint32_t pitch = ((fetch[0] >> 22) & 0x1FF) * 32;
                 const uint32_t format = fetch[1] & 0x3F, endian = (fetch[1] >> 6) & 3;
                 const uint32_t base = fetch[1] & 0xFFFFF000;
-                // Tamaño: 13 + 13 bits en 2D; en 3D, 11 + 11 (+ 10 de profundidad). De una textura 3D
-                // (p. ej. una tabla de color) de momento se usa la primera capa como 2D.
+                // Tamaño: 13 + 13 bits en 2D; en 3D, 11 + 11 (+ 10 de profundidad). Una textura 3D leída
+                // como 2D (las que se leen como 3D van a VolumeFor) da su primera capa.
                 const uint32_t dimension = (fetch[5] >> 9) & 3;
                 const uint32_t width = dimension == 2 ? (fetch[2] & 0x7FF) + 1 : (fetch[2] & 0x1FFF) + 1;
                 const uint32_t height = dimension == 2 ? ((fetch[2] >> 11) & 0x7FF) + 1 : ((fetch[2] >> 13) & 0x1FFF) + 1;
@@ -768,14 +779,6 @@ namespace gpu
                         std::fprintf(stderr, "[render] un shader lee como cubo una textura de dimensión %u (se ve magenta)\n", dimension);
                     reported = true;
                     return missingCube;
-                }
-                if (dimension == 2)
-                {
-                    static bool reported = false;
-                    if (!reported)
-                        std::fprintf(stderr, "[render] textura 3D %ux%ux%u (formato %u): se usa su primera capa\n", width, height,
-                            ((fetch[2] >> 22) & 0x3FF) + 1, fetch[1] & 0x3F);
-                    reported = true;
                 }
                 // Un mapa cúbico tiene sus 6 caras seguidas; leído como 2D se usa la primera.
                 const uint32_t faces = cube ? 6 : 1;
@@ -1019,12 +1022,97 @@ namespace gpu
                 return cached.texture;
             }
 
+            // Textura 3D (solo el nivel 0 y formatos sin comprimir). Cada capa se lee como una imagen 2D
+            // (con su mosaico, si lo tiene) y las capas van seguidas. En la consola el mosaico 3D agrupa
+            // las capas de 4 en 4, así que con mosaico el orden de los texels puede no ser el exacto; la
+            // única que usa el juego es ruido (32x32x32), donde el orden no importa.
+            id<MTLTexture> VolumeFor(const uint32_t* fetch)
+            {
+                const uint32_t dimension = (fetch[5] >> 9) & 3, format = fetch[1] & 0x3F, endian = (fetch[1] >> 6) & 3;
+                const uint32_t base = fetch[1] & 0x1FFFF000;
+                const bool tiled = fetch[0] >> 31;
+                const uint32_t width = (fetch[2] & 0x7FF) + 1, height = ((fetch[2] >> 11) & 0x7FF) + 1, depth = ((fetch[2] >> 22) & 0x3FF) + 1;
+                MTLPixelFormat pixelFormat;
+                uint32_t bytesPerTexel, log2Bytes;
+                switch (format)
+                {
+                case 2: pixelFormat = MTLPixelFormatR8Unorm; bytesPerTexel = 1; log2Bytes = 0; break;
+                case 10: pixelFormat = MTLPixelFormatRG8Unorm; bytesPerTexel = 2; log2Bytes = 1; break;
+                case 6: pixelFormat = MTLPixelFormatRGBA8Unorm; bytesPerTexel = 4; log2Bytes = 2; break;
+                default: pixelFormat = MTLPixelFormatInvalid; bytesPerTexel = log2Bytes = 0; break;
+                }
+                if (dimension != 2 || pixelFormat == MTLPixelFormatInvalid || base == 0)
+                {
+                    static bool reported = false;
+                    if (!reported)
+                        std::fprintf(stderr, "[render] textura 3D no soportada (dimensión %u, formato %u): se ve magenta\n", dimension, format);
+                    reported = true;
+                    return missingVolume;
+                }
+                const uint32_t pitch = std::max(((fetch[0] >> 22) & 0x1FF) * 32, width);
+                const size_t sliceSize = tiled ? TiledSize(pitch, height, bytesPerTexel) : size_t(pitch) * ((height + 31) & ~31u) * bytesPerTexel;
+                const size_t rawSize = std::min<size_t>(sliceSize * depth, 0x20000000 - base);
+                const uint64_t key = (uint64_t(base) << 32) ^ (uint64_t(format) << 26) ^ (uint64_t(width) << 13) ^ height ^
+                                     (uint64_t(depth) * 0x9E3779B97F4A7C15ull) ^ (3ull << 61);
+                Texture& cached = textures[key];
+                if (cached.texture && (cached.epoch == epoch || memory::Unchanged(base, uint32_t(rawSize))))
+                {
+                    cached.epoch = epoch;
+                    return cached.texture;
+                }
+                if (WritebackOverlapping(base, rawSize))
+                    return VolumeFor(fetch);
+                memory::Watch(base, uint32_t(rawSize));
+                const auto* source = static_cast<const uint8_t*>(memory::Translate(0xA0000000 | base));
+                const uint64_t hash = HashMemory(source, rawSize);
+                if (cached.texture && cached.hash == hash)
+                {
+                    cached.epoch = epoch;
+                    return cached.texture;
+                }
+
+                MTLTextureDescriptor* descriptor = [[MTLTextureDescriptor alloc] init];
+                descriptor.textureType = MTLTextureType3D;
+                descriptor.pixelFormat = pixelFormat;
+                descriptor.width = width;
+                descriptor.height = height;
+                descriptor.depth = depth;
+                cached.texture = [device newTextureWithDescriptor:descriptor];
+                std::vector<uint8_t> data(size_t(width) * height * depth * bytesPerTexel);
+                for (uint32_t z = 0; z < depth; z++)
+                    for (uint32_t y = 0; y < height; y++)
+                        for (uint32_t x = 0; x < width; x++)
+                        {
+                            const size_t offset = z * sliceSize + (tiled ? TiledOffset(x, y, pitch, log2Bytes) : (size_t(y) * pitch + x) * bytesPerTexel);
+                            if (offset + bytesPerTexel <= rawSize)
+                                std::memcpy(&data[((size_t(z) * height + y) * width + x) * bytesPerTexel], source + offset, bytesPerTexel);
+                        }
+                for (size_t i = 0; i + 3 < data.size(); i += 4)
+                {
+                    uint32_t word;
+                    std::memcpy(&word, &data[i], 4);
+                    switch (endian)
+                    {
+                    case 1: word = ((word & 0x00FF00FF) << 8) | ((word >> 8) & 0x00FF00FF); break;
+                    case 2: word = __builtin_bswap32(word); break;
+                    case 3: word = (word << 16) | (word >> 16); break;
+                    default: break;
+                    }
+                    std::memcpy(&data[i], &word, 4);
+                }
+                [cached.texture replaceRegion:MTLRegionMake3D(0, 0, 0, width, height, depth) mipmapLevel:0 slice:0 withBytes:data.data()
+                    bytesPerRow:width * bytesPerTexel bytesPerImage:size_t(width) * height * bytesPerTexel];
+                cached.hash = hash;
+                cached.epoch = epoch;
+                return cached.texture;
+            }
+
             id<MTLSamplerState> SamplerFor(const uint32_t* fetch)
             {
-                // clamp_x/y: bits 10-12 y 13-15 de la palabra 0; filtros mag/min: bits 19-20 y 21-22 de la palabra 3;
-                // color del borde: bits 0-1 de la palabra 5 (0 = negro transparente, 1 = blanco).
+                // clamp_x/y/z: bits 10-12, 13-15 y 16-18 de la palabra 0; filtros mag/min: bits 19-20 y 21-22 de
+                // la palabra 3; color del borde: bits 0-1 de la palabra 5 (0 = negro transparente, 1 = blanco).
                 // Filtro entre mipmaps: bits 23-24 de la palabra 3; anisótropo: bits 25-27.
-                const uint32_t key = ((fetch[0] >> 10) & 0x3F) | (((fetch[3] >> 19) & 0x1FF) << 6) | ((fetch[5] & 3) << 15);
+                const uint32_t key = ((fetch[0] >> 10) & 0x1FF) | (((fetch[3] >> 19) & 0x1FF) << 9) | ((fetch[5] & 3) << 18);
                 auto it = samplers.find(key);
                 if (it != samplers.end())
                     return it->second;
@@ -1043,6 +1131,7 @@ namespace gpu
                 MTLSamplerDescriptor* descriptor = [[MTLSamplerDescriptor alloc] init];
                 descriptor.sAddressMode = address((fetch[0] >> 10) & 7);
                 descriptor.tAddressMode = address((fetch[0] >> 13) & 7);
+                descriptor.rAddressMode = address((fetch[0] >> 16) & 7);
                 // El mapa de sombras, p. ej., usa borde blanco: fuera de él no hay sombra.
                 descriptor.borderColor = (fetch[5] & 3) == 1 ? MTLSamplerBorderColorOpaqueWhite : MTLSamplerBorderColorTransparentBlack;
                 descriptor.magFilter = ((fetch[3] >> 19) & 3) ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
@@ -1208,16 +1297,16 @@ namespace gpu
                 for (uint32_t entry : textureSlots)
                 {
                     const uint32_t slot = entry & 31;
-                    const bool cube = entry & kCubeSlot;
+                    const uint32_t kind = entry & (kCubeSlot | kVolumeSlot);
                     const uint32_t* fetch = &fetchConstants[slot * 6];
                     SlotMemo& memo = slotMemos[slot];
-                    if (memo.epoch != epoch || memo.cube != cube || std::memcmp(memo.fetch, fetch, sizeof(memo.fetch)) != 0)
+                    if (memo.epoch != epoch || memo.kind != kind || std::memcmp(memo.fetch, fetch, sizeof(memo.fetch)) != 0)
                     {
-                        memo.texture = TextureFor(fetch, cube);
+                        memo.texture = kind == kVolumeSlot ? VolumeFor(fetch) : TextureFor(fetch, kind == kCubeSlot);
                         memo.sampler = SamplerFor(fetch);
                         std::memcpy(memo.fetch, fetch, sizeof(memo.fetch));
                         memo.epoch = epoch;
-                        memo.cube = cube;
+                        memo.kind = kind;
                     }
                     static const bool traceDepth = Trace();
                     if (traceDepth)
