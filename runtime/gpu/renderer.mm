@@ -4,10 +4,13 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
+#include <mutex>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -187,11 +190,48 @@ namespace gpu
             id<MTLCommandBuffer> commands;
             id<MTLRenderCommandEncoder> encoder;
 
-            std::unordered_map<uint64_t, id<MTLFunction>> functions;
-            std::unordered_map<uint64_t, bool> failedShaders;
-            std::unordered_map<uint64_t, std::vector<uint32_t>> textureSlots; // texturas de cada shader
+            // Shaders y pipelines se compilan en segundo plano: traducir y compilar un shader nuevo
+            // cuesta ~100 ms, y en carrera aparecen sin parar. Mientras tanto se saltan los dibujos que
+            // los usan (aparecen unos fotogramas más tarde) en vez de detener el juego.
+            // PROSTREET_SYNC_SHADERS=1: se compilan en el acto (p. ej. para comparar capturas).
+            struct CompiledShader
+            {
+                id<MTLFunction> function; // nil si no compila
+                std::vector<uint32_t> slots; // texturas que lee (con kCubeSlot si es un cubo)
+                std::vector<std::pair<uint32_t, uint32_t>> constantRanges;
+            };
+            // Lo que hace falta para crear un pipeline (copiado del dibujo que lo pide).
+            struct PipelineRequest
+            {
+                uint64_t key;
+                Shader vertex, pixel;
+                uint32_t blend, mask, samples;
+                bool depthOnly, alphaToCoverage;
+                MTLPixelFormat colorFormat;
+            };
+            struct CompiledPipeline
+            {
+                uint64_t key;
+                id<MTLRenderPipelineState> state; // nil si algún shader no compila
+                uint64_t vertexHash, pixelHash;
+                std::vector<uint32_t> slots;
+                std::vector<std::pair<uint32_t, uint32_t>> vertexRanges, pixelRanges;
+            };
+            struct ReadyPipeline
+            {
+                id<MTLRenderPipelineState> state;
+                std::vector<uint32_t> slots;
+            };
+            const bool syncShaders = std::getenv("PROSTREET_SYNC_SHADERS") != nullptr;
+            // Del hilo de la GPU:
+            std::unordered_map<uint64_t, ReadyPipeline> pipelines;
+            std::unordered_set<uint64_t> pendingPipelines;
             std::unordered_map<uint64_t, std::vector<std::pair<uint32_t, uint32_t>>> constantRanges; // de cada shader
-            std::unordered_map<uint64_t, id<MTLRenderPipelineState>> pipelines;
+            // Compartido con los hilos de compilación (con compileLock):
+            std::mutex compileLock;
+            std::unordered_map<uint64_t, std::shared_ptr<const CompiledShader>> compiledShaders;
+            std::vector<CompiledPipeline> finishedPipelines;
+            std::atomic<bool> pipelinesFinished{ false };
             std::unordered_map<uint64_t, Texture> textures;
             std::vector<ResolvedSurface> surfaces;
             std::unordered_map<uint32_t, SurfaceCube> surfaceCubes;
@@ -380,40 +420,100 @@ namespace gpu
                 return memory != nil && sets[0].color != nil;
             }
 
-            id<MTLFunction> Function(const Shader& shader, bool pixel, std::vector<uint32_t>* slots)
+            // En un hilo de compilación. Un shader que usan varios pipelines se compila una vez (salvo
+            // si dos lo piden a la vez: entonces se queda el primero).
+            std::shared_ptr<const CompiledShader> CompileShader(bool pixel, const Shader& shader)
             {
-                auto it = functions.find(shader.hash);
-                if (it != functions.end())
                 {
-                    if (slots)
-                        *slots = textureSlots[shader.hash];
-                    return it->second;
+                    std::lock_guard lock(compileLock);
+                    auto it = compiledShaders.find(shader.hash);
+                    if (it != compiledShaders.end())
+                        return it->second;
                 }
-                if (failedShaders.count(shader.hash))
-                    return nil;
-
+                auto compiled = std::make_shared<CompiledShader>();
                 TranslatedShader translated = TranslateShader(pixel, shader.code, shader.hash);
                 NSError* error = nil;
                 id<MTLLibrary> library = [device newLibraryWithSource:[NSString stringWithUTF8String:translated.source.c_str()] options:nil error:&error];
-                id<MTLFunction> function = [library newFunctionWithName:[NSString stringWithUTF8String:translated.entry.c_str()]];
-                if (!function)
-                {
+                compiled->function = [library newFunctionWithName:[NSString stringWithUTF8String:translated.entry.c_str()]];
+                if (!compiled->function)
                     std::fprintf(stderr, "[render] no compila %s: %s\n", translated.entry.c_str(), error ? error.localizedDescription.UTF8String : "?");
-                    failedShaders[shader.hash] = true;
-                    return nil;
-                }
-                if (!translated.warnings.empty())
+                else if (!translated.warnings.empty())
                     std::fprintf(stderr, "[render] %s: %s\n", translated.entry.c_str(), translated.warnings.c_str());
-                std::vector<uint32_t> shaderSlots = translated.textures;
-                for (uint32_t& slot : shaderSlots)
+                compiled->slots = translated.textures;
+                for (uint32_t& slot : compiled->slots)
                     if (std::find(translated.cubeTextures.begin(), translated.cubeTextures.end(), slot) != translated.cubeTextures.end())
                         slot |= kCubeSlot;
-                functions[shader.hash] = function;
-                textureSlots[shader.hash] = shaderSlots;
-                constantRanges[shader.hash] = translated.constantRanges;
-                if (slots)
-                    *slots = shaderSlots;
-                return function;
+                compiled->constantRanges = translated.constantRanges;
+                std::lock_guard lock(compileLock);
+                return compiledShaders.emplace(shader.hash, std::move(compiled)).first->second;
+            }
+
+            // En un hilo de compilación: los dos shaders y el pipeline. El resultado lo recoge el hilo
+            // de la GPU (CollectPipelines).
+            void BuildPipeline(const PipelineRequest& request)
+            {
+                @autoreleasepool
+                {
+                    static const bool trace = Trace();
+                    const auto start = std::chrono::steady_clock::now();
+                    const auto vertex = CompileShader(false, request.vertex), pixel = CompileShader(true, request.pixel);
+                    CompiledPipeline result{ request.key, nil, request.vertex.hash, request.pixel.hash, pixel->slots,
+                                             vertex->constantRanges, pixel->constantRanges };
+                    if (vertex->function && pixel->function)
+                    {
+                        MTLRenderPipelineDescriptor* descriptor = [[MTLRenderPipelineDescriptor alloc] init];
+                        descriptor.vertexFunction = vertex->function;
+                        descriptor.fragmentFunction = pixel->function;
+                        MTLRenderPipelineColorAttachmentDescriptor* color = descriptor.colorAttachments[0];
+                        color.pixelFormat = request.colorFormat;
+                        descriptor.rasterSampleCount = request.samples;
+                        descriptor.alphaToCoverageEnabled = request.alphaToCoverage;
+                        descriptor.depthAttachmentPixelFormat = kDepthFormat;
+                        descriptor.stencilAttachmentPixelFormat = kDepthFormat;
+                        const uint32_t mask = request.mask, blend = request.blend;
+                        color.writeMask = request.depthOnly ? MTLColorWriteMaskNone : (mask & 1 ? MTLColorWriteMaskRed : 0) | (mask & 2 ? MTLColorWriteMaskGreen : 0) |
+                                          (mask & 4 ? MTLColorWriteMaskBlue : 0) | (mask & 8 ? MTLColorWriteMaskAlpha : 0);
+                        // RB_BLENDCONTROL: srcblend 0-4, comb 5-7, destblend 8-12, y lo mismo para alfa desde el bit 16.
+                        const bool opaque = (blend & 0x1FFF) == 0x0001 && ((blend >> 16) & 0x1FFF) == 0x0001;
+                        color.blendingEnabled = !opaque;
+                        color.sourceRGBBlendFactor = BlendFactor(blend & 0x1F);
+                        color.rgbBlendOperation = BlendOperation((blend >> 5) & 7);
+                        color.destinationRGBBlendFactor = BlendFactor((blend >> 8) & 0x1F);
+                        color.sourceAlphaBlendFactor = BlendFactor((blend >> 16) & 0x1F);
+                        color.alphaBlendOperation = BlendOperation((blend >> 21) & 7);
+                        color.destinationAlphaBlendFactor = BlendFactor((blend >> 24) & 0x1F);
+                        NSError* error = nil;
+                        result.state = [device newRenderPipelineStateWithDescriptor:descriptor error:&error];
+                        if (!result.state)
+                            std::fprintf(stderr, "[render] pipeline: %s\n", error.localizedDescription.UTF8String);
+                    }
+                    if (trace)
+                        std::fprintf(stderr, "[render] pipeline vs_%016llx + ps_%016llx en %.0f ms\n", (unsigned long long)request.vertex.hash,
+                            (unsigned long long)request.pixel.hash, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+                    std::lock_guard lock(compileLock);
+                    finishedPipelines.push_back(std::move(result));
+                    pipelinesFinished.store(true, std::memory_order_release);
+                }
+            }
+
+            // Pasa al hilo de la GPU los pipelines terminados.
+            void CollectPipelines()
+            {
+                if (!pipelinesFinished.load(std::memory_order_acquire))
+                    return;
+                std::vector<CompiledPipeline> finished;
+                {
+                    std::lock_guard lock(compileLock);
+                    finished.swap(finishedPipelines);
+                    pipelinesFinished.store(false, std::memory_order_relaxed);
+                }
+                for (CompiledPipeline& result : finished)
+                {
+                    pendingPipelines.erase(result.key);
+                    constantRanges[result.vertexHash] = std::move(result.vertexRanges);
+                    constantRanges[result.pixelHash] = std::move(result.pixelRanges);
+                    pipelines[result.key] = { result.state, std::move(result.slots) };
+                }
             }
 
             static MTLBlendFactor BlendFactor(uint32_t value)
@@ -469,46 +569,38 @@ namespace gpu
                     return lastPipeline;
                 }
 
-                id<MTLFunction> vertex = Function(*draw.vertexShader, false, nullptr);
-                id<MTLFunction> fragment = Function(*draw.pixelShader, true, &slots);
-                if (!vertex || !fragment)
-                    return nil;
+                CollectPipelines();
                 auto it = pipelines.find(key);
-                if (it != pipelines.end())
+                if (it == pipelines.end())
                 {
-                    lastPipelineKey = key;
-                    lastPipeline = it->second;
-                    lastPipelineSlots = slots;
-                    return it->second;
+                    // Nuevo: se pide (una vez) y este dibujo se salta.
+                    if (pendingPipelines.insert(key).second)
+                    {
+                        auto request = std::make_shared<PipelineRequest>(PipelineRequest{ key, *draw.vertexShader, *draw.pixelShader,
+                            blend, mask, set.samples, draw.depthOnly, alphaToCoverage, set.color.pixelFormat });
+                        if (syncShaders)
+                        {
+                            BuildPipeline(*request);
+                            CollectPipelines();
+                            it = pipelines.find(key);
+                        }
+                        else
+                        {
+                            dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                                BuildPipeline(*request);
+                            });
+                        }
+                    }
+                    if (it == pipelines.end())
+                        return nil;
                 }
-
-                MTLRenderPipelineDescriptor* descriptor = [[MTLRenderPipelineDescriptor alloc] init];
-                descriptor.vertexFunction = vertex;
-                descriptor.fragmentFunction = fragment;
-                MTLRenderPipelineColorAttachmentDescriptor* color = descriptor.colorAttachments[0];
-                color.pixelFormat = set.color.pixelFormat;
-                descriptor.rasterSampleCount = set.samples;
-                descriptor.alphaToCoverageEnabled = alphaToCoverage;
-                descriptor.depthAttachmentPixelFormat = kDepthFormat;
-                descriptor.stencilAttachmentPixelFormat = kDepthFormat;
-                color.writeMask = draw.depthOnly ? MTLColorWriteMaskNone : (mask & 1 ? MTLColorWriteMaskRed : 0) | (mask & 2 ? MTLColorWriteMaskGreen : 0) |
-                                  (mask & 4 ? MTLColorWriteMaskBlue : 0) | (mask & 8 ? MTLColorWriteMaskAlpha : 0);
-                // RB_BLENDCONTROL: srcblend 0-4, comb 5-7, destblend 8-12, y lo mismo para alfa desde el bit 16.
-                const bool opaque = (blend & 0x1FFF) == 0x0001 && ((blend >> 16) & 0x1FFF) == 0x0001;
-                color.blendingEnabled = !opaque;
-                color.sourceRGBBlendFactor = BlendFactor(blend & 0x1F);
-                color.rgbBlendOperation = BlendOperation((blend >> 5) & 7);
-                color.destinationRGBBlendFactor = BlendFactor((blend >> 8) & 0x1F);
-                color.sourceAlphaBlendFactor = BlendFactor((blend >> 16) & 0x1F);
-                color.alphaBlendOperation = BlendOperation((blend >> 21) & 7);
-                color.destinationAlphaBlendFactor = BlendFactor((blend >> 24) & 0x1F);
-
-                NSError* error = nil;
-                id<MTLRenderPipelineState> pipeline = [device newRenderPipelineStateWithDescriptor:descriptor error:&error];
-                if (!pipeline)
-                    std::fprintf(stderr, "[render] pipeline: %s\n", error.localizedDescription.UTF8String);
-                pipelines[key] = pipeline;
-                return pipeline;
+                if (!it->second.state)
+                    return nil;
+                lastPipelineKey = key;
+                lastPipeline = it->second.state;
+                lastPipelineSlots = it->second.slots;
+                slots = it->second.slots;
+                return lastPipeline;
             }
 
             // Prueba de profundidad y stencil (RB_DEPTHCONTROL). Las funciones de comparación y las
