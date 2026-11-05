@@ -17,3 +17,6 @@ runtime/build/
 runtime/generated/
 data/
 analysis/shaders/
+
+# App generada por tools/make_app.sh (puede llevar un icono del juego).
+ProStreet.app/

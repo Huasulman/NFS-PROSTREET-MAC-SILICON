@@ -1,5 +1,6 @@
 #include "shader_translator.h"
 
+#include <cmath>
 #include <cstdio>
 #include <set>
 #include <sstream>
@@ -16,7 +17,44 @@ struct DrawState
 {
     uint primitive; uint indexSize; uint indexBase; uint indexEndian; uint indexOffset; uint vte;
     float viewportScale[4]; float viewportOffset[4]; float targetSize[2]; float windowOffset[2]; uint bools[8];
+    uint alphaTest; float alphaRef; float pointSize[2]; float pointMinMax[2];
 };
+
+// Prueba alfa de Xenos (fija, no del shader). Las funciones van en el orden de las de profundidad.
+// Alpha-to-mask sin MSAA: cubre el píxel si alfa >= 0,5.
+inline bool alpha_test_fails(constant DrawState& st, float alpha)
+{
+    if (st.alphaTest & 16)
+    {
+        if (alpha < 0.5f)
+            return true;
+    }
+    if (!(st.alphaTest & 8))
+        return false;
+    float ref = st.alphaRef;
+    switch (st.alphaTest & 7)
+    {
+    case 0: return true;
+    case 1: return !(alpha < ref);
+    case 2: return !(alpha == ref);
+    case 3: return !(alpha <= ref);
+    case 4: return !(alpha > ref);
+    case 5: return !(alpha != ref);
+    case 6: return !(alpha >= ref);
+    default: return false;
+    }
+}
+
+// Tamaño de la textura según su constante de fetch (13 + 13 bits en 2D; 11 + 11 en 3D). Es el que
+// usan las coordenadas sin normalizar: la textura de Metal puede ser mayor (resolves a la escala de
+// resolución).
+inline float2 fetch_size(constant uint* fc, uint constant_index)
+{
+    uint size = fc[constant_index * 6 + 2];
+    if (((fc[constant_index * 6 + 5] >> 9) & 3) == 2)
+        return float2((size & 0x7FF) + 1, ((size >> 11) & 0x7FF) + 1);
+    return float2((size & 0x1FFF) + 1, ((size >> 13) & 0x1FFF) + 1);
+}
 
 struct VSOut
 {
@@ -114,6 +152,32 @@ float4 fetch_swizzle(float4 v, uint swizzle)
     return r;
 }
 
+// Dirección de un mapa cúbico a partir de lo que deja CUBEv (y el shader): SC y TC en 1...2 y la
+// cara en z (como Xenia, al revés que la instrucción de la ALU).
+float3 cube_direction(float3 coordinates)
+{
+    float s = coordinates.x * 2.0f - 3.0f, t = coordinates.y * 2.0f - 3.0f;
+    uint face = uint(clamp(floor(coordinates.z), 0.0f, 5.0f));
+    bool negative = face & 1;
+    switch (face >> 1)
+    {
+    case 0: return float3(negative ? -1.0f : 1.0f, -t, negative ? s : -s);
+    case 1: return float3(s, negative ? -1.0f : 1.0f, negative ? -t : t);
+    default: return float3(negative ? -s : s, -t, negative ? -1.0f : 1.0f);
+    }
+}
+
+// CUBEv: con src1 = dirección.z_xy da (TC, SC, 2 * eje mayor, cara).
+float4 cube_vector(float4 s1)
+{
+    float x = s1.z, y = s1.w, z = s1.x;
+    if (abs(z) >= abs(x) && abs(z) >= abs(y))
+        return float4(-y, z < 0.0f ? -x : x, 2.0f * z, z < 0.0f ? 5.0f : 4.0f);
+    if (abs(y) >= abs(x))
+        return float4(y < 0.0f ? -z : z, x, 2.0f * y, y < 0.0f ? 3.0f : 2.0f);
+    return float4(-y, x < 0.0f ? z : -z, 2.0f * x, x < 0.0f ? 1.0f : 0.0f);
+}
+
 inline bool bool_constant(constant DrawState& st, uint index) { return (st.bools[index >> 5] >> (index & 31)) & 1; }
 )MSL";
 
@@ -142,6 +206,8 @@ inline bool bool_constant(constant DrawState& st, uint index) { return (st.bools
             std::ostringstream out;
             std::ostringstream warnings;
             std::set<uint32_t> textures;
+            std::set<uint32_t> cubeTextures; // de las anteriores, las que se leen como mapa cúbico
+            std::set<uint32_t> volumeTextures; // y las que se leen como textura 3D
             std::set<uint32_t> constants;
             uint32_t lastStride = 0;
             int indent = 1;
@@ -155,8 +221,11 @@ inline bool bool_constant(constant DrawState& st, uint index) { return (st.bools
                 return out;
             }
 
-            // Operando de la ALU: registro temporal (con valor absoluto opcional) o constante.
-            std::string Source(uint32_t reg, bool temporary, uint32_t swizzle, bool negate)
+            // Operando de la ALU: registro temporal (con valor absoluto opcional, bit 7 del registro) o
+            // constante (con valor absoluto si la instrucción lleva abs_constants).
+            // relative: la constante se indexa con a0 (c[reg + a0]; con aL, que siempre vale 0 al no haber
+            // bucles, queda como absoluta). Entonces puede leer cualquier constante: se suben todas.
+            std::string Source(uint32_t reg, bool temporary, uint32_t swizzle, bool negate, bool absConstants, bool relative = false)
             {
                 std::string name;
                 if (temporary)
@@ -167,8 +236,19 @@ inline bool bool_constant(constant DrawState& st, uint index) { return (st.bools
                 }
                 else
                 {
-                    name = "c[" + std::to_string(reg) + "]";
-                    constants.insert(reg);
+                    if (relative)
+                    {
+                        name = "c[clamp(" + std::to_string(reg) + " + a0, 0, 255)]";
+                        for (uint32_t i = 0; i < 256; i++)
+                            constants.insert(i);
+                    }
+                    else
+                    {
+                        name = "c[" + std::to_string(reg) + "]";
+                        constants.insert(reg);
+                    }
+                    if (absConstants)
+                        name = "fabs(" + name + ")";
                 }
                 return (negate ? "(-" : "(") + name + AluSwizzle(swizzle) + ")";
             }
@@ -181,7 +261,7 @@ inline bool bool_constant(constant DrawState& st, uint index) { return (st.bools
                         return "opos";
                     if (reg < 16)
                         return "o[" + std::to_string(reg) + "]";
-                    return "odiscard"; // 63 (tamaño de punto, etc.): se ignora
+                    return "odiscard"; // 63: x = tamaño de punto (lo demás se ignora)
                 }
                 if (reg < 4)
                     return "oc[" + std::to_string(reg) + "]";
@@ -210,6 +290,15 @@ inline bool bool_constant(constant DrawState& st, uint index) { return (st.bools
                 const bool vectorClamp = Bits(w0, 24, 1), scalarClamp = Bits(w0, 25, 1);
                 const uint32_t reg3 = Bits(w2, 0, 8), swizzle3 = Bits(w1, 0, 8);
                 const bool temporary3 = Bits(w2, 29, 1), negate3 = Bits(w1, 24, 1);
+                const bool absConstants = Bits(w0, 7, 1);
+                // Direccionamiento relativo de constantes (palabra 1): const_0_rel_abs (31) vale para la primera
+                // constante de la instrucción y const_1_rel_abs (30) para las siguientes; el bit 29 dice si es
+                // relativo a a0 (si no, a aL).
+                const bool temporary1 = Bits(w2, 31, 1), temporary2 = Bits(w2, 30, 1);
+                const bool a0Relative = Bits(w1, 29, 1);
+                const bool relative1 = a0Relative && Bits(w1, 31, 1);
+                const bool relative2 = a0Relative && Bits(w1, temporary1 ? 31 : 30, 1);
+                const bool relative3 = a0Relative && Bits(w1, (temporary1 && temporary2) ? 31 : 30, 1);
 
                 const bool predicated = Bits(w1, 28, 1);
                 if (predicated)
@@ -218,9 +307,9 @@ inline bool bool_constant(constant DrawState& st, uint index) { return (st.bools
                 }
                 Line() << "{\n";
                 indent++;
-                Line() << "float4 s1 = " << Source(Bits(w2, 16, 8), Bits(w2, 31, 1), Bits(w1, 16, 8), Bits(w1, 26, 1)) << ";\n";
-                Line() << "float4 s2 = " << Source(Bits(w2, 8, 8), Bits(w2, 30, 1), Bits(w1, 8, 8), Bits(w1, 25, 1)) << ";\n";
-                Line() << "float4 s3 = " << Source(reg3, temporary3, swizzle3, negate3) << ";\n";
+                Line() << "float4 s1 = " << Source(Bits(w2, 16, 8), temporary1, Bits(w1, 16, 8), Bits(w1, 26, 1), absConstants, relative1) << ";\n";
+                Line() << "float4 s2 = " << Source(Bits(w2, 8, 8), temporary2, Bits(w1, 8, 8), Bits(w1, 25, 1), absConstants, relative2) << ";\n";
+                Line() << "float4 s3 = " << Source(reg3, temporary3, swizzle3, negate3, absConstants, relative3) << ";\n";
 
                 // Parte vectorial.
                 std::string v;
@@ -244,6 +333,7 @@ inline bool bool_constant(constant DrawState& st, uint index) { return (st.bools
                 case 15: v = "float4(dot(s1, s2))"; break;
                 case 16: v = "float4(dot(s1.xyz, s2.xyz))"; break;
                 case 17: v = "float4(s1.x * s2.x + s1.y * s2.y + s3.x)"; break;
+                case 18: v = "cube_vector(s1)"; break;
                 case 19: v = "float4(max(max(s1.x, s1.y), max(s1.z, s1.w)))"; break;
                 case 28: v = "float4(1.0f, s1.y * s2.y, s1.z, s2.w)"; break;
                 case 29: // maxa: además fija el registro de direcciones
@@ -272,9 +362,9 @@ inline bool bool_constant(constant DrawState& st, uint index) { return (st.bools
                 }
                 Line() << "float4 vr = " << v << ";\n";
 
-                // Parte escalar: operandos a = src3.(componente 0), b = src3.(componente 1).
-                const std::string a = "s3." + std::string(1, kComponents[0]);
-                const std::string b = "s3." + std::string(1, kComponents[1]);
+                // Parte escalar: operandos a = src3.w y b = src3.x, tras el swizzle (como Xenia).
+                const std::string a = "s3.w";
+                const std::string b = "s3.x";
                 std::string s;
                 switch (scalarOp)
                 {
@@ -328,9 +418,23 @@ inline bool bool_constant(constant DrawState& st, uint index) { return (st.bools
                     // número del temporal sale del código de operación, del bit de selección y de los
                     // bits 2-5 del swizzle (según Xenia). Quedan los bits 0-1 del swizzle para el
                     // componente del temporal y los bits 6-7 para el de la constante.
+                    // La negación de src3 y abs_constants valen para los dos operandos.
                     const uint32_t temp = (scalarOp & 1) | (uint32_t(temporary3) << 1) | (swizzle3 & 0x3C);
-                    const std::string other = "r[" + std::to_string(temp) + "]." + std::string(1, kComponents[AluComponent(swizzle3, 0)]);
-                    Line() << "float sc = c[" << reg3 << "]." << kComponents[AluComponent(swizzle3, 3)] << ";\n";
+                    auto modifiers = [&](const std::string& value) {
+                        const std::string magnitude = absConstants ? "fabs(" + value + ")" : value;
+                        return negate3 ? "(-" + magnitude + ")" : magnitude;
+                    };
+                    const std::string other = modifiers("r[" + std::to_string(temp) + "]." + std::string(1, kComponents[AluComponent(swizzle3, 0)]));
+                    std::string constant = "c[" + std::to_string(reg3) + "]";
+                    if (a0Relative && Bits(w1, 30, 1)) // src3 es la primera constante solo si src1 y src2 son temporales
+                    {
+                        constant = "c[clamp(" + std::to_string(reg3) + " + a0, 0, 255)]";
+                        for (uint32_t i = 0; i < 256; i++)
+                            constants.insert(i);
+                    }
+                    else
+                        constants.insert(reg3);
+                    Line() << "float sc = " << modifiers(constant + "." + kComponents[AluComponent(swizzle3, 3)]) << ";\n";
                     const char* op = scalarOp <= 43 ? " * " : (scalarOp <= 45 ? " + " : " - ");
                     s = std::string("sc") + op + other;
                     break;
@@ -373,6 +477,9 @@ inline bool bool_constant(constant DrawState& st, uint index) { return (st.bools
                 const uint32_t w0 = w[0], w1 = w[1], w2 = w[2];
                 const uint32_t opcode = Bits(w0, 0, 5);
                 const uint32_t source = Bits(w0, 5, 6), dest = Bits(w0, 12, 6);
+                // Predicación (pred_select en la palabra 1, pred_condition en la 2), igual en todos los fetch.
+                if (Bits(w1, 31, 1))
+                    Line() << "if (p == " << (Bits(w2, 31, 1) ? "true" : "false") << ")\n";
                 if (opcode == 0) // vfetch
                 {
                     const uint32_t constant = Bits(w0, 20, 5) * 3 + Bits(w0, 25, 2);
@@ -381,30 +488,66 @@ inline bool bool_constant(constant DrawState& st, uint index) { return (st.bools
                     if (stride == 0)
                         stride = lastStride; // "mini fetch": mismo vértice que la lectura anterior
                     lastStride = stride;
-                    const uint32_t offset = Bits(w2, 8, 22) * 4;
+                    const int32_t offset = (int32_t(Bits(w2, 8, 23) << 9) >> 9) * 4; // en palabras, con signo
+                    const int32_t expAdjust = int32_t(Bits(w1, 24, 6) << 26) >> 26;  // el resultado se multiplica por 2^exp_adjust
                     Line() << "{\n";
                     indent++;
                     Line() << "uint index = uint(int(round(r[" << source << "]." << component << ")));\n";
                     Line() << "uint2 vf = uint2(fc[" << constant * 2 << "], fc[" << constant * 2 + 1 << "]);\n";
-                    Line() << "float4 f = fetch_vertex(mem, (vf.x & 0x1FFFFFFCu) + index * " << stride << "u + " << offset
-                           << "u, vf.y & 3u, " << Bits(w1, 16, 6) << "u, " << (Bits(w1, 14, 1) ? "true" : "false") << ", "
+                    // Bit 12: con signo (format_comp_all); bit 13: entero, sin normalizar (num_format_all).
+                    Line() << "float4 f = fetch_vertex(mem, uint(int((vf.x & 0x1FFFFFFCu) + index * " << stride << "u) + (" << offset
+                           << ")), vf.y & 3u, " << Bits(w1, 16, 6) << "u, " << (Bits(w1, 12, 1) ? "true" : "false") << ", "
                            << (Bits(w1, 13, 1) ? "true" : "false") << ");\n";
+                    if (expAdjust)
+                    {
+                        char scale[32];
+                        std::snprintf(scale, sizeof(scale), "%.9g", std::ldexp(1.0, expAdjust));
+                        Line() << "f *= " << scale << "f;\n";
+                    }
                     WriteFetch(dest, Bits(w1, 0, 12));
                     indent--;
                     Line() << "}\n";
                     return;
                 }
+                const std::string sourceRegister = "r[" + std::to_string(source) + "].";
                 if (opcode == 1) // tfetch
                 {
                     const uint32_t constant = Bits(w0, 20, 5);
                     if (!pixel)
                     {
                         warnings << "lectura de textura en un shader de vértices; ";
+                        Line() << "{}\n";
                         return;
                     }
                     textures.insert(constant);
-                    std::string coordinates = "float2(r[" + std::to_string(source) + "]." + kComponents[Bits(w0, 26, 2)] + ", r[" +
-                                              std::to_string(source) + "]." + kComponents[Bits(w0, 28, 2)] + ")";
+                    std::string coordinates = "float2(" + sourceRegister + kComponents[Bits(w0, 26, 2)] + ", " + sourceRegister +
+                                              kComponents[Bits(w0, 28, 2)] + ")";
+                    // Coordenadas sin normalizar (tx_coord_denorm) y desplazamiento de la instrucción, en medios
+                    // texels (offset_x/y: 5 bits con signo en la palabra 2; los usa, p. ej., el PCF de las sombras).
+                    const int32_t offsetX = int32_t(Bits(w2, 16, 5) << 27) >> 27, offsetY = int32_t(Bits(w2, 21, 5) << 27) >> 27;
+                    const bool unnormalized = Bits(w0, 25, 1);
+                    if (unnormalized || offsetX || offsetY)
+                    {
+                        const std::string size = "fetch_size(fc, " + std::to_string(constant) + ")";
+                        std::string adjusted = coordinates;
+                        if (offsetX || offsetY)
+                            adjusted = "(" + adjusted + " + float2(" + std::to_string(offsetX * 0.5f) + "f, " + std::to_string(offsetY * 0.5f) +
+                                       "f)" + (unnormalized ? ")" : " / " + size + ")");
+                        if (unnormalized)
+                            adjusted = "(" + adjusted + " / " + size + ")";
+                        coordinates = adjusted;
+                    }
+                    if (Bits(w2, 14, 2) == 2) // 3D: la tercera coordenada es la profundidad
+                    {
+                        volumeTextures.insert(constant);
+                        coordinates = "float3(" + coordinates + ", " + sourceRegister + kComponents[Bits(w0, 30, 2)] + ")";
+                    }
+                    if (Bits(w2, 14, 2) == 3) // cubo: SC, TC y cara
+                    {
+                        cubeTextures.insert(constant);
+                        coordinates = "cube_direction(float3(" + sourceRegister + kComponents[Bits(w0, 26, 2)] + ", " +
+                                      sourceRegister + kComponents[Bits(w0, 28, 2)] + ", " + sourceRegister + kComponents[Bits(w0, 30, 2)] + "))";
+                    }
                     Line() << "{\n";
                     indent++;
                     Line() << "float4 f = fetch_swizzle(t" << constant << ".sample(s" << constant << ", " << coordinates
@@ -414,7 +557,26 @@ inline bool bool_constant(constant DrawState& st, uint index) { return (st.bools
                     Line() << "}\n";
                     return;
                 }
+                if (opcode == 18) // getGradients: (ddx(x), ddy(x), ddx(y), ddy(y)) de las coordenadas
+                {
+                    const std::string x = sourceRegister + kComponents[Bits(w0, 26, 2)], y = sourceRegister + kComponents[Bits(w0, 28, 2)];
+                    Line() << "{\n";
+                    indent++;
+                    Line() << "float4 f = float4(dfdx(" << x << "), dfdy(" << x << "), dfdx(" << y << "), dfdy(" << y << "));\n";
+                    WriteFetch(dest, Bits(w1, 0, 12));
+                    indent--;
+                    Line() << "}\n";
+                    return;
+                }
+                // setTextureLod y setTextureGradientsHorz/Vert: las texturas aún no tienen mipmaps, así que
+                // el nivel que fijan no cambia nada.
+                if (opcode == 24 || opcode == 25 || opcode == 26)
+                {
+                    Line() << "{}\n";
+                    return;
+                }
                 warnings << "fetch " << opcode << " no soportado; ";
+                Line() << "{}\n";
             }
 
             bool Translate(uint64_t hash, std::string& entry)
@@ -491,7 +653,7 @@ inline bool bool_constant(constant DrawState& st, uint index) { return (st.bools
                     // El shader del juego va en una función aparte (<entrada>_run): las listas de
                     // rectángulos necesitan ejecutarlo para tres vértices y deducir el cuarto.
                     out << "static VSOut " << entry << "_run(uint index, device const uint* mem, constant float4* c,\n"
-                        << "    constant uint* fc, constant DrawState& st)\n{\n";
+                        << "    constant uint* fc, constant DrawState& st, thread float& pointSize)\n{\n";
                     out << R"MSL(    if (st.indexSize == 2)
     {
         uint address = st.indexBase + index * 2;
@@ -531,6 +693,8 @@ inline bool bool_constant(constant DrawState& st, uint index) { return (st.bools
     window.xy += float2(st.windowOffset[0], st.windowOffset[1]); // PA_SC_WINDOW_OFFSET (tiling)
     float2 clip = float2(window.x / st.targetSize[0] * 2.0f - 1.0f, 1.0f - window.y / st.targetSize[1] * 2.0f);
 
+    pointSize = odiscard.x;
+
     VSOut result;
     result.position = float4(clip * wOut, window.z * wOut, wOut);
     result.i0 = o[0]; result.i1 = o[1]; result.i2 = o[2]; result.i3 = o[3];
@@ -542,23 +706,29 @@ inline bool bool_constant(constant DrawState& st, uint index) { return (st.bools
 )MSL";
                     out << "vertex VSOut " << entry << "(uint vid [[vertex_id]], device const uint* mem [[buffer(0)]],\n"
                         << "    constant float4* c [[buffer(1)]], constant uint* fc [[buffer(2)]], constant DrawState& st [[buffer(3)]])\n{\n";
-                    out << R"MSL(    // Listas de quads: dos triángulos por quad (0 1 2, 0 2 3).
-    if (st.primitive == 13)
+                    out << R"MSL(    // Qué vértice del juego toca a este vértice de Metal. El shader del juego se llama desde un
+    // solo sitio (y otro para las listas de rectángulos): cada llamada lo copia entero al compilar.
+    uint index = vid;
+    if (st.primitive == 13) // listas de quads: dos triángulos por quad (0 1 2, 0 2 3)
     {
         const uint corners[6] = { 0, 1, 2, 0, 2, 3 };
-        return )MSL" << entry << R"MSL(_run((vid / 6) * 4 + corners[vid % 6], mem, c, fc, st);
+        index = (vid / 6) * 4 + corners[vid % 6];
     }
-    // Listas de rectángulos: 3 esquinas por rectángulo. El primer triángulo son las tres; el
-    // segundo usa la cuarta, P + Q - R, donde R es la esquina en ángulo recto (la opuesta al
-    // lado más largo), para la posición y para todos los interpolantes.
-    if (st.primitive == 8)
+    else if (st.primitive == 5) // abanicos: (0, k + 1, k + 2)
+        index = vid % 3 == 0 ? 0 : vid / 3 + vid % 3;
+    else if (st.primitive == 1) // listas de puntos: un cuadrado (dos triángulos) por punto
+        index = vid / 6;
+    else if (st.primitive == 8 && vid % 6 < 3) // listas de rectángulos: el primer triángulo son las 3 esquinas
+        index = (vid / 6) * 3 + vid % 6;
+    else if (st.primitive == 8)
     {
+        // El segundo usa la cuarta, P + Q - R, donde R es la esquina en ángulo recto (la opuesta al
+        // lado más largo), para la posición y para todos los interpolantes.
         uint rect = vid / 6, k = vid % 6;
-        if (k < 3)
-            return )MSL" << entry << R"MSL(_run(rect * 3 + k, mem, c, fc, st);
         VSOut v[3];
+        float unused;
         for (uint i = 0; i < 3; i++)
-            v[i] = )MSL" << entry << R"MSL(_run(rect * 3 + i, mem, c, fc, st);
+            v[i] = )MSL" << entry << R"MSL(_run(rect * 3 + i, mem, c, fc, st, unused);
         float2 p0 = v[0].position.xy / v[0].position.w, p1 = v[1].position.xy / v[1].position.w,
                p2 = v[2].position.xy / v[2].position.w;
         float d01 = distance_squared(p0, p1), d12 = distance_squared(p1, p2), d02 = distance_squared(p0, p2);
@@ -578,7 +748,19 @@ inline bool bool_constant(constant DrawState& st, uint index) { return (st.bools
         result.i14 = v[a].i14 + v[b].i14 - v[r].i14; result.i15 = v[a].i15 + v[b].i15 - v[r].i15;
         return result;
     }
-    return )MSL" << entry << R"MSL(_run(vid, mem, c, fc, st);
+
+    float pointSize;
+    VSOut v = )MSL" << entry << R"MSL(_run(index, mem, c, fc, st, pointSize);
+    if (st.primitive == 1)
+    {
+        // Del tamaño que exporta el shader (limitado por PA_SU_POINT_MINMAX) o, si no exporta
+        // ninguno, el de PA_SU_POINT_SIZE.
+        const float2 corners[6] = { float2(-1, -1), float2(1, -1), float2(1, 1), float2(-1, -1), float2(1, 1), float2(-1, 1) };
+        float2 size = pointSize > 0.0f ? float2(clamp(pointSize, st.pointMinMax[0], st.pointMinMax[1]))
+                                       : float2(st.pointSize[0], st.pointSize[1]);
+        v.position.xy += corners[vid % 6] * size / float2(st.targetSize[0], st.targetSize[1]) * v.position.w;
+    }
+    return v;
 }
 )MSL";
                 }
@@ -587,7 +769,7 @@ inline bool bool_constant(constant DrawState& st, uint index) { return (st.bools
                     out << "fragment float4 " << entry << "(VSOut in [[stage_in]], device const uint* mem [[buffer(0)]],\n"
                         << "    constant float4* c [[buffer(1)]], constant uint* fc [[buffer(2)]], constant DrawState& st [[buffer(3)]]";
                     for (uint32_t t : textures)
-                        out << ",\n    texture2d<float> t" << t << " [[texture(" << t << ")]], sampler s" << t << " [[sampler(" << t << ")]]";
+                        out << ",\n    " << (cubeTextures.count(t) ? "texturecube" : volumeTextures.count(t) ? "texture3d" : "texture2d") << "<float> t" << t << " [[texture(" << t << ")]], sampler s" << t << " [[sampler(" << t << ")]]";
                     out << ")\n{\n";
                     out << R"MSL(    float4 r[64];
     for (int i = 0; i < 64; i++) r[i] = float4(0);
@@ -601,6 +783,7 @@ inline bool bool_constant(constant DrawState& st, uint index) { return (st.bools
     int a0 = 0;
 )MSL";
                     out << body.str();
+                    out << "    if (alpha_test_fails(st, oc[0].w)) discard_fragment();\n";
                     out << "    return oc[0];\n}\n";
                 }
                 return true;
@@ -618,6 +801,8 @@ inline bool bool_constant(constant DrawState& st, uint index) { return (st.bools
         result.source = std::string(kPrelude) + "\n" + translator.out.str();
         result.warnings = translator.warnings.str();
         result.textures.assign(translator.textures.begin(), translator.textures.end());
+        result.cubeTextures.assign(translator.cubeTextures.begin(), translator.cubeTextures.end());
+        result.volumeTextures.assign(translator.volumeTextures.begin(), translator.volumeTextures.end());
         for (uint32_t reg : translator.constants)
         {
             auto& ranges = result.constantRanges;

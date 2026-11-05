@@ -181,3 +181,35 @@ PPC_FUNC(__imp__VdGetCurrentDisplayInformation)
     memory::Write16(info + 0, kDisplayWidth);
     memory::Write16(info + 2, kDisplayHeight);
 }
+
+// Llamadas de configuración de la pantalla y del procesador de comandos del sistema que no
+// cambian nada aquí: el modo de vídeo es fijo (720p) y el front buffer llega por VdSwap.
+
+// void VdSetSystemCommandBufferGpuIdentifierAddress(void* address)
+PPC_FUNC(__imp__VdSetSystemCommandBufferGpuIdentifierAddress)
+{
+    (void)base;
+}
+
+// uint32_t VdCallGraphicsNotificationRoutines(uint32_t unknown, ...)
+PPC_FUNC(__imp__VdCallGraphicsNotificationRoutines)
+{
+    (void)base;
+    ctx.r3.u64 = 0;
+}
+
+// uint32_t VdSetDisplayMode(uint32_t mode)
+PPC_FUNC(__imp__VdSetDisplayMode)
+{
+    (void)base;
+    ctx.r3.u64 = 0;
+}
+
+// void VdPersistDisplay(uint32_t unknown, uint32_t* physicalAddress): sin imagen que conservar
+// entre títulos (0 = nada que liberar después con MmFreePhysicalMemory).
+PPC_FUNC(__imp__VdPersistDisplay)
+{
+    (void)base;
+    if (ctx.r4.u32)
+        memory::Write32(ctx.r4.u32, 0);
+}

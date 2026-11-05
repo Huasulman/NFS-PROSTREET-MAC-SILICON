@@ -121,7 +121,8 @@ def disassemble_fetch(words):
                 f"vf{const_index * 3 + const_select} (formato {fmt}, {signed} {normalized}, "
                 f"stride {stride * 4} B, offset {offset * 4} B)")
     source_swizzle = "".join(COMPONENTS[bits(w0, 26 + i * 2, 2)] for i in range(3))
-    return f"{name} r{dest}.{destination_swizzle(bits(w1, 0, 12))}, r{source}.{source_swizzle}, tf{const_index}"
+    dimension = {0: " (1D)", 2: " (3D)", 3: " (cubo)"}.get(bits(w2, 14, 2), "") if opcode == 1 else ""
+    return f"{name} r{dest}.{destination_swizzle(bits(w1, 0, 12))}, r{source}.{source_swizzle}, tf{const_index}{dimension}"
 
 
 def disassemble(path):

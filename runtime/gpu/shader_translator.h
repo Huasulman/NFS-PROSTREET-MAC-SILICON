@@ -22,6 +22,8 @@ namespace gpu
         std::string entry;            // nombre de la función
         std::string warnings;         // instrucciones no soportadas, etc.
         std::vector<uint32_t> textures; // constantes de fetch de textura que usa
+        std::vector<uint32_t> cubeTextures; // de ellas, las que lee como mapa cúbico (texturecube)
+        std::vector<uint32_t> volumeTextures; // y las que lee como textura 3D (texture3d)
         // Constantes ALU que usa, como rangos (primera, cuántas) en orden; los huecos pequeños se
         // incluyen para que haya pocos rangos.
         std::vector<std::pair<uint32_t, uint32_t>> constantRanges;
@@ -43,5 +45,9 @@ namespace gpu
         float targetSize[2];    // tamaño del destino de dibujo, en píxeles
         float windowOffset[2];  // PA_SC_WINDOW_OFFSET si PA_SU_SC_MODE_CNTL lo activa
         uint32_t bools[8];      // constantes booleanas (256 bits)
+        uint32_t alphaTest;     // RB_COLORCONTROL: función 0-2, prueba activa 3, alpha-to-mask 4
+        float alphaRef;         // RB_ALPHA_REF
+        float pointSize[2];     // PA_SU_POINT_SIZE (ancho, alto), en píxeles
+        float pointMinMax[2];   // PA_SU_POINT_MINMAX: límites del tamaño que exporta el shader
     };
 }

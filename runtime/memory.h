@@ -33,6 +33,20 @@ namespace memory
     }
 
     inline void* Translate(uint32_t address) { return Base() + address; }
+
+    // Vigilancia de escrituras en la memoria física (para saber si una textura ha cambiado sin
+    // mirar su memoria): Watch deja de solo lectura las páginas (16 KB) de [physical, physical + size)
+    // en las dos vistas; la primera escritura en una de ellas la vuelve a abrir y la marca como
+    // cambiada (HandleWriteFault, desde el manejador de SIGBUS/SIGSEGV). Las direcciones son
+    // físicas (0 .. 512 MB).
+    void Watch(uint32_t physical, uint32_t size);
+    // ¿Siguen vigiladas (sin escrituras) todas las páginas del rango?
+    bool Unchanged(uint32_t physical, uint32_t size);
+    // Antes de que el sistema escriba en la memoria del juego (p. ej. pread): con la página
+    // protegida fallaría sin señal. Admite cualquier dirección del invitado.
+    void PrepareHostWrite(uint32_t guest, uint32_t size);
+    // Para el manejador de señales: si la dirección es de una página vigilada, la abre y devuelve true.
+    bool HandleWriteFault(const void* host);
     inline bool Contains(const void* host)
     {
         const auto* p = static_cast<const uint8_t*>(host);

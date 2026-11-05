@@ -15,6 +15,7 @@
 #include "input.h"
 #include "window.h"
 #include "../gpu/presenter.h"
+#include "../gpu/renderer.h"
 
 namespace gpu
 {
@@ -119,8 +120,78 @@ namespace gpu
 
 @implementation ProStreetDelegate
 
+// Escalas de resolución del menú Gráficos (la etiqueta de cada opción es su número).
+static const float kScales[] = { 1.0f, 1.5f };
+static NSString* const kScaleDefault = @"ResolutionScale";
+static NSString* const kMsaaDefault = @"Antialiasing";
+
+// Barra de menús: la aplicación (ocultar, salir) y Gráficos (resolución, pantalla completa).
+- (void)buildMenu
+{
+    NSMenu* bar = [[NSMenu alloc] init];
+
+    NSMenuItem* appItem = [bar addItemWithTitle:@"" action:nil keyEquivalent:@""];
+    NSMenu* appMenu = [[NSMenu alloc] init];
+    [appMenu addItemWithTitle:@"Ocultar ProStreet" action:@selector(hide:) keyEquivalent:@"h"];
+    [appMenu addItem:[NSMenuItem separatorItem]];
+    [appMenu addItemWithTitle:@"Salir de ProStreet" action:@selector(terminate:) keyEquivalent:@"q"];
+    appItem.submenu = appMenu;
+
+    NSMenuItem* graphicsItem = [bar addItemWithTitle:@"Gráficos" action:nil keyEquivalent:@""];
+    NSMenu* graphics = [[NSMenu alloc] initWithTitle:@"Gráficos"];
+    NSArray<NSString*>* titles = @[ @"Resolución 1x (1280 × 720)", @"Resolución 1,5x (1920 × 1080)" ];
+    for (NSUInteger i = 0; i < titles.count; i++)
+    {
+        NSMenuItem* item = [graphics addItemWithTitle:titles[i] action:@selector(chooseScale:)
+            keyEquivalent:[NSString stringWithFormat:@"%lu", (unsigned long)i + 1]];
+        item.target = self;
+        item.tag = NSInteger(i);
+    }
+    [graphics addItem:[NSMenuItem separatorItem]];
+    NSMenuItem* msaa = [graphics addItemWithTitle:@"Antialiasing (MSAA 4x)" action:@selector(toggleAntialiasing:) keyEquivalent:@"a"];
+    msaa.keyEquivalentModifierMask = NSEventModifierFlagCommand | NSEventModifierFlagOption;
+    msaa.target = self;
+    [graphics addItem:[NSMenuItem separatorItem]];
+    NSMenuItem* fullScreen = [graphics addItemWithTitle:@"Pantalla completa" action:@selector(toggleFullScreen:) keyEquivalent:@"f"];
+    fullScreen.keyEquivalentModifierMask = NSEventModifierFlagCommand | NSEventModifierFlagControl;
+    graphicsItem.submenu = graphics;
+
+    NSApp.mainMenu = bar;
+}
+
+- (void)chooseScale:(NSMenuItem*)sender
+{
+    const float scale = kScales[sender.tag];
+    gpu::SetResolutionScale(scale);
+    [NSUserDefaults.standardUserDefaults setFloat:scale forKey:kScaleDefault];
+}
+
+- (void)toggleAntialiasing:(NSMenuItem*)sender
+{
+    const bool enabled = !gpu::Antialiasing();
+    gpu::SetAntialiasing(enabled);
+    [NSUserDefaults.standardUserDefaults setBool:enabled forKey:kMsaaDefault];
+}
+
+// Marca la escala y el antialiasing en uso.
+- (BOOL)validateMenuItem:(NSMenuItem*)item
+{
+    if (item.action == @selector(chooseScale:))
+        item.state = kScales[item.tag] == gpu::ResolutionScale() ? NSControlStateValueOn : NSControlStateValueOff;
+    if (item.action == @selector(toggleAntialiasing:))
+        item.state = gpu::Antialiasing() ? NSControlStateValueOn : NSControlStateValueOff;
+    return YES;
+}
+
 - (void)applicationDidFinishLaunching:(NSNotification*)notification
 {
+    // La escala y el antialiasing elegidos la última vez (las variables de entorno mandan).
+    if (!std::getenv("PROSTREET_SCALE") && [NSUserDefaults.standardUserDefaults objectForKey:kScaleDefault])
+        gpu::SetResolutionScale([NSUserDefaults.standardUserDefaults floatForKey:kScaleDefault]);
+    if (!std::getenv("PROSTREET_NO_MSAA") && [NSUserDefaults.standardUserDefaults objectForKey:kMsaaDefault])
+        gpu::SetAntialiasing([NSUserDefaults.standardUserDefaults boolForKey:kMsaaDefault]);
+    [self buildMenu];
+
     const NSRect frame = NSMakeRect(0, 0, 1280, 720);
     self.window = [[NSWindow alloc] initWithContentRect:frame
         styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable

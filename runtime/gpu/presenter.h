@@ -23,5 +23,20 @@ namespace gpu
 
     // Dirección (en bytes) del píxel (x, y) en una superficie 2D en mosaico de Xenos.
     // `pitch` en píxeles (múltiplo de 32), `log2Bpp` = log2(bytes por píxel).
-    uint32_t TiledOffset(uint32_t x, uint32_t y, uint32_t pitch, uint32_t log2Bpp);
+    // En línea: se llama por cada bloque al quitar el mosaico de las texturas.
+    inline uint32_t TiledOffset(uint32_t x, uint32_t y, uint32_t pitch, uint32_t log2Bpp)
+    {
+        // XGAddress2DTiledOffset, como en Xenia (texture_address): bloques de 32x32 píxeles
+        // con un patrón interno de micro-mosaicos.
+        const uint32_t alignedPitch = (pitch + 31) & ~31u;
+        const uint32_t macro = ((y >> 5) * (alignedPitch >> 5)) << (log2Bpp + 7);
+        const uint32_t micro = ((y & 6) << 2) << log2Bpp;
+        const uint32_t outer = macro + ((micro & ~0xFu) << 1) + (micro & 0xF) + ((y & 8) << (3 + log2Bpp)) + ((y & 1) << 4);
+
+        const uint32_t macroX = (x >> 5) << (log2Bpp + 7);
+        const uint32_t microX = (x & 7) << log2Bpp;
+        const uint32_t offset = outer + macroX + ((microX & ~0xFu) << 1) + (microX & 0xF);
+        return ((offset & ~0x1FFu) << 3) + ((offset & 0x1C0) << 2) + (offset & 0x3F) + ((y & 16) << 7) +
+               (((((y & 8) >> 2) + (x >> 3)) & 3) << 6);
+    }
 }

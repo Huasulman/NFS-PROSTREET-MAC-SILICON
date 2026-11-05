@@ -26,43 +26,29 @@ namespace gpu
     // Implementada en platform/window.mm (necesita ImageIO).
     void SavePng(const std::string& path, const Frame& frame);
 
-    uint32_t TiledOffset(uint32_t x, uint32_t y, uint32_t pitch, uint32_t log2Bpp)
-    {
-        // XGAddress2DTiledOffset, como en Xenia (texture_address): bloques de 32x32 píxeles
-        // con un patrón interno de micro-mosaicos.
-        const uint32_t alignedPitch = (pitch + 31) & ~31u;
-        const uint32_t macro = ((y >> 5) * (alignedPitch >> 5)) << (log2Bpp + 7);
-        const uint32_t micro = ((y & 6) << 2) << log2Bpp;
-        const uint32_t outer = macro + ((micro & ~0xFu) << 1) + (micro & 0xF) + ((y & 8) << (3 + log2Bpp)) + ((y & 1) << 4);
-
-        const uint32_t macroX = (x >> 5) << (log2Bpp + 7);
-        const uint32_t microX = (x & 7) << log2Bpp;
-        const uint32_t offset = outer + macroX + ((microX & ~0xFu) << 1) + (microX & 0xF);
-        return ((offset & ~0x1FFu) << 3) + ((offset & 0x1C0) << 2) + (offset & 0x3F) + ((y & 16) << 7) +
-               (((((y & 8) >> 2) + (x >> 3)) & 3) << 6);
-    }
-
     void PresentFrame(uint32_t frontBufferGuest, uint32_t width, uint32_t height)
     {
         if (frontBufferGuest == 0 || width == 0 || height == 0 || width > 4096 || height > 4096)
             return;
 
         Frame frame;
-        frame.width = width;
-        frame.height = height;
-        frame.pixels.resize(size_t(width) * height);
         const auto* source = static_cast<const uint8_t*>(memory::Translate(frontBufferGuest));
-        if (gLinear || !RendererReadFrame(frontBufferGuest, width, height, frame.pixels.data()))
-        for (uint32_t y = 0; y < height; y++)
+        if (gLinear || !RendererReadFrame(frontBufferGuest, width, height, frame))
         {
-            for (uint32_t x = 0; x < width; x++)
+            frame.width = width;
+            frame.height = height;
+            frame.pixels.resize(size_t(width) * height);
+            for (uint32_t y = 0; y < height; y++)
             {
-                const uint32_t offset = gLinear ? (y * width + x) * 4 : TiledOffset(x, y, width, 2);
-                // 8_8_8_8 como palabra little-endian 0xAARRGGBB (como lo escribe el resolve, sin
-                // intercambio de bytes): es directamente un píxel BGRA del Mac.
-                uint32_t value;
-                std::memcpy(&value, source + offset, 4);
-                frame.pixels[size_t(y) * width + x] = value | 0xFF000000u;
+                for (uint32_t x = 0; x < width; x++)
+                {
+                    const uint32_t offset = gLinear ? (y * width + x) * 4 : TiledOffset(x, y, width, 2);
+                    // 8_8_8_8 como palabra little-endian 0xAARRGGBB (como lo escribe el resolve, sin
+                    // intercambio de bytes): es directamente un píxel BGRA del Mac.
+                    uint32_t value;
+                    std::memcpy(&value, source + offset, 4);
+                    frame.pixels[size_t(y) * width + x] = value | 0xFF000000u;
+                }
             }
         }
 

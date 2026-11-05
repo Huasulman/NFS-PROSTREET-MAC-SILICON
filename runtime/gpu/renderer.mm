@@ -2,11 +2,17 @@
 
 #include "renderer.h"
 
+#include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
+#include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "presenter.h"
@@ -23,7 +29,12 @@ namespace gpu
         constexpr uint32_t kRegIndexOffset = 0x2102;  // VGT_INDX_OFFSET
         constexpr uint32_t kRegViewportXScale = 0x210F; // PA_CL_VPORT_XSCALE (y luego XOFFSET, YSCALE...)
         constexpr uint32_t kRegBlendControl0 = 0x2201; // RB_BLENDCONTROL0
+        constexpr uint32_t kRegColorControl = 0x2202;  // RB_COLORCONTROL (prueba alfa)
+        constexpr uint32_t kRegAlphaRef = 0x210E;      // RB_ALPHA_REF
         constexpr uint32_t kRegVteControl = 0x2206;   // PA_CL_VTE_CNTL
+        constexpr uint32_t kRegPointSize = 0x2280;    // PA_SU_POINT_SIZE: alto 0-15, ancho 16-31
+        constexpr uint32_t kRegPointMinMax = 0x2281;  // PA_SU_POINT_MINMAX: mínimo 0-15, máximo 16-31
+        constexpr uint32_t kRegPolyOffsetFront = 0x2380; // PA_SU_POLY_OFFSET_FRONT_SCALE (y OFFSET, luego BACK_...)
         constexpr uint32_t kRegWindowOffset = 0x2080; // PA_SC_WINDOW_OFFSET
         constexpr uint32_t kRegModeControl = 0x2205;  // PA_SU_SC_MODE_CNTL
         constexpr uint32_t kRegDepthInfo = 0x2002;    // RB_DEPTH_INFO (bit 16: profundidad en coma flotante)
@@ -54,9 +65,21 @@ namespace gpu
         constexpr uint32_t kRegFetchConstants = 0x4800;
         constexpr uint32_t kRegBoolConstants = 0x4900;
 
-        constexpr uint32_t kTargetWidth = 1280, kTargetHeight = 720;
+        // Como la EDRAM, cabe cualquier superficie del juego: la pantalla (1280x720) y el mapa de
+        // sombras (1600x1600, solo profundidad).
+        constexpr uint32_t kTargetWidth = 2048, kTargetHeight = 2048;
+        // Destino con MSAA: la escena del juego (1280x720, que con 4 muestras va por franjas).
+        constexpr uint32_t kMsaaWidth = 1280, kMsaaHeight = 720;
+        // Las ranuras de textura de un shader llevan este bit si las lee como mapa cúbico.
+        constexpr uint32_t kCubeSlot = 0x100;
+        constexpr uint32_t kVolumeSlot = 0x200; // ...o como textura 3D
 
         bool Trace() { return std::getenv("PROSTREET_TRACE") != nullptr; }
+
+        // Escala de resolución pedida (ver SetResolutionScale): el renderer la aplica al presentar.
+        // Antialiasing pedido (ver SetAntialiasing), igual: se aplica al presentar.
+        std::atomic<bool> gRequestedMsaa{ std::getenv("PROSTREET_NO_MSAA") == nullptr };
+        std::atomic<float> gRequestedScale{ std::getenv("PROSTREET_SCALE") ? std::clamp(float(std::atof(std::getenv("PROSTREET_SCALE"))), 1.0f, 2.0f) : 1.0f };
 
         float AsFloat(uint32_t bits)
         {
@@ -73,7 +96,7 @@ namespace gpu
         };
 
         // Imagen que ha escrito un resolve (con mosaico, 8_8_8_8): se guarda también una copia en
-        // la GPU. Si un dibujo la usa luego como textura y la memoria no ha cambiado, se usa esa
+        // la GPU (a la escala de resolución; base, pitch y height son los del juego). Si un dibujo la usa luego como textura y la memoria no ha cambiado, se usa esa
         // copia en vez de deshacer el mosaico y volver a subirla. Con predicated tiling, cada
         // franja se escribe en su parte de la misma imagen.
         struct ResolvedSurface
@@ -86,6 +109,27 @@ namespace gpu
             bool pending = false;
             uint64_t validEpoch = 0; // época en la que su memoria se comprobó (hash) por última vez
             uint32_t pendingLeft = 0, pendingTop = 0, pendingRight = 0, pendingBottom = 0;
+            uint64_t version = 0;    // cambia con cada resolve que la escribe
+            // Copia con mipmaps (generados en la GPU) para las texturas que la leen con niveles.
+            id<MTLTexture> mipTexture, mipView;
+            uint64_t mipVersion = 0;
+        };
+
+        // Mapa cúbico montado en la GPU con las 6 imágenes que han dejado los resolves (p. ej. el de
+        // los reflejos, que se redibuja en cada fotograma): así no hay que leerlas de la GPU.
+        struct SurfaceCube
+        {
+            id<MTLTexture> texture, view; // view: con R y B cambiados, como ResolvedSurface::view
+            uint64_t versions[6] = {};
+        };
+
+        // Profundidad que ha copiado un resolve (fuente 4). Solo está en la GPU (R32Float): el juego
+        // la lee como textura 24_8 en la misma dirección. Con predicated tiling, cada franja
+        // llega con su propia dirección dentro de la imagen.
+        struct DepthSurface
+        {
+            uint32_t base = 0, pitch = 0, height = 0;
+            id<MTLTexture> texture;
         };
 
         // Bytes de la memoria original de una imagen con mosaico (las filas van de 32 en 32).
@@ -120,24 +164,87 @@ namespace gpu
             id<MTLDevice> device;
             id<MTLCommandQueue> queue;
             id<MTLBuffer> memory;      // memoria física del juego, sin copia
-            id<MTLTexture> target;     // la "EDRAM": destino de dibujo
-            id<MTLTexture> depth;      // y su profundidad / stencil
-            bool depthClearPending = true;
-            double clearDepth = 1.0;
-            uint8_t clearStencil = 0;
+            // La "EDRAM": destinos de dibujo. El 0 es sin MSAA y cabe cualquier superficie; el 1 es para
+            // las superficies con MSAA (RB_SURFACE_INFO bits 16-17, p. ej. la escena a 1280 de ancho):
+            // se dibuja con 4 muestras y al cerrar cada pasada se resuelve en color/depth, que es lo que
+            // leen los resolves. Sin antialiasing (PROSTREET_NO_MSAA=1 o el menú): todo al destino 0.
+            // Las texturas van a la escala de resolución; width y height son los del juego (los
+            // dibujos y resolves usan esas coordenadas y se pasan a las de las texturas con Scaled).
+            struct RenderSet
+            {
+                id<MTLTexture> color, depth;     // 1 muestra
+                id<MTLTexture> colorMS, depthMS; // con MSAA: donde se dibuja
+                uint32_t width = 0, height = 0, samples = 1;
+                bool clearPending = true, depthClearPending = true;
+                MTLClearColor clearColor = MTLClearColorMake(0, 0, 0, 1);
+                double clearDepth = 1.0;
+                uint8_t clearStencil = 0;
+            };
+            RenderSet sets[2];
+            uint32_t passSet = 0; // el de la pasada abierta
+            bool msaaEnabled = false; // en uso (ver gRequestedMsaa)
+            float scale = 1.0f; // escala de resolución en uso
+
+            // Coordenada del juego (píxeles de la EDRAM o de una imagen de resolve) en las texturas.
+            uint32_t Scaled(uint32_t value) const { return uint32_t(value * scale + 0.5f); }
+
+            uint32_t SetFor(const uint32_t* registers) const
+            {
+                const uint32_t info = registers[kRegSurfaceInfo];
+                return msaaEnabled && sets[1].color && ((info >> 16) & 3) && (info & 0x3FFF) <= sets[1].width ? 1 : 0;
+            }
             std::unordered_map<uint64_t, id<MTLDepthStencilState>> depthStates;
             id<MTLCommandBuffer> commands;
             id<MTLRenderCommandEncoder> encoder;
-            bool clearPending = true;
-            MTLClearColor clearColor = MTLClearColorMake(0, 0, 0, 1);
 
-            std::unordered_map<uint64_t, id<MTLFunction>> functions;
-            std::unordered_map<uint64_t, bool> failedShaders;
-            std::unordered_map<uint64_t, std::vector<uint32_t>> textureSlots; // texturas de cada shader
+            // Shaders y pipelines se compilan en segundo plano: traducir y compilar un shader nuevo
+            // cuesta ~100 ms, y en carrera aparecen sin parar. Mientras tanto se saltan los dibujos que
+            // los usan (aparecen unos fotogramas más tarde) en vez de detener el juego.
+            // PROSTREET_SYNC_SHADERS=1: se compilan en el acto (p. ej. para comparar capturas).
+            struct CompiledShader
+            {
+                id<MTLFunction> function; // nil si no compila
+                std::vector<uint32_t> slots; // texturas que lee (con kCubeSlot o kVolumeSlot según el tipo)
+                std::vector<std::pair<uint32_t, uint32_t>> constantRanges;
+            };
+            // Lo que hace falta para crear un pipeline (copiado del dibujo que lo pide).
+            struct PipelineRequest
+            {
+                uint64_t key;
+                Shader vertex, pixel;
+                uint32_t blend, mask, samples;
+                bool depthOnly, alphaToCoverage;
+                MTLPixelFormat colorFormat;
+            };
+            struct CompiledPipeline
+            {
+                uint64_t key;
+                id<MTLRenderPipelineState> state; // nil si algún shader no compila
+                uint64_t vertexHash, pixelHash;
+                std::vector<uint32_t> slots;
+                std::vector<std::pair<uint32_t, uint32_t>> vertexRanges, pixelRanges;
+            };
+            struct ReadyPipeline
+            {
+                id<MTLRenderPipelineState> state;
+                std::vector<uint32_t> slots;
+            };
+            const bool syncShaders = std::getenv("PROSTREET_SYNC_SHADERS") != nullptr;
+            // Del hilo de la GPU:
+            std::unordered_map<uint64_t, ReadyPipeline> pipelines;
+            std::unordered_set<uint64_t> pendingPipelines;
             std::unordered_map<uint64_t, std::vector<std::pair<uint32_t, uint32_t>>> constantRanges; // de cada shader
-            std::unordered_map<uint64_t, id<MTLRenderPipelineState>> pipelines;
+            // Compartido con los hilos de compilación (con compileLock):
+            std::mutex compileLock;
+            std::unordered_map<uint64_t, std::shared_ptr<const CompiledShader>> compiledShaders;
+            std::vector<CompiledPipeline> finishedPipelines;
+            std::atomic<bool> pipelinesFinished{ false };
             std::unordered_map<uint64_t, Texture> textures;
             std::vector<ResolvedSurface> surfaces;
+            std::unordered_map<uint32_t, SurfaceCube> surfaceCubes;
+            uint64_t surfaceVersions = 0;
+            std::vector<DepthSurface> depthSurfaces;
+            id<MTLBuffer> depthStaging; // profundidad de camino a una DepthSurface
 
             // Por ranura de textura: la última constante de fetch vista, su textura, su sampler y en
             // qué época. Muchos dibujos seguidos usan las mismas texturas.
@@ -145,6 +252,7 @@ namespace gpu
             {
                 uint32_t fetch[6] = {};
                 uint64_t epoch = 0;
+                uint32_t kind = 0; // kCubeSlot, kVolumeSlot o 0
                 id<MTLTexture> texture;
                 id<MTLSamplerState> sampler;
             };
@@ -160,6 +268,10 @@ namespace gpu
             const bool immediateWriteback = std::getenv("PROSTREET_RESOLVE_WRITEBACK") != nullptr;
             std::unordered_map<uint32_t, id<MTLSamplerState>> samplers;
             id<MTLTexture> missingTexture;
+            id<MTLTexture> missingCube;    // lo mismo, para un shader que espera un mapa cúbico
+            id<MTLTexture> missingVolume;  // ...o una textura 3D
+            id<MTLTexture> blackTexture;   // (0, 0, 0, 0): constante de fetch sin textura (formato 0)
+            id<MTLTexture> farDepthTexture; // profundidad 1 (lejos): 24_8 sin resolve que la haya escrito
 
             uint64_t draws = 0, skipped = 0, resolves = 0;
 
@@ -227,6 +339,66 @@ namespace gpu
                 return constantOffsets;
             }
 
+            // Los destinos de dibujo (y el búfer de paso de la profundidad), a la escala actual.
+            void CreateTargets()
+            {
+                auto createSet = [&](RenderSet& set, uint32_t width, uint32_t height, uint32_t samples) {
+                    set.width = width;
+                    set.height = height;
+                    set.samples = samples;
+                    set.clearPending = set.depthClearPending = true;
+                    MTLTextureDescriptor* descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                        width:Scaled(width) height:Scaled(height) mipmapped:NO];
+                    descriptor.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+                    descriptor.storageMode = MTLStorageModeShared; // los resolves inmediatos la leen
+                    set.color = [device newTextureWithDescriptor:descriptor];
+                    MTLTextureDescriptor* depthDescriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:kDepthFormat
+                        width:Scaled(width) height:Scaled(height) mipmapped:NO];
+                    depthDescriptor.usage = MTLTextureUsageRenderTarget;
+                    depthDescriptor.storageMode = MTLStorageModePrivate;
+                    set.depth = [device newTextureWithDescriptor:depthDescriptor];
+                    if (samples > 1)
+                    {
+                        descriptor.textureType = MTLTextureType2DMultisample;
+                        descriptor.sampleCount = samples;
+                        descriptor.usage = MTLTextureUsageRenderTarget;
+                        descriptor.storageMode = MTLStorageModePrivate;
+                        set.colorMS = [device newTextureWithDescriptor:descriptor];
+                        depthDescriptor.textureType = MTLTextureType2DMultisample;
+                        depthDescriptor.sampleCount = samples;
+                        set.depthMS = [device newTextureWithDescriptor:depthDescriptor];
+                    }
+                };
+                createSet(sets[0], kTargetWidth, kTargetHeight, 1);
+                sets[1] = RenderSet{};
+                if (msaaEnabled && [device supportsTextureSampleCount:4])
+                    createSet(sets[1], kMsaaWidth, kMsaaHeight, 4);
+
+                depthStaging = [device newBufferWithLength:size_t(Scaled(kTargetWidth)) * Scaled(kTargetHeight) * 4 options:MTLResourceStorageModePrivate];
+            }
+
+            // Cambio de escala o de antialiasing (al presentar: la EDRAM ya no hace falta). Lo que solo
+            // está en la GPU se escribe antes en la memoria del juego; las copias en la GPU se descartan.
+            void ApplySettings()
+            {
+                const float requested = gRequestedScale.load();
+                const bool msaa = gRequestedMsaa.load();
+                if (requested == scale && msaa == msaaEnabled)
+                    return;
+                EndPass(true);
+                for (ResolvedSurface& surface : surfaces)
+                    WritebackSurface(surface);
+                surfaces.clear();
+                surfaceCubes.clear();
+                depthSurfaces.clear();
+                scale = requested;
+                msaaEnabled = msaa;
+                CreateTargets();
+                epoch++;
+                std::fprintf(stderr, "[render] escala de resolución %.2gx (%ux%u), antialiasing %s\n", scale, Scaled(kMsaaWidth),
+                    Scaled(kMsaaHeight), sets[1].color ? "4x" : "no");
+            }
+
             bool Initialize()
             {
                 device = MTLCreateSystemDefaultDevice();
@@ -236,57 +408,134 @@ namespace gpu
                 memory = [device newBufferWithBytesNoCopy:memory::Translate(memory::kPhysicalBase) length:memory::kPhysicalSize
                     options:MTLResourceStorageModeShared deallocator:nil];
 
-                MTLTextureDescriptor* descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
-                    width:kTargetWidth height:kTargetHeight mipmapped:NO];
-                descriptor.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
-                descriptor.storageMode = MTLStorageModeShared;
-                target = [device newTextureWithDescriptor:descriptor];
-                MTLTextureDescriptor* depthDescriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:kDepthFormat
-                    width:kTargetWidth height:kTargetHeight mipmapped:NO];
-                depthDescriptor.usage = MTLTextureUsageRenderTarget;
-                depthDescriptor.storageMode = MTLStorageModePrivate;
-                depth = [device newTextureWithDescriptor:depthDescriptor];
+                scale = gRequestedScale.load();
+                msaaEnabled = gRequestedMsaa.load();
+                CreateTargets();
 
                 // Textura de 1x1 magenta para formatos aún no soportados (se ven enseguida).
                 MTLTextureDescriptor* small = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:1 height:1 mipmapped:NO];
                 missingTexture = [device newTextureWithDescriptor:small];
                 const uint32_t magenta = 0xFFFF00FF;
                 [missingTexture replaceRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:0 withBytes:&magenta bytesPerRow:4];
+                missingCube = [device newTextureWithDescriptor:[MTLTextureDescriptor textureCubeDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                    size:1 mipmapped:NO]];
+                for (NSUInteger face = 0; face < 6; face++)
+                    [missingCube replaceRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:0 slice:face withBytes:&magenta bytesPerRow:4 bytesPerImage:4];
+                MTLTextureDescriptor* smallVolume = [[MTLTextureDescriptor alloc] init];
+                smallVolume.textureType = MTLTextureType3D;
+                smallVolume.pixelFormat = MTLPixelFormatRGBA8Unorm;
+                smallVolume.width = smallVolume.height = smallVolume.depth = 1;
+                missingVolume = [device newTextureWithDescriptor:smallVolume];
+                [missingVolume replaceRegion:MTLRegionMake3D(0, 0, 0, 1, 1, 1) mipmapLevel:0 slice:0 withBytes:&magenta bytesPerRow:4 bytesPerImage:4];
+                blackTexture = [device newTextureWithDescriptor:small];
+                const uint32_t black = 0;
+                [blackTexture replaceRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:0 withBytes:&black bytesPerRow:4];
+                farDepthTexture = [device newTextureWithDescriptor:[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR32Float
+                    width:1 height:1 mipmapped:NO]];
+                const float far = 1.0f;
+                [farDepthTexture replaceRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:0 withBytes:&far bytesPerRow:4];
                 constantRing = [device newBufferWithLength:kRingSize options:MTLResourceStorageModeShared];
                 std::fprintf(stderr, "[render] Metal: %s\n", device.name.UTF8String);
-                return memory != nil && target != nil;
+                return memory != nil && sets[0].color != nil;
             }
 
-            id<MTLFunction> Function(const Shader& shader, bool pixel, std::vector<uint32_t>* slots)
+            // En un hilo de compilación. Un shader que usan varios pipelines se compila una vez (salvo
+            // si dos lo piden a la vez: entonces se queda el primero).
+            std::shared_ptr<const CompiledShader> CompileShader(bool pixel, const Shader& shader)
             {
-                auto it = functions.find(shader.hash);
-                if (it != functions.end())
                 {
-                    if (slots)
-                        *slots = textureSlots[shader.hash];
-                    return it->second;
+                    std::lock_guard lock(compileLock);
+                    auto it = compiledShaders.find(shader.hash);
+                    if (it != compiledShaders.end())
+                        return it->second;
                 }
-                if (failedShaders.count(shader.hash))
-                    return nil;
-
+                auto compiled = std::make_shared<CompiledShader>();
                 TranslatedShader translated = TranslateShader(pixel, shader.code, shader.hash);
                 NSError* error = nil;
                 id<MTLLibrary> library = [device newLibraryWithSource:[NSString stringWithUTF8String:translated.source.c_str()] options:nil error:&error];
-                id<MTLFunction> function = [library newFunctionWithName:[NSString stringWithUTF8String:translated.entry.c_str()]];
-                if (!function)
-                {
+                compiled->function = [library newFunctionWithName:[NSString stringWithUTF8String:translated.entry.c_str()]];
+                if (!compiled->function)
                     std::fprintf(stderr, "[render] no compila %s: %s\n", translated.entry.c_str(), error ? error.localizedDescription.UTF8String : "?");
-                    failedShaders[shader.hash] = true;
-                    return nil;
-                }
-                if (!translated.warnings.empty())
+                else if (!translated.warnings.empty())
                     std::fprintf(stderr, "[render] %s: %s\n", translated.entry.c_str(), translated.warnings.c_str());
-                functions[shader.hash] = function;
-                textureSlots[shader.hash] = translated.textures;
-                constantRanges[shader.hash] = translated.constantRanges;
-                if (slots)
-                    *slots = translated.textures;
-                return function;
+                compiled->slots = translated.textures;
+                for (uint32_t& slot : compiled->slots)
+                    if (std::find(translated.cubeTextures.begin(), translated.cubeTextures.end(), slot) != translated.cubeTextures.end())
+                        slot |= kCubeSlot;
+                for (uint32_t& slot : compiled->slots)
+                    if (std::find(translated.volumeTextures.begin(), translated.volumeTextures.end(), slot) != translated.volumeTextures.end())
+                        slot |= kVolumeSlot;
+                compiled->constantRanges = translated.constantRanges;
+                std::lock_guard lock(compileLock);
+                return compiledShaders.emplace(shader.hash, std::move(compiled)).first->second;
+            }
+
+            // En un hilo de compilación: los dos shaders y el pipeline. El resultado lo recoge el hilo
+            // de la GPU (CollectPipelines).
+            void BuildPipeline(const PipelineRequest& request)
+            {
+                @autoreleasepool
+                {
+                    static const bool trace = Trace();
+                    const auto start = std::chrono::steady_clock::now();
+                    const auto vertex = CompileShader(false, request.vertex), pixel = CompileShader(true, request.pixel);
+                    CompiledPipeline result{ request.key, nil, request.vertex.hash, request.pixel.hash, pixel->slots,
+                                             vertex->constantRanges, pixel->constantRanges };
+                    if (vertex->function && pixel->function)
+                    {
+                        MTLRenderPipelineDescriptor* descriptor = [[MTLRenderPipelineDescriptor alloc] init];
+                        descriptor.vertexFunction = vertex->function;
+                        descriptor.fragmentFunction = pixel->function;
+                        MTLRenderPipelineColorAttachmentDescriptor* color = descriptor.colorAttachments[0];
+                        color.pixelFormat = request.colorFormat;
+                        descriptor.rasterSampleCount = request.samples;
+                        descriptor.alphaToCoverageEnabled = request.alphaToCoverage;
+                        descriptor.depthAttachmentPixelFormat = kDepthFormat;
+                        descriptor.stencilAttachmentPixelFormat = kDepthFormat;
+                        const uint32_t mask = request.mask, blend = request.blend;
+                        color.writeMask = request.depthOnly ? MTLColorWriteMaskNone : (mask & 1 ? MTLColorWriteMaskRed : 0) | (mask & 2 ? MTLColorWriteMaskGreen : 0) |
+                                          (mask & 4 ? MTLColorWriteMaskBlue : 0) | (mask & 8 ? MTLColorWriteMaskAlpha : 0);
+                        // RB_BLENDCONTROL: srcblend 0-4, comb 5-7, destblend 8-12, y lo mismo para alfa desde el bit 16.
+                        const bool opaque = (blend & 0x1FFF) == 0x0001 && ((blend >> 16) & 0x1FFF) == 0x0001;
+                        color.blendingEnabled = !opaque;
+                        color.sourceRGBBlendFactor = BlendFactor(blend & 0x1F);
+                        color.rgbBlendOperation = BlendOperation((blend >> 5) & 7);
+                        color.destinationRGBBlendFactor = BlendFactor((blend >> 8) & 0x1F);
+                        color.sourceAlphaBlendFactor = BlendFactor((blend >> 16) & 0x1F);
+                        color.alphaBlendOperation = BlendOperation((blend >> 21) & 7);
+                        color.destinationAlphaBlendFactor = BlendFactor((blend >> 24) & 0x1F);
+                        NSError* error = nil;
+                        result.state = [device newRenderPipelineStateWithDescriptor:descriptor error:&error];
+                        if (!result.state)
+                            std::fprintf(stderr, "[render] pipeline: %s\n", error.localizedDescription.UTF8String);
+                    }
+                    if (trace)
+                        std::fprintf(stderr, "[render] pipeline vs_%016llx + ps_%016llx en %.0f ms\n", (unsigned long long)request.vertex.hash,
+                            (unsigned long long)request.pixel.hash, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+                    std::lock_guard lock(compileLock);
+                    finishedPipelines.push_back(std::move(result));
+                    pipelinesFinished.store(true, std::memory_order_release);
+                }
+            }
+
+            // Pasa al hilo de la GPU los pipelines terminados.
+            void CollectPipelines()
+            {
+                if (!pipelinesFinished.load(std::memory_order_acquire))
+                    return;
+                std::vector<CompiledPipeline> finished;
+                {
+                    std::lock_guard lock(compileLock);
+                    finished.swap(finishedPipelines);
+                    pipelinesFinished.store(false, std::memory_order_relaxed);
+                }
+                for (CompiledPipeline& result : finished)
+                {
+                    pendingPipelines.erase(result.key);
+                    constantRanges[result.vertexHash] = std::move(result.vertexRanges);
+                    constantRanges[result.pixelHash] = std::move(result.pixelRanges);
+                    pipelines[result.key] = { result.state, std::move(result.slots) };
+                }
             }
 
             static MTLBlendFactor BlendFactor(uint32_t value)
@@ -332,50 +581,48 @@ namespace gpu
                 key = key * 1000003 + blend;
                 key = key * 17 + mask;
                 key = key * 3 + (draw.depthOnly ? 1 : 0);
+                // Con MSAA, alpha-to-mask (RB_COLORCONTROL bit 4) es la cobertura por alfa de Metal.
+                const RenderSet& set = sets[SetFor(draw.registers)];
+                const bool alphaToCoverage = set.samples > 1 && (draw.registers[kRegColorControl] & 0x10);
+                key = key * 7 + set.samples * 2 + (alphaToCoverage ? 1 : 0);
                 if (key == lastPipelineKey && lastPipeline) // lo más habitual: el mismo que el dibujo anterior
                 {
                     slots = lastPipelineSlots;
                     return lastPipeline;
                 }
 
-                id<MTLFunction> vertex = Function(*draw.vertexShader, false, nullptr);
-                id<MTLFunction> fragment = Function(*draw.pixelShader, true, &slots);
-                if (!vertex || !fragment)
-                    return nil;
+                CollectPipelines();
                 auto it = pipelines.find(key);
-                if (it != pipelines.end())
+                if (it == pipelines.end())
                 {
-                    lastPipelineKey = key;
-                    lastPipeline = it->second;
-                    lastPipelineSlots = slots;
-                    return it->second;
+                    // Nuevo: se pide (una vez) y este dibujo se salta.
+                    if (pendingPipelines.insert(key).second)
+                    {
+                        auto request = std::make_shared<PipelineRequest>(PipelineRequest{ key, *draw.vertexShader, *draw.pixelShader,
+                            blend, mask, set.samples, draw.depthOnly, alphaToCoverage, set.color.pixelFormat });
+                        if (syncShaders)
+                        {
+                            BuildPipeline(*request);
+                            CollectPipelines();
+                            it = pipelines.find(key);
+                        }
+                        else
+                        {
+                            dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                                BuildPipeline(*request);
+                            });
+                        }
+                    }
+                    if (it == pipelines.end())
+                        return nil;
                 }
-
-                MTLRenderPipelineDescriptor* descriptor = [[MTLRenderPipelineDescriptor alloc] init];
-                descriptor.vertexFunction = vertex;
-                descriptor.fragmentFunction = fragment;
-                MTLRenderPipelineColorAttachmentDescriptor* color = descriptor.colorAttachments[0];
-                color.pixelFormat = target.pixelFormat;
-                descriptor.depthAttachmentPixelFormat = kDepthFormat;
-                descriptor.stencilAttachmentPixelFormat = kDepthFormat;
-                color.writeMask = draw.depthOnly ? MTLColorWriteMaskNone : (mask & 1 ? MTLColorWriteMaskRed : 0) | (mask & 2 ? MTLColorWriteMaskGreen : 0) |
-                                  (mask & 4 ? MTLColorWriteMaskBlue : 0) | (mask & 8 ? MTLColorWriteMaskAlpha : 0);
-                // RB_BLENDCONTROL: srcblend 0-4, comb 5-7, destblend 8-12, y lo mismo para alfa desde el bit 16.
-                const bool opaque = (blend & 0x1FFF) == 0x0001 && ((blend >> 16) & 0x1FFF) == 0x0001;
-                color.blendingEnabled = !opaque;
-                color.sourceRGBBlendFactor = BlendFactor(blend & 0x1F);
-                color.rgbBlendOperation = BlendOperation((blend >> 5) & 7);
-                color.destinationRGBBlendFactor = BlendFactor((blend >> 8) & 0x1F);
-                color.sourceAlphaBlendFactor = BlendFactor((blend >> 16) & 0x1F);
-                color.alphaBlendOperation = BlendOperation((blend >> 21) & 7);
-                color.destinationAlphaBlendFactor = BlendFactor((blend >> 24) & 0x1F);
-
-                NSError* error = nil;
-                id<MTLRenderPipelineState> pipeline = [device newRenderPipelineStateWithDescriptor:descriptor error:&error];
-                if (!pipeline)
-                    std::fprintf(stderr, "[render] pipeline: %s\n", error.localizedDescription.UTF8String);
-                pipelines[key] = pipeline;
-                return pipeline;
+                if (!it->second.state)
+                    return nil;
+                lastPipelineKey = key;
+                lastPipeline = it->second.state;
+                lastPipelineSlots = it->second.slots;
+                slots = it->second.slots;
+                return lastPipeline;
             }
 
             // Prueba de profundidad y stencil (RB_DEPTHCONTROL). Las funciones de comparación y las
@@ -414,18 +661,146 @@ namespace gpu
                 return state;
             }
 
-            // Textura a partir de una constante de fetch (6 palabras).
-            id<MTLTexture> TextureFor(const uint32_t* fetch)
+            // La imagen de un resolve con `levels` niveles de mipmap (el 0 copiado del resolve, los demás
+            // generados), al tamaño de la textura del juego (width x surface.height) a la escala actual.
+            id<MTLTexture> MipmappedSurface(ResolvedSurface& surface, uint32_t width, uint32_t levels)
+            {
+                const uint32_t scaledWidth = std::min<uint32_t>(Scaled(width), uint32_t(surface.texture.width));
+                const uint32_t scaledHeight = uint32_t(surface.texture.height);
+                uint32_t maxLevels = 1;
+                while ((std::max(scaledWidth, scaledHeight) >> maxLevels) > 0)
+                    maxLevels++;
+                levels = std::min(levels, maxLevels);
+                if (!surface.mipTexture || surface.mipTexture.width != scaledWidth || surface.mipTexture.mipmapLevelCount != levels)
+                {
+                    MTLTextureDescriptor* descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                        width:scaledWidth height:scaledHeight mipmapped:YES];
+                    descriptor.mipmapLevelCount = levels;
+                    descriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget | MTLTextureUsagePixelFormatView;
+                    descriptor.storageMode = MTLStorageModePrivate;
+                    surface.mipTexture = [device newTextureWithDescriptor:descriptor];
+                    surface.mipView = [surface.mipTexture newTextureViewWithPixelFormat:MTLPixelFormatRGBA8Unorm textureType:MTLTextureType2D
+                        levels:NSMakeRange(0, levels) slices:NSMakeRange(0, 1)
+                        swizzle:MTLTextureSwizzleChannelsMake(MTLTextureSwizzleBlue, MTLTextureSwizzleGreen,
+                            MTLTextureSwizzleRed, MTLTextureSwizzleAlpha)];
+                    surface.mipVersion = 0;
+                }
+                if (surface.mipVersion != surface.version)
+                {
+                    // Antes que el trabajo aún sin enviar (que es el que la lee), como CubeFromSurfaces.
+                    id<MTLCommandBuffer> copy = [queue commandBuffer];
+                    id<MTLBlitCommandEncoder> blit = [copy blitCommandEncoder];
+                    [blit copyFromTexture:surface.texture sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
+                        sourceSize:MTLSizeMake(scaledWidth, scaledHeight, 1) toTexture:surface.mipTexture destinationSlice:0
+                        destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
+                    [blit generateMipmapsForTexture:surface.mipTexture];
+                    [blit endEncoding];
+                    [copy commit];
+                    surface.mipVersion = surface.version;
+                }
+                return surface.mipView;
+            }
+
+            // Cubo con las caras en [base + cara * faceStride] si las 6 son imágenes de resolves vigentes
+            // (su memoria no ha cambiado desde entonces). Si alguna ha cambiado, se monta un cubo nuevo (el
+            // anterior puede usarlo un dibujo aún sin enviar); la copia va antes que el trabajo pendiente.
+            id<MTLTexture> CubeFromSurfaces(uint32_t base, size_t faceStride, uint32_t pitch, uint32_t size, uint32_t endian)
+            {
+                ResolvedSurface* faces[6];
+                for (uint32_t face = 0; face < 6; face++)
+                {
+                    faces[face] = nullptr;
+                    for (ResolvedSurface& surface : surfaces)
+                        if (surface.base == base + face * faceStride && surface.pitch == pitch && surface.height == size &&
+                            surface.endian == endian && size <= surface.pitch)
+                        {
+                            faces[face] = &surface;
+                            break;
+                        }
+                    ResolvedSurface* surface = faces[face];
+                    if (!surface)
+                        return nil;
+                    if (surface->validEpoch != epoch)
+                    {
+                        const auto* memoryStart = static_cast<const uint8_t*>(memory::Translate(0xA0000000 | surface->base));
+                        if (surface->hash != HashMemory(memoryStart, std::min<size_t>(TiledSize(surface->pitch, surface->height, 4),
+                            0x20000000 - surface->base)))
+                            return nil;
+                        surface->validEpoch = epoch;
+                    }
+                }
+                SurfaceCube& cube = surfaceCubes[base];
+                const uint32_t scaledSize = Scaled(size);
+                bool changed = !cube.texture || cube.texture.width != scaledSize;
+                for (uint32_t face = 0; face < 6; face++)
+                    changed |= cube.versions[face] != faces[face]->version;
+                if (!changed)
+                    return cube.view;
+                MTLTextureDescriptor* descriptor = [MTLTextureDescriptor textureCubeDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                    size:scaledSize mipmapped:NO];
+                descriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
+                descriptor.storageMode = MTLStorageModePrivate;
+                cube.texture = [device newTextureWithDescriptor:descriptor];
+                cube.view = [cube.texture newTextureViewWithPixelFormat:MTLPixelFormatRGBA8Unorm textureType:MTLTextureTypeCube
+                    levels:NSMakeRange(0, 1) slices:NSMakeRange(0, 6)
+                    swizzle:MTLTextureSwizzleChannelsMake(MTLTextureSwizzleBlue, MTLTextureSwizzleGreen,
+                        MTLTextureSwizzleRed, MTLTextureSwizzleAlpha)];
+                id<MTLCommandBuffer> copy = [queue commandBuffer];
+                id<MTLBlitCommandEncoder> blit = [copy blitCommandEncoder];
+                for (uint32_t face = 0; face < 6; face++)
+                {
+                    [blit copyFromTexture:faces[face]->texture sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
+                        sourceSize:MTLSizeMake(scaledSize, scaledSize, 1) toTexture:cube.texture destinationSlice:face destinationLevel:0
+                        destinationOrigin:MTLOriginMake(0, 0, 0)];
+                    cube.versions[face] = faces[face]->version;
+                }
+                [blit endEncoding];
+                [copy commit];
+                return cube.view;
+            }
+
+            // Textura a partir de una constante de fetch (6 palabras). cube: el shader la lee como mapa
+            // cúbico (entonces hay que darle uno, aunque sea el de relleno).
+            id<MTLTexture> TextureFor(const uint32_t* fetch, bool cube)
             {
                 const bool tiled = fetch[0] >> 31;
                 const uint32_t pitch = ((fetch[0] >> 22) & 0x1FF) * 32;
                 const uint32_t format = fetch[1] & 0x3F, endian = (fetch[1] >> 6) & 3;
                 const uint32_t base = fetch[1] & 0xFFFFF000;
-                // Tamaño: 13 + 13 bits en 2D; en 3D, 11 + 11 (+ 10 de profundidad). De una textura 3D
-                // (p. ej. una tabla de color) de momento se usa la primera capa como 2D.
+                // Tamaño: 13 + 13 bits en 2D; en 3D, 11 + 11 (+ 10 de profundidad). Una textura 3D leída
+                // como 2D (las que se leen como 3D van a VolumeFor) da su primera capa.
                 const uint32_t dimension = (fetch[5] >> 9) & 3;
                 const uint32_t width = dimension == 2 ? (fetch[2] & 0x7FF) + 1 : (fetch[2] & 0x1FFF) + 1;
                 const uint32_t height = dimension == 2 ? ((fetch[2] >> 11) & 0x7FF) + 1 : ((fetch[2] >> 13) & 0x1FFF) + 1;
+                if (cube && dimension != 3)
+                {
+                    static bool reported = false;
+                    if (!reported)
+                        std::fprintf(stderr, "[render] un shader lee como cubo una textura de dimensión %u (se ve magenta)\n", dimension);
+                    reported = true;
+                    return missingCube;
+                }
+                // Un mapa cúbico tiene sus 6 caras seguidas; leído como 2D se usa la primera.
+                const uint32_t faces = cube ? 6 : 1;
+
+                if (format == 22 || format == 23) // 24_8 y 24_8_FLOAT: profundidad
+                {
+                    if (cube)
+                        return missingCube;
+                    for (const DepthSurface& surface : depthSurfaces)
+                        if (surface.base == (base & 0x1FFFFFFF))
+                            return surface.texture;
+                    return farDepthTexture;
+                }
+                if (format == 0) // 1_REVERSE: en la práctica, una constante sin textura
+                {
+                    static bool reported = false;
+                    if (!reported)
+                        std::fprintf(stderr, "[render] textura de formato 0 (%08X %08X %08X %08X %08X %08X): se lee como (0, 0, 0, 0)\n",
+                            fetch[0], fetch[1], fetch[2], fetch[3], fetch[4], fetch[5]);
+                    reported = true;
+                    return cube ? missingCube : blackTexture;
+                }
 
                 MTLPixelFormat pixelFormat;
                 uint32_t blockSize = 1, bytesPerBlock;
@@ -443,11 +818,11 @@ namespace gpu
                     static std::unordered_map<uint32_t, int> reported;
                     if (!reported[format]++)
                         std::fprintf(stderr, "[render] formato de textura %u aún no soportado (se ve magenta)\n", format);
-                    return missingTexture;
+                    return cube ? missingCube : missingTexture;
                 }
                 }
-                if (base == 0 || width > 8192 || height > 8192)
-                    return missingTexture;
+                if (base == 0 || width > 8192 || height > 8192 || (cube && width != height))
+                    return cube ? missingCube : missingTexture;
 
                 const uint32_t blocksX = (width + blockSize - 1) / blockSize, blocksY = (height + blockSize - 1) / blockSize;
                 const uint32_t pitchBlocks = std::max(pitch / blockSize, blocksX);
@@ -455,50 +830,263 @@ namespace gpu
                 while ((1u << log2Bytes) < bytesPerBlock)
                     log2Bytes++;
 
+                // Niveles de mipmap (como Xenia): el 0 está en la base; del 1 en adelante, seguidos desde
+                // mip_address (palabra 5), cada uno con el tamaño de la potencia de dos siguiente a la base
+                // dividida entre 2^nivel y alineado a bloques de 32x32 (o filas de 256 bytes sin mosaico).
+                // Con packed_mips, los niveles cuyo lado menor es de 16 texels o menos comparten un mismo
+                // bloque de 32x32 (la "cola"), cada uno en su desplazamiento.
+                const uint32_t mipAddress = fetch[5] & 0xFFFFF000;
+                const bool packedMips = (fetch[5] >> 11) & 1;
+                auto log2Ceil = [](uint32_t value) { uint32_t n = 0; while ((1u << n) < value) n++; return n; };
+                const uint32_t fullChain = log2Ceil(std::max(width, height)) + 1;
+                const uint32_t maxLevel = (fetch[4] >> 6) & 0xF;
+                const uint32_t levels = mipAddress ? std::min(maxLevel + 1, fullChain) : 1;
+                const uint32_t packedLevel = packedMips ? (log2Ceil(std::min(width, height)) > 4 ? log2Ceil(std::min(width, height)) - 4 : 0) : ~0u;
+                auto nextPow2 = [&](uint32_t value) { return 1u << log2Ceil(value); };
+                struct Level
+                {
+                    uint32_t width, height;      // texels
+                    uint32_t blocksX, blocksY;
+                    uint32_t address;             // dirección física de su memoria (o de la cola)
+                    uint32_t pitchBlocks;         // de la memoria (bloques por fila)
+                    uint32_t offsetX = 0, offsetY = 0; // en bloques, dentro de la cola
+                    size_t sliceStride;           // entre caras
+                    size_t size;                  // de una cara
+                };
+                std::vector<Level> levelInfo;
+                size_t mipOffset = 0;
+                for (uint32_t level = 0; level < levels; level++)
+                {
+                    Level info;
+                    info.width = std::max(width >> level, 1u);
+                    info.height = std::max(height >> level, 1u);
+                    info.blocksX = (info.width + blockSize - 1) / blockSize;
+                    info.blocksY = (info.height + blockSize - 1) / blockSize;
+                    const bool inTail = level >= packedLevel;
+                    const uint32_t storageLevel = inTail ? packedLevel : level; // el nivel cuya memoria se lee
+                    uint32_t strideBlocksX, strideBlocksY;
+                    if (storageLevel == 0)
+                    {
+                        strideBlocksX = pitchBlocks;
+                        strideBlocksY = blocksY;
+                    }
+                    else
+                    {
+                        strideBlocksX = (std::max(nextPow2(width) >> storageLevel, 1u) + blockSize - 1) / blockSize;
+                        strideBlocksY = (std::max(nextPow2(height) >> storageLevel, 1u) + blockSize - 1) / blockSize;
+                    }
+                    if (tiled)
+                    {
+                        strideBlocksX = (strideBlocksX + 31) & ~31u;
+                        info.size = TiledSize(strideBlocksX, strideBlocksY, bytesPerBlock);
+                    }
+                    else
+                    {
+                        if (storageLevel != 0)
+                            strideBlocksX = ((strideBlocksX * bytesPerBlock + 255) & ~255u) / bytesPerBlock;
+                        info.size = size_t(strideBlocksX) * ((strideBlocksY + 31) & ~31u) * bytesPerBlock;
+                    }
+                    info.pitchBlocks = strideBlocksX;
+                    info.sliceStride = (info.size + 4095) & ~size_t(4095);
+                    if (inTail && level != packedLevel)
+                        info.address = levelInfo[packedLevel].address;
+                    else if (level == 0)
+                        info.address = base & 0x1FFFFFFF;
+                    else
+                    {
+                        info.address = (mipAddress & 0x1FFFFFFF) + uint32_t(mipOffset);
+                        mipOffset += info.sliceStride * faces;
+                    }
+                    if (inTail) // desplazamiento dentro de la cola (GetPackedMipOffset de Xenia)
+                    {
+                        const uint32_t log2Width = log2Ceil(width), log2Height = log2Ceil(height);
+                        const uint32_t packedMip = level - packedLevel;
+                        uint32_t x = 0, y = 0;
+                        if (packedMip < 3)
+                            (log2Width > log2Height ? y : x) = 16 >> packedMip;
+                        else
+                        {
+                            const uint32_t offset = (1u << ((log2Width > log2Height ? log2Width : log2Height) - packedLevel)) >> (packedMip - 2);
+                            (log2Width > log2Height ? x : y) = offset;
+                        }
+                        info.offsetX = x / blockSize;
+                        info.offsetY = y / blockSize;
+                        info.size = levelInfo.empty() || level == packedLevel ? info.size : levelInfo[packedLevel].size;
+                    }
+                    levelInfo.push_back(info);
+                }
+
                 // ¿Ha cambiado? Se mira la memoria original (con mosaico, las filas van de 32 en 32).
                 const auto* source = static_cast<const uint8_t*>(memory::Translate(0xA0000000 | (base & 0x1FFFFFFF)));
-                const size_t rawSize = std::min<size_t>(tiled ? TiledSize(pitchBlocks, blocksY, bytesPerBlock) :
-                    size_t(pitchBlocks) * blocksY * bytesPerBlock, 0x20000000 - (base & 0x1FFFFFFF));
+                const size_t faceSize = levelInfo[0].size;
+                const size_t faceStride = levelInfo[0].sliceStride; // las caras van alineadas a 4 KB
+                const size_t rawSize = std::min<size_t>(faceStride * (faces - 1) + faceSize, 0x20000000 - (base & 0x1FFFFFFF));
+                const size_t mipSize = std::min<size_t>(mipOffset, 0x20000000 - (mipAddress & 0x1FFFFFFF));
+                const auto* mipSource = static_cast<const uint8_t*>(memory::Translate(0xA0000000 | (mipAddress & 0x1FFFFFFF)));
                 // ¿Es la imagen de un resolve? Entonces se usa su copia en la GPU, mientras la memoria no
                 // haya cambiado desde el resolve (se comprueba una vez por época).
-                if (format == 6 && tiled)
+                // Con mipmaps (p. ej. una imagen reducida para un efecto), se generan en la GPU a partir del
+                // resolve en vez de leerlos de la memoria.
+                if (format == 6 && tiled && !cube)
                     for (ResolvedSurface& surface : surfaces)
                         if (surface.base == (base & 0x1FFFFFFF) && surface.pitch == pitchBlocks && surface.height == height &&
                             surface.endian == endian && width <= surface.pitch)
                         {
-                            if (surface.validEpoch == epoch)
-                                return surface.view;
-                            if (surface.hash == HashMemory(source, rawSize))
-                            {
-                                surface.validEpoch = epoch;
-                                return surface.view;
-                            }
+                            if (surface.validEpoch != epoch && surface.hash != HashMemory(source, rawSize))
+                                continue;
+                            surface.validEpoch = epoch;
+                            return levels == 1 ? surface.view : MipmappedSurface(surface, width, levels);
                         }
-                const uint64_t key = (uint64_t(base) << 32) ^ (uint64_t(format) << 26) ^ (uint64_t(width) << 13) ^ height;
+                if (format == 6 && tiled && cube && levels == 1)
+                    if (id<MTLTexture> view = CubeFromSurfaces(base & 0x1FFFFFFF, faceStride, pitchBlocks, width, endian))
+                        return view;
+                const uint64_t key = (uint64_t(base) << 32) ^ (uint64_t(format) << 26) ^ (uint64_t(width) << 13) ^ height ^ (uint64_t(cube) << 63) ^
+                                     (uint64_t(mipAddress) * 0x9E3779B1ull) ^ (uint64_t(levels) << 58);
                 Texture& cached = textures[key];
                 if (cached.texture && cached.epoch == epoch)
                     return cached.texture;
-                const uint64_t hash = HashMemory(source, rawSize);
                 // Si la textura cae sobre un resolve aún no escrito en memoria (y no ha podido usar su
                 // copia), se escribe ahora para leer lo que toca.
-                if (WritebackOverlapping(base & 0x1FFFFFFF, rawSize))
-                    return TextureFor(fetch);
+                if (WritebackOverlapping(base & 0x1FFFFFFF, rawSize) || (mipSize && WritebackOverlapping(mipAddress & 0x1FFFFFFF, mipSize)))
+                    return TextureFor(fetch, cube);
+                // Sin escrituras en su memoria desde que se leyó (páginas vigiladas): no hace falta mirarla.
+                if (cached.texture && memory::Unchanged(base & 0x1FFFFFFF, uint32_t(rawSize)) &&
+                    (!mipSize || memory::Unchanged(mipAddress & 0x1FFFFFFF, uint32_t(mipSize))))
+                {
+                    cached.epoch = epoch;
+                    return cached.texture;
+                }
+                // Se vigila antes de leerla: una escritura posterior la marcará como cambiada.
+                memory::Watch(base & 0x1FFFFFFF, uint32_t(rawSize));
+                if (mipSize)
+                    memory::Watch(mipAddress & 0x1FFFFFFF, uint32_t(mipSize));
+                const uint64_t hash = HashMemory(source, rawSize) ^ (mipSize ? HashMemory(mipSource, mipSize) * 31 : 0);
                 if (cached.texture && cached.hash == hash)
                 {
                     cached.epoch = epoch;
                     return cached.texture;
                 }
 
-                // Lectura (quitando el mosaico) e intercambio de bytes.
-                std::vector<uint8_t> data(size_t(blocksX) * blocksY * bytesPerBlock);
-                for (uint32_t by = 0; by < blocksY; by++)
+                // Textura nueva (no se reescribe la anterior: puede usarla un dibujo aún sin enviar).
+                MTLTextureDescriptor* descriptor = cube ?
+                    [MTLTextureDescriptor textureCubeDescriptorWithPixelFormat:pixelFormat size:width mipmapped:levels > 1] :
+                    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pixelFormat width:width height:height mipmapped:levels > 1];
+                descriptor.mipmapLevelCount = levels;
+                cached.texture = [device newTextureWithDescriptor:descriptor];
+
+                // Lectura de cada nivel y cara (quitando el mosaico) e intercambio de bytes.
+                std::vector<uint8_t> data;
+                for (uint32_t level = 0; level < levels; level++)
                 {
-                    for (uint32_t bx = 0; bx < blocksX; bx++)
+                    const Level& info = levelInfo[level];
+                    const size_t imageBytes = size_t(info.blocksX) * info.blocksY * bytesPerBlock;
+                    for (uint32_t face = 0; face < faces; face++)
                     {
-                        const uint32_t offset = tiled ? TiledOffset(bx, by, pitchBlocks, log2Bytes) : (by * pitchBlocks + bx) * bytesPerBlock;
-                        std::memcpy(&data[(size_t(by) * blocksX + bx) * bytesPerBlock], source + offset, bytesPerBlock);
+                        data.assign(imageBytes, 0);
+                        const size_t start = size_t(info.address) + face * info.sliceStride;
+                        if (start + info.size > 0x20000000)
+                            break; // se sale de la memoria
+                        const auto* levelSource = static_cast<const uint8_t*>(memory::Translate(0xA0000000 | uint32_t(start)));
+                        for (uint32_t by = 0; by < info.blocksY; by++)
+                        {
+                            for (uint32_t bx = 0; bx < info.blocksX; bx++)
+                            {
+                                const uint32_t x = bx + info.offsetX, y = by + info.offsetY;
+                                const size_t offset = tiled ? TiledOffset(x, y, info.pitchBlocks, log2Bytes) : (size_t(y) * info.pitchBlocks + x) * bytesPerBlock;
+                                if (offset + bytesPerBlock <= info.size)
+                                    std::memcpy(&data[(size_t(by) * info.blocksX + bx) * bytesPerBlock], levelSource + offset, bytesPerBlock);
+                            }
+                        }
+                        for (size_t i = 0; i + 3 < data.size(); i += 4)
+                        {
+                            uint32_t word;
+                            std::memcpy(&word, &data[i], 4);
+                            switch (endian)
+                            {
+                            case 1: word = ((word & 0x00FF00FF) << 8) | ((word >> 8) & 0x00FF00FF); break;
+                            case 2: word = __builtin_bswap32(word); break;
+                            case 3: word = (word << 16) | (word >> 16); break;
+                            default: break;
+                            }
+                            std::memcpy(&data[i], &word, 4);
+                        }
+                        [cached.texture replaceRegion:MTLRegionMake2D(0, 0, info.width, info.height) mipmapLevel:level slice:face
+                            withBytes:data.data() bytesPerRow:info.blocksX * bytesPerBlock bytesPerImage:imageBytes];
                     }
                 }
+                cached.hash = hash;
+                cached.epoch = epoch;
+                if (Trace())
+                    std::fprintf(stderr, "[render] textura 0x%08X %ux%u formato %u, %u niveles%s%s%s\n", base, width, height, format, levels,
+                        packedMips ? " (cola empaquetada)" : "", tiled ? " (mosaico)" : "", cube ? " (cubo)" : "");
+                return cached.texture;
+            }
+
+            // Textura 3D (solo el nivel 0 y formatos sin comprimir). Cada capa se lee como una imagen 2D
+            // (con su mosaico, si lo tiene) y las capas van seguidas. En la consola el mosaico 3D agrupa
+            // las capas de 4 en 4, así que con mosaico el orden de los texels puede no ser el exacto; la
+            // única que usa el juego es ruido (32x32x32), donde el orden no importa.
+            id<MTLTexture> VolumeFor(const uint32_t* fetch)
+            {
+                const uint32_t dimension = (fetch[5] >> 9) & 3, format = fetch[1] & 0x3F, endian = (fetch[1] >> 6) & 3;
+                const uint32_t base = fetch[1] & 0x1FFFF000;
+                const bool tiled = fetch[0] >> 31;
+                const uint32_t width = (fetch[2] & 0x7FF) + 1, height = ((fetch[2] >> 11) & 0x7FF) + 1, depth = ((fetch[2] >> 22) & 0x3FF) + 1;
+                MTLPixelFormat pixelFormat;
+                uint32_t bytesPerTexel, log2Bytes;
+                switch (format)
+                {
+                case 2: pixelFormat = MTLPixelFormatR8Unorm; bytesPerTexel = 1; log2Bytes = 0; break;
+                case 10: pixelFormat = MTLPixelFormatRG8Unorm; bytesPerTexel = 2; log2Bytes = 1; break;
+                case 6: pixelFormat = MTLPixelFormatRGBA8Unorm; bytesPerTexel = 4; log2Bytes = 2; break;
+                default: pixelFormat = MTLPixelFormatInvalid; bytesPerTexel = log2Bytes = 0; break;
+                }
+                if (dimension != 2 || pixelFormat == MTLPixelFormatInvalid || base == 0)
+                {
+                    static bool reported = false;
+                    if (!reported)
+                        std::fprintf(stderr, "[render] textura 3D no soportada (dimensión %u, formato %u): se ve magenta\n", dimension, format);
+                    reported = true;
+                    return missingVolume;
+                }
+                const uint32_t pitch = std::max(((fetch[0] >> 22) & 0x1FF) * 32, width);
+                const size_t sliceSize = tiled ? TiledSize(pitch, height, bytesPerTexel) : size_t(pitch) * ((height + 31) & ~31u) * bytesPerTexel;
+                const size_t rawSize = std::min<size_t>(sliceSize * depth, 0x20000000 - base);
+                const uint64_t key = (uint64_t(base) << 32) ^ (uint64_t(format) << 26) ^ (uint64_t(width) << 13) ^ height ^
+                                     (uint64_t(depth) * 0x9E3779B97F4A7C15ull) ^ (3ull << 61);
+                Texture& cached = textures[key];
+                if (cached.texture && (cached.epoch == epoch || memory::Unchanged(base, uint32_t(rawSize))))
+                {
+                    cached.epoch = epoch;
+                    return cached.texture;
+                }
+                if (WritebackOverlapping(base, rawSize))
+                    return VolumeFor(fetch);
+                memory::Watch(base, uint32_t(rawSize));
+                const auto* source = static_cast<const uint8_t*>(memory::Translate(0xA0000000 | base));
+                const uint64_t hash = HashMemory(source, rawSize);
+                if (cached.texture && cached.hash == hash)
+                {
+                    cached.epoch = epoch;
+                    return cached.texture;
+                }
+
+                MTLTextureDescriptor* descriptor = [[MTLTextureDescriptor alloc] init];
+                descriptor.textureType = MTLTextureType3D;
+                descriptor.pixelFormat = pixelFormat;
+                descriptor.width = width;
+                descriptor.height = height;
+                descriptor.depth = depth;
+                cached.texture = [device newTextureWithDescriptor:descriptor];
+                std::vector<uint8_t> data(size_t(width) * height * depth * bytesPerTexel);
+                for (uint32_t z = 0; z < depth; z++)
+                    for (uint32_t y = 0; y < height; y++)
+                        for (uint32_t x = 0; x < width; x++)
+                        {
+                            const size_t offset = z * sliceSize + (tiled ? TiledOffset(x, y, pitch, log2Bytes) : (size_t(y) * pitch + x) * bytesPerTexel);
+                            if (offset + bytesPerTexel <= rawSize)
+                                std::memcpy(&data[((size_t(z) * height + y) * width + x) * bytesPerTexel], source + offset, bytesPerTexel);
+                        }
                 for (size_t i = 0; i + 3 < data.size(); i += 4)
                 {
                     uint32_t word;
@@ -512,65 +1100,92 @@ namespace gpu
                     }
                     std::memcpy(&data[i], &word, 4);
                 }
-
-                // Textura nueva (no se reescribe la anterior: puede usarla un dibujo aún sin enviar).
-                MTLTextureDescriptor* descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pixelFormat
-                    width:width height:height mipmapped:NO];
-                cached.texture = [device newTextureWithDescriptor:descriptor];
-                [cached.texture replaceRegion:MTLRegionMake2D(0, 0, width, height) mipmapLevel:0 withBytes:data.data()
-                    bytesPerRow:blocksX * bytesPerBlock];
+                [cached.texture replaceRegion:MTLRegionMake3D(0, 0, 0, width, height, depth) mipmapLevel:0 slice:0 withBytes:data.data()
+                    bytesPerRow:width * bytesPerTexel bytesPerImage:size_t(width) * height * bytesPerTexel];
                 cached.hash = hash;
                 cached.epoch = epoch;
-                if (Trace())
-                    std::fprintf(stderr, "[render] textura 0x%08X %ux%u formato %u%s\n", base, width, height, format, tiled ? " (mosaico)" : "");
                 return cached.texture;
             }
 
             id<MTLSamplerState> SamplerFor(const uint32_t* fetch)
             {
-                // clamp_x/y: bits 10-12 y 13-15 de la palabra 0; filtros mag/min: bits 19-20 y 21-22 de la palabra 3.
-                const uint32_t key = ((fetch[0] >> 10) & 0x3F) | (((fetch[3] >> 19) & 0xF) << 6);
+                // clamp_x/y/z: bits 10-12, 13-15 y 16-18 de la palabra 0; filtros mag/min: bits 19-20 y 21-22 de
+                // la palabra 3; color del borde: bits 0-1 de la palabra 5 (0 = negro transparente, 1 = blanco).
+                // Filtro entre mipmaps: bits 23-24 de la palabra 3; anisótropo: bits 25-27.
+                const uint32_t key = ((fetch[0] >> 10) & 0x1FF) | (((fetch[3] >> 19) & 0x1FF) << 9) | ((fetch[5] & 3) << 18);
                 auto it = samplers.find(key);
                 if (it != samplers.end())
                     return it->second;
+                // Modos de Xenos: 0 repetir, 1 espejo, 2 último texel, 3 espejo una vez, 4 y 5 lo mismo hasta
+                // medio texel del borde (aquí como 2 y 3), 6 color del borde, 7 espejo y borde (aquí como 3).
                 auto address = [](uint32_t clamp) {
                     switch (clamp)
                     {
                     case 0: return MTLSamplerAddressModeRepeat;
                     case 1: return MTLSamplerAddressModeMirrorRepeat;
+                    case 3: case 5: case 7: return MTLSamplerAddressModeMirrorClampToEdge;
+                    case 6: return MTLSamplerAddressModeClampToBorderColor;
                     default: return MTLSamplerAddressModeClampToEdge;
                     }
                 };
                 MTLSamplerDescriptor* descriptor = [[MTLSamplerDescriptor alloc] init];
                 descriptor.sAddressMode = address((fetch[0] >> 10) & 7);
                 descriptor.tAddressMode = address((fetch[0] >> 13) & 7);
+                descriptor.rAddressMode = address((fetch[0] >> 16) & 7);
+                // El mapa de sombras, p. ej., usa borde blanco: fuera de él no hay sombra.
+                descriptor.borderColor = (fetch[5] & 3) == 1 ? MTLSamplerBorderColorOpaqueWhite : MTLSamplerBorderColorTransparentBlack;
                 descriptor.magFilter = ((fetch[3] >> 19) & 3) ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
                 descriptor.minFilter = ((fetch[3] >> 21) & 3) ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
+                // 0 = el más cercano, 1 = lineal, 2 = solo la base, 3 = lo que diga la instrucción (aquí lineal).
+                const uint32_t mipFilter = (fetch[3] >> 23) & 3;
+                descriptor.mipFilter = mipFilter == 0 ? MTLSamplerMipFilterNearest :
+                                       mipFilter == 2 ? MTLSamplerMipFilterNotMipmapped : MTLSamplerMipFilterLinear;
+                // Anisótropo: 0 = no, 1-5 = hasta 1, 2, 4, 8 y 16 muestras (6 y 7: de la instrucción; aquí 1).
+                const uint32_t aniso = (fetch[3] >> 25) & 7;
+                if (aniso >= 2 && aniso <= 5 && descriptor.minFilter == MTLSamplerMinMagFilterLinear)
+                    descriptor.maxAnisotropy = 1u << (aniso - 1);
                 id<MTLSamplerState> sampler = [device newSamplerStateWithDescriptor:descriptor];
                 samplers[key] = sampler;
                 return sampler;
             }
 
-            void BeginPass()
+            void BeginPass(uint32_t setIndex)
             {
-                if (encoder)
+                if (encoder && passSet == setIndex)
                     return;
+                EndPass(false);
+                passSet = setIndex;
+                RenderSet& set = sets[setIndex];
                 commands = [queue commandBuffer];
                 MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
-                pass.colorAttachments[0].texture = target;
-                pass.colorAttachments[0].loadAction = clearPending ? MTLLoadActionClear : MTLLoadActionLoad;
-                pass.colorAttachments[0].clearColor = clearColor;
-                pass.colorAttachments[0].storeAction = MTLStoreActionStore;
-                pass.depthAttachment.texture = depth;
-                pass.depthAttachment.loadAction = depthClearPending ? MTLLoadActionClear : MTLLoadActionLoad;
-                pass.depthAttachment.clearDepth = clearDepth;
-                pass.depthAttachment.storeAction = MTLStoreActionStore;
-                pass.stencilAttachment.texture = depth;
-                pass.stencilAttachment.loadAction = depthClearPending ? MTLLoadActionClear : MTLLoadActionLoad;
-                pass.stencilAttachment.clearStencil = clearStencil;
+                const bool msaa = set.samples > 1;
+                pass.colorAttachments[0].texture = msaa ? set.colorMS : set.color;
+                pass.colorAttachments[0].loadAction = set.clearPending ? MTLLoadActionClear : MTLLoadActionLoad;
+                pass.colorAttachments[0].clearColor = set.clearColor;
+                pass.depthAttachment.texture = msaa ? set.depthMS : set.depth;
+                pass.depthAttachment.loadAction = set.depthClearPending ? MTLLoadActionClear : MTLLoadActionLoad;
+                pass.depthAttachment.clearDepth = set.clearDepth;
+                pass.stencilAttachment.texture = msaa ? set.depthMS : set.depth;
+                pass.stencilAttachment.loadAction = set.depthClearPending ? MTLLoadActionClear : MTLLoadActionLoad;
+                pass.stencilAttachment.clearStencil = set.clearStencil;
                 pass.stencilAttachment.storeAction = MTLStoreActionStore;
-                clearPending = false;
-                depthClearPending = false;
+                if (msaa)
+                {
+                    // Se guardan las muestras (la pasada siguiente sigue encima) y se resuelve (muestra 0
+                    // para la profundidad) en las texturas de una muestra.
+                    pass.colorAttachments[0].resolveTexture = set.color;
+                    pass.colorAttachments[0].storeAction = MTLStoreActionStoreAndMultisampleResolve;
+                    pass.depthAttachment.resolveTexture = set.depth;
+                    pass.depthAttachment.depthResolveFilter = MTLMultisampleDepthResolveFilterSample0;
+                    pass.depthAttachment.storeAction = MTLStoreActionStoreAndMultisampleResolve;
+                }
+                else
+                {
+                    pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+                    pass.depthAttachment.storeAction = MTLStoreActionStore;
+                }
+                set.clearPending = false;
+                set.depthClearPending = false;
                 encoder = [commands renderCommandEncoderWithDescriptor:pass];
             }
 
@@ -593,9 +1208,10 @@ namespace gpu
 
             bool Draw(const DrawCall& draw)
             {
-                // De momento: listas de triángulos, tiras, listas de rectángulos y de quads.
+                // Puntos, listas de triángulos, abanicos, tiras, listas de rectángulos y de quads.
                 const uint32_t primitive = draw.primitive;
-                if ((primitive != 4 && primitive != 6 && primitive != 8 && primitive != 13) || draw.count == 0 ||
+                if ((primitive != 1 && primitive != 4 && primitive != 5 && primitive != 6 && primitive != 8 && primitive != 13) ||
+                    draw.count == 0 || (primitive == 5 && draw.count < 3) ||
                     draw.vertexShader->code.empty() || draw.pixelShader->code.empty())
                 {
                     skipped++;
@@ -610,9 +1226,29 @@ namespace gpu
                 }
 
                 const ConstantOffsets constants = UploadConstants(draw);
-                BeginPass();
+                const uint32_t setIndex = SetFor(draw.registers);
+                // PA_SU_SC_MODE_CNTL: cull_front (bit 0) y cull_back (bit 1), solo en polígonos (los
+                // rectángulos y puntos se expanden aquí, con el sentido que salga).
+                const uint32_t mode = draw.registers[kRegModeControl];
+                const bool polygon = primitive == 4 || primitive == 5 || primitive == 6 || primitive == 13;
+                if (polygon && (mode & 3) == 3)
+                    return true; // se descartan las dos caras: no queda nada
+                BeginPass(setIndex);
                 [encoder setRenderPipelineState:pipeline];
-                [encoder setCullMode:MTLCullModeNone];
+                [encoder setCullMode:!polygon ? MTLCullModeNone : (mode & 1) ? MTLCullModeFront : (mode & 2) ? MTLCullModeBack : MTLCullModeNone];
+                // Desplazamiento de profundidad (bits 11 y 12: caras delanteras y traseras; Metal tiene uno
+                // solo). Como Xenia: la escala va en 1/16 de píxel (y por píxel de la escala de
+                // resolución) y el desplazamiento en unidades de una profundidad de 24 bits.
+                if (polygon && (mode & 0x1800))
+                {
+                    const uint32_t reg = kRegPolyOffsetFront + ((mode & 0x800) ? 0 : 2);
+                    [encoder setDepthBias:AsFloat(draw.registers[reg + 1]) * 16777216.0f
+                        slopeScale:AsFloat(draw.registers[reg]) * (1.0f / 16.0f) * scale clamp:0.0f];
+                }
+                else
+                {
+                    [encoder setDepthBias:0.0f slopeScale:0.0f clamp:0.0f];
+                }
                 [encoder setDepthStencilState:DepthState(draw.registers)];
                 [encoder setStencilFrontReferenceValue:draw.registers[kRegStencilFront] & 0xFF
                     backReferenceValue:((draw.registers[kRegDepthControl] & 0x80) ? draw.registers[kRegStencilBack] : draw.registers[kRegStencilFront]) & 0xFF];
@@ -631,13 +1267,23 @@ namespace gpu
                     state.viewportScale[i] = AsFloat(draw.registers[kRegViewportXScale + i * 2]);
                     state.viewportOffset[i] = AsFloat(draw.registers[kRegViewportXScale + i * 2 + 1]);
                 }
-                state.targetSize[0] = kTargetWidth;
-                state.targetSize[1] = kTargetHeight;
+                state.targetSize[0] = sets[setIndex].width;
+                state.targetSize[1] = sets[setIndex].height;
                 int32_t windowX, windowY;
                 WindowOffset(draw.registers, windowX, windowY);
                 state.windowOffset[0] = float(windowX);
                 state.windowOffset[1] = float(windowY);
                 std::memcpy(state.bools, &draw.registers[kRegBoolConstants], sizeof(state.bools));
+                state.alphaTest = draw.registers[kRegColorControl] & 0x1F;
+                if (sets[setIndex].samples > 1)
+                    state.alphaTest &= ~0x10u; // alpha-to-mask: lo hace la cobertura por alfa del pipeline
+                state.alphaRef = AsFloat(draw.registers[kRegAlphaRef]);
+                // Tamaños de punto en 12.4 de coma fija, como radio (Xenia: diámetro = valor * 2 / 16).
+                const uint32_t pointSize = draw.registers[kRegPointSize], pointMinMax = draw.registers[kRegPointMinMax];
+                state.pointSize[0] = (pointSize >> 16) / 8.0f;
+                state.pointSize[1] = (pointSize & 0xFFFF) / 8.0f;
+                state.pointMinMax[0] = (pointMinMax & 0xFFFF) / 8.0f;
+                state.pointMinMax[1] = (pointMinMax >> 16) / 8.0f;
 
                 const uint32_t* fetchConstants = &draw.registers[kRegFetchConstants];
                 [encoder setVertexBuffer:memory offset:0 atIndex:0];
@@ -648,26 +1294,56 @@ namespace gpu
                 [encoder setFragmentBuffer:constantRing offset:constants.pixel atIndex:1];
                 [encoder setFragmentBuffer:constantRing offset:constants.fetch atIndex:2];
                 [encoder setFragmentBytes:&state length:sizeof(state) atIndex:3];
-                for (uint32_t slot : textureSlots)
+                for (uint32_t entry : textureSlots)
                 {
+                    const uint32_t slot = entry & 31;
+                    const uint32_t kind = entry & (kCubeSlot | kVolumeSlot);
                     const uint32_t* fetch = &fetchConstants[slot * 6];
-                    SlotMemo& memo = slotMemos[slot & 31];
-                    if (memo.epoch != epoch || std::memcmp(memo.fetch, fetch, sizeof(memo.fetch)) != 0)
+                    SlotMemo& memo = slotMemos[slot];
+                    if (memo.epoch != epoch || memo.kind != kind || std::memcmp(memo.fetch, fetch, sizeof(memo.fetch)) != 0)
                     {
-                        memo.texture = TextureFor(fetch);
+                        memo.texture = kind == kVolumeSlot ? VolumeFor(fetch) : TextureFor(fetch, kind == kCubeSlot);
                         memo.sampler = SamplerFor(fetch);
                         std::memcpy(memo.fetch, fetch, sizeof(memo.fetch));
                         memo.epoch = epoch;
+                        memo.kind = kind;
+                    }
+                    static const bool traceDepth = Trace();
+                    if (traceDepth)
+                    {
+                        // Qué shaders de píxeles leen una profundidad (resolve de fuente 4) y en qué ranura.
+                        static std::unordered_set<uint64_t> reported;
+                        const uint32_t format = fetch[1] & 0x3F;
+                        if ((format == 22 || format == 23) && reported.insert(draw.pixelShader->hash * 32 + slot).second)
+                            std::fprintf(stderr, "[render] ps_%016llx lee profundidad en t%u (0x%08X, %s) fetch %08X %08X %08X %08X %08X %08X\n",
+                                (unsigned long long)draw.pixelShader->hash, slot, fetch[1] & 0xFFFFF000,
+                                memo.texture == farDepthTexture ? "sin resolve" : "resolve",
+                                fetch[0], fetch[1], fetch[2], fetch[3], fetch[4], fetch[5]);
                     }
                     [encoder setFragmentTexture:memo.texture atIndex:slot];
                     [encoder setFragmentSamplerState:memo.sampler atIndex:slot];
                 }
 
-                const uint32_t vertices = primitive == 13 ? draw.count / 4 * 6 : primitive == 8 ? draw.count / 3 * 6 : draw.count;
+                const uint32_t vertices = primitive == 13 ? draw.count / 4 * 6 : primitive == 8 ? draw.count / 3 * 6 :
+                                          primitive == 5 ? (draw.count - 2) * 3 : primitive == 1 ? draw.count * 6 : draw.count;
                 [encoder drawPrimitives:primitive == 6 ? MTLPrimitiveTypeTriangleStrip : MTLPrimitiveTypeTriangle
                     vertexStart:0 vertexCount:vertices];
                 draws++;
                 return true;
+            }
+
+            // Lee de una textura a la escala de resolución el rectángulo que corresponde a uno del juego
+            // (left, top, width, height). El píxel (x, y) del juego es el (Scaled(x), Scaled(y)) leído.
+            void ReadScaled(id<MTLTexture> texture, uint32_t left, uint32_t top, uint32_t width, uint32_t height,
+                std::vector<uint32_t>& pixels, uint32_t& scaledLeft, uint32_t& scaledTop, uint32_t& scaledWidth)
+            {
+                scaledLeft = Scaled(left);
+                scaledTop = Scaled(top);
+                scaledWidth = std::min<uint32_t>(Scaled(left + width - 1) + 1, uint32_t(texture.width)) - scaledLeft;
+                const uint32_t scaledHeight = std::min<uint32_t>(Scaled(top + height - 1) + 1, uint32_t(texture.height)) - scaledTop;
+                pixels.assign(size_t(scaledWidth) * scaledHeight, 0);
+                [texture getBytes:pixels.data() bytesPerRow:scaledWidth * 4
+                    fromRegion:MTLRegionMake2D(scaledLeft, scaledTop, scaledWidth, scaledHeight) mipmapLevel:0];
             }
 
             // Escribe en la memoria del juego (con mosaico y su orden de bytes) lo que un resolve
@@ -681,13 +1357,14 @@ namespace gpu
                 [lastCommit waitUntilCompleted];
                 const uint32_t left = surface.pendingLeft, top = surface.pendingTop;
                 const uint32_t width = surface.pendingRight - left, height = surface.pendingBottom - top;
-                std::vector<uint32_t> pixels(size_t(width) * height);
-                [surface.texture getBytes:pixels.data() bytesPerRow:width * 4 fromRegion:MTLRegionMake2D(left, top, width, height) mipmapLevel:0];
+                std::vector<uint32_t> pixels;
+                uint32_t scaledLeft, scaledTop, scaledWidth;
+                ReadScaled(surface.texture, left, top, width, height, pixels, scaledLeft, scaledTop, scaledWidth);
                 auto* dest = static_cast<uint8_t*>(memory::Translate(0xA0000000 | surface.base));
                 for (uint32_t y = 0; y < height; y++)
                     for (uint32_t x = 0; x < width; x++)
                     {
-                        const uint32_t rgba = pixels[size_t(y) * width + x];
+                        const uint32_t rgba = pixels[size_t(Scaled(top + y) - scaledTop) * scaledWidth + Scaled(left + x) - scaledLeft];
                         uint32_t value = (rgba & 0xFF00FF00) | ((rgba & 0xFF) << 16) | ((rgba >> 16) & 0xFF);
                         switch (surface.endian)
                         {
@@ -719,29 +1396,37 @@ namespace gpu
                 return wrote;
             }
 
-            // El front buffer para la ventana, directamente de la copia en la GPU (BGRA, sin mosaico).
-            bool ReadFrame(uint32_t base, uint32_t width, uint32_t height, uint32_t* pixels)
+            // El front buffer para la ventana, directamente de la copia en la GPU (BGRA, sin mosaico,
+            // a la escala de resolución). Después se aplica un cambio de escala pedido.
+            bool ReadFrame(uint32_t base, uint32_t width, uint32_t height, Frame& frame)
             {
                 epoch++;
+                bool found = false;
                 for (ResolvedSurface& surface : surfaces)
                 {
                     if (surface.base != base || surface.pitch != width || surface.height < height)
                         continue;
                     EndPass(false);
                     [lastCommit waitUntilCompleted];
-                    [surface.texture getBytes:pixels bytesPerRow:width * 4 fromRegion:MTLRegionMake2D(0, 0, width, height) mipmapLevel:0];
-                    for (size_t i = 0, n = size_t(width) * height; i < n; i++)
+                    frame.width = std::min<uint32_t>(Scaled(width), uint32_t(surface.texture.width));
+                    frame.height = std::min<uint32_t>(Scaled(height), uint32_t(surface.texture.height));
+                    frame.pixels.resize(size_t(frame.width) * frame.height);
+                    [surface.texture getBytes:frame.pixels.data() bytesPerRow:frame.width * 4
+                        fromRegion:MTLRegionMake2D(0, 0, frame.width, frame.height) mipmapLevel:0];
+                    for (uint32_t& pixel : frame.pixels)
                     {
-                        const uint32_t rgba = pixels[i];
-                        pixels[i] = (rgba & 0x0000FF00) | ((rgba & 0xFF) << 16) | ((rgba >> 16) & 0xFF) | 0xFF000000u;
+                        const uint32_t rgba = pixel;
+                        pixel = (rgba & 0x0000FF00) | ((rgba & 0xFF) << 16) | ((rgba >> 16) & 0xFF) | 0xFF000000u;
                     }
-                    return true;
+                    found = true;
+                    break;
                 }
-                return false;
+                ApplySettings();
+                return found;
             }
 
             // Copia en la GPU de lo que acaba de escribir un resolve (ver ResolvedSurface).
-            void UpdateSurface(uint32_t base, uint32_t pitch, uint32_t height, uint32_t endian,
+            void UpdateSurface(id<MTLTexture> source, uint32_t base, uint32_t pitch, uint32_t height, uint32_t endian,
                 uint32_t left, uint32_t top, uint32_t width, uint32_t rows, bool deferred)
             {
                 // ¿Es una franja de una imagen ya conocida? Las filas de 32 en 32 son contiguas.
@@ -772,7 +1457,7 @@ namespace gpu
                         surfaces.erase(surfaces.begin());
                     }
                     MTLTextureDescriptor* descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
-                        width:pitch height:height mipmapped:NO];
+                        width:Scaled(pitch) height:Scaled(height) mipmapped:NO];
                     descriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
                     descriptor.storageMode = MTLStorageModeShared; // se lee al escribir la memoria o presentar
                     ResolvedSurface created;
@@ -789,12 +1474,21 @@ namespace gpu
                     offsetY = 0;
                 }
                 surface->endian = endian;
+                surface->version = ++surfaceVersions; // único entre todas: una imagen nueva no repite número
 
+                // A la escala: el tamaño sale del destino (así las franjas seguidas no dejan huecos),
+                // recortado a las dos texturas.
+                const uint32_t sourceX = Scaled(left), sourceY = Scaled(top);
+                const uint32_t destY = Scaled(offsetY + top);
+                const uint32_t copyWidth = std::min({ Scaled(left + width) - sourceX, uint32_t(source.width) - sourceX,
+                    uint32_t(surface->texture.width) - sourceX });
+                const uint32_t copyRows = std::min({ Scaled(offsetY + top + rows) - destY, uint32_t(source.height) - sourceY,
+                    uint32_t(surface->texture.height) - destY });
                 id<MTLCommandBuffer> copy = [queue commandBuffer];
                 id<MTLBlitCommandEncoder> blit = [copy blitCommandEncoder];
-                [blit copyFromTexture:target sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(left, top, 0)
-                    sourceSize:MTLSizeMake(width, rows, 1) toTexture:surface->texture destinationSlice:0 destinationLevel:0
-                    destinationOrigin:MTLOriginMake(left, offsetY + top, 0)];
+                [blit copyFromTexture:source sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(sourceX, sourceY, 0)
+                    sourceSize:MTLSizeMake(copyWidth, copyRows, 1) toTexture:surface->texture destinationSlice:0 destinationLevel:0
+                    destinationOrigin:MTLOriginMake(sourceX, destY, 0)];
                 [blit endEncoding];
                 [copy commit];
                 lastCommit = copy;
@@ -849,6 +1543,84 @@ namespace gpu
                 right = uint32_t(maxX); bottom = uint32_t(maxY);
             }
 
+            // Copia la profundidad (en la GPU) a la DepthSurface de su dirección. El rectángulo es el de
+            // los vértices recortado por PA_SC_WINDOW_SCISSOR, y con el desplazamiento de ventana pasa a
+            // la EDRAM y a la franja de destino (cuya base ya apunta a ella).
+            void ResolveDepth(const uint32_t* registers, uint32_t base, uint32_t pitch, uint32_t height)
+            {
+                const RenderSet& set = sets[SetFor(registers)];
+                const uint32_t vertices = 0xA0000000 | (registers[kRegFetchConstants] & 0x1FFFFFFC);
+                float minX = 1e9f, minY = 1e9f, maxX = -1e9f, maxY = -1e9f;
+                for (int i = 0; i < 3; i++)
+                {
+                    const float x = AsFloat(__builtin_bswap32(*static_cast<const uint32_t*>(memory::Translate(vertices + i * 8))));
+                    const float y = AsFloat(__builtin_bswap32(*static_cast<const uint32_t*>(memory::Translate(vertices + i * 8 + 4))));
+                    minX = std::min(minX, x); maxX = std::max(maxX, x);
+                    minY = std::min(minY, y); maxY = std::max(maxY, y);
+                }
+                const uint32_t scissorTL = registers[0x2081], scissorBR = registers[0x2082];
+                minX = std::max(minX, float(scissorTL & 0x7FFF)); minY = std::max(minY, float((scissorTL >> 16) & 0x7FFF));
+                maxX = std::min(maxX, float(scissorBR & 0x7FFF)); maxY = std::min(maxY, float((scissorBR >> 16) & 0x7FFF));
+                int32_t windowX, windowY;
+                WindowOffset(registers, windowX, windowY);
+                const int32_t left = std::max(int32_t(minX) + windowX, 0), top = std::max(int32_t(minY) + windowY, 0);
+                const int32_t right = std::min({ int32_t(maxX) + windowX, int32_t(pitch), int32_t(set.width) });
+                const int32_t bottom = std::min({ int32_t(maxY) + windowY, int32_t(height), int32_t(set.height) });
+                if (right <= left || bottom <= top || pitch == 0 || height == 0)
+                    return;
+
+                // ¿Una franja de una imagen ya conocida?
+                DepthSurface* surface = nullptr;
+                uint32_t offsetY = 0;
+                for (DepthSurface& candidate : depthSurfaces)
+                    if (candidate.pitch == pitch && base >= candidate.base && base < candidate.base + candidate.pitch * 4 * candidate.height &&
+                        (base - candidate.base) % (pitch * 4) == 0)
+                    {
+                        surface = &candidate;
+                        offsetY = (base - candidate.base) / (pitch * 4);
+                        break;
+                    }
+                if (!surface || offsetY + bottom > surface->height)
+                {
+                    if (surface)
+                        depthSurfaces.erase(depthSurfaces.begin() + (surface - depthSurfaces.data()));
+                    if (depthSurfaces.size() >= 8)
+                        depthSurfaces.erase(depthSurfaces.begin());
+                    DepthSurface created;
+                    created.base = base;
+                    created.pitch = pitch;
+                    created.height = height;
+                    MTLTextureDescriptor* descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR32Float
+                        width:Scaled(std::min(pitch, kTargetWidth)) height:Scaled(std::min(height, kTargetHeight)) mipmapped:NO];
+                    descriptor.usage = MTLTextureUsageShaderRead;
+                    descriptor.storageMode = MTLStorageModePrivate;
+                    created.texture = [device newTextureWithDescriptor:descriptor];
+                    depthSurfaces.push_back(created);
+                    surface = &depthSurfaces.back();
+                    offsetY = 0;
+                }
+                if (Scaled(offsetY + bottom) > surface->texture.height)
+                    return;
+
+                EndPass(false);
+                // A la escala de resolución, como en UpdateSurface.
+                const uint32_t sourceX = Scaled(left), sourceY = Scaled(top), destY = Scaled(offsetY + top);
+                const uint32_t width = std::min({ Scaled(right) - sourceX, uint32_t(set.depth.width) - sourceX, uint32_t(surface->texture.width) - sourceX });
+                const uint32_t rows = std::min(Scaled(offsetY + bottom) - destY, uint32_t(set.depth.height) - sourceY);
+                id<MTLCommandBuffer> copy = [queue commandBuffer];
+                id<MTLBlitCommandEncoder> blit = [copy blitCommandEncoder];
+                [blit copyFromTexture:set.depth sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(sourceX, sourceY, 0)
+                    sourceSize:MTLSizeMake(width, rows, 1) toBuffer:depthStaging destinationOffset:0
+                    destinationBytesPerRow:width * 4 destinationBytesPerImage:size_t(width) * rows * 4
+                    options:MTLBlitOptionDepthFromDepthStencil];
+                [blit copyFromBuffer:depthStaging sourceOffset:0 sourceBytesPerRow:width * 4 sourceBytesPerImage:size_t(width) * rows * 4
+                    sourceSize:MTLSizeMake(width, rows, 1) toTexture:surface->texture destinationSlice:0 destinationLevel:0
+                    destinationOrigin:MTLOriginMake(sourceX, destY, 0)];
+                [blit endEncoding];
+                [copy commit];
+                lastCommit = copy;
+            }
+
             void Resolve(const uint32_t* registers)
             {
                 resolves++;
@@ -878,31 +1650,35 @@ namespace gpu
                 // Copiar la EDRAM a memoria (solo color, formato 8_8_8_8 por ahora). El rectángulo
                 // está en coordenadas de pantalla: con el desplazamiento de ventana pasa a las de
                 // la EDRAM, que son también las del destino (cuya base ya apunta a la franja).
+                RenderSet& set = sets[SetFor(registers)];
                 uint32_t left = 0, top = 0, right = destPitch, bottom = destHeight;
                 ResolveRect(registers, left, top, right, bottom);
-                right = std::min({right, destPitch, kTargetWidth});
-                bottom = std::min({bottom, destHeight, kTargetHeight});
+                right = std::min({right, destPitch, set.width});
+                bottom = std::min({bottom, destHeight, set.height});
                 if (immediateWriteback)
                     epoch++; // la memoria cambia en el acto
-                if (source < 4 && destFormat == 6 && destBase && right > left && bottom > top && !immediateWriteback)
+                if (source == 4 && destBase)
+                    ResolveDepth(registers, destBase & 0x1FFFFFFF, destPitch, destHeight);
+                else if (source < 4 && destFormat == 6 && destBase && right > left && bottom > top && !immediateWriteback)
                 {
                     // Solo en la GPU: la memoria se escribe cuando alguien la necesita (WritebackSurface).
                     EndPass(false);
-                    UpdateSurface(destBase & 0x1FFFFFFF, destPitch, destHeight, destEndian, left, top, right - left, bottom - top, true);
+                    UpdateSurface(set.color, destBase & 0x1FFFFFFF, destPitch, destHeight, destEndian, left, top, right - left, bottom - top, true);
                 }
                 else if (source < 4 && destFormat == 6 && destBase && right > left && bottom > top)
                 {
                     EndPass(true);
                     const uint32_t width = right - left, height = bottom - top;
-                    std::vector<uint32_t> pixels(size_t(width) * height);
-                    [target getBytes:pixels.data() bytesPerRow:width * 4 fromRegion:MTLRegionMake2D(left, top, width, height) mipmapLevel:0];
+                    std::vector<uint32_t> pixels;
+                    uint32_t scaledLeft, scaledTop, scaledWidth;
+                    ReadScaled(set.color, left, top, width, height, pixels, scaledLeft, scaledTop, scaledWidth);
                     auto* dest = static_cast<uint8_t*>(memory::Translate(0xA0000000 | (destBase & 0x1FFFFFFF)));
                     for (uint32_t y = 0; y < height; y++)
                     {
                         for (uint32_t x = 0; x < width; x++)
                         {
                             // RGBA8 de Metal (R en el byte bajo) -> palabra 0xAARRGGBB en memoria.
-                            const uint32_t rgba = pixels[size_t(y) * width + x];
+                            const uint32_t rgba = pixels[size_t(Scaled(top + y) - scaledTop) * scaledWidth + Scaled(left + x) - scaledLeft];
                             uint32_t value = (rgba & 0xFF00FF00) | ((rgba & 0xFF) << 16) | ((rgba >> 16) & 0xFF);
                             switch (destEndian)
                             {
@@ -914,7 +1690,7 @@ namespace gpu
                             std::memcpy(dest + TiledOffset(left + x, top + y, destPitch, 2), &value, 4);
                         }
                     }
-                    UpdateSurface(destBase & 0x1FFFFFFF, destPitch, destHeight, destEndian, left, top, width, height, false);
+                    UpdateSurface(set.color, destBase & 0x1FFFFFFF, destPitch, destHeight, destEndian, left, top, width, height, false);
                 }
 
                 // Borrado tras la copia (RB_COPY_CONTROL bit 8): en la siguiente pasada.
@@ -922,9 +1698,9 @@ namespace gpu
                 {
                     EndPass(false);
                     const uint32_t clear = registers[kRegColorClear];
-                    clearColor = MTLClearColorMake(((clear >> 16) & 0xFF) / 255.0, ((clear >> 8) & 0xFF) / 255.0,
+                    set.clearColor = MTLClearColorMake(((clear >> 16) & 0xFF) / 255.0, ((clear >> 8) & 0xFF) / 255.0,
                         (clear & 0xFF) / 255.0, ((clear >> 24) & 0xFF) / 255.0);
-                    clearPending = true;
+                    set.clearPending = true;
                 }
                 // Borrado de profundidad / stencil (bit 9). D24S8 o D24FS8 (20e4) según RB_DEPTH_INFO.
                 if (control & 0x200)
@@ -934,15 +1710,15 @@ namespace gpu
                     if (registers[kRegDepthInfo] & 0x10000)
                     {
                         const uint32_t exponent = value >> 20, mantissa = value & 0xFFFFF;
-                        clearDepth = exponent ? std::ldexp(1.0 + mantissa / 1048576.0, int(exponent) - 15) : std::ldexp(mantissa / 1048576.0, -14);
-                        clearDepth = std::min(clearDepth, 1.0);
+                        set.clearDepth = exponent ? std::ldexp(1.0 + mantissa / 1048576.0, int(exponent) - 15) : std::ldexp(mantissa / 1048576.0, -14);
+                        set.clearDepth = std::min(set.clearDepth, 1.0);
                     }
                     else
                     {
-                        clearDepth = value / 16777215.0;
+                        set.clearDepth = value / 16777215.0;
                     }
-                    clearStencil = uint8_t(clear & 0xFF);
-                    depthClearPending = true;
+                    set.clearStencil = uint8_t(clear & 0xFF);
+                    set.depthClearPending = true;
                 }
             }
         };
@@ -976,13 +1752,33 @@ namespace gpu
         }
     }
 
-    bool RendererReadFrame(uint32_t physical, uint32_t width, uint32_t height, uint32_t* pixels)
+    bool RendererReadFrame(uint32_t physical, uint32_t width, uint32_t height, Frame& frame)
     {
         @autoreleasepool
         {
             Renderer* renderer = Get();
-            return renderer && renderer->ReadFrame(physical & 0x1FFFFFFF, width, height, pixels);
+            return renderer && renderer->ReadFrame(physical & 0x1FFFFFFF, width, height, frame);
         }
+    }
+
+    void SetResolutionScale(float scale)
+    {
+        gRequestedScale = std::clamp(scale, 1.0f, 2.0f);
+    }
+
+    float ResolutionScale()
+    {
+        return gRequestedScale.load();
+    }
+
+    void SetAntialiasing(bool enabled)
+    {
+        gRequestedMsaa = enabled;
+    }
+
+    bool Antialiasing()
+    {
+        return gRequestedMsaa.load();
     }
 
     void RendererResolve(const uint32_t* registers)
