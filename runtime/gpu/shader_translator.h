@@ -46,5 +46,7 @@ namespace gpu
         uint32_t bools[8];      // constantes booleanas (256 bits)
         uint32_t alphaTest;     // RB_COLORCONTROL: función 0-2, prueba activa 3, alpha-to-mask 4
         float alphaRef;         // RB_ALPHA_REF
+        float pointSize[2];     // PA_SU_POINT_SIZE (ancho, alto), en píxeles
+        float pointMinMax[2];   // PA_SU_POINT_MINMAX: límites del tamaño que exporta el shader
     };
 }

@@ -29,6 +29,8 @@ namespace gpu
         constexpr uint32_t kRegColorControl = 0x2202;  // RB_COLORCONTROL (prueba alfa)
         constexpr uint32_t kRegAlphaRef = 0x210E;      // RB_ALPHA_REF
         constexpr uint32_t kRegVteControl = 0x2206;   // PA_CL_VTE_CNTL
+        constexpr uint32_t kRegPointSize = 0x2280;    // PA_SU_POINT_SIZE: alto 0-15, ancho 16-31
+        constexpr uint32_t kRegPointMinMax = 0x2281;  // PA_SU_POINT_MINMAX: mínimo 0-15, máximo 16-31
         constexpr uint32_t kRegWindowOffset = 0x2080; // PA_SC_WINDOW_OFFSET
         constexpr uint32_t kRegModeControl = 0x2205;  // PA_SU_SC_MODE_CNTL
         constexpr uint32_t kRegDepthInfo = 0x2002;    // RB_DEPTH_INFO (bit 16: profundidad en coma flotante)
@@ -967,9 +969,10 @@ namespace gpu
 
             bool Draw(const DrawCall& draw)
             {
-                // De momento: listas de triángulos, tiras, listas de rectángulos y de quads.
+                // Puntos, listas de triángulos, abanicos, tiras, listas de rectángulos y de quads.
                 const uint32_t primitive = draw.primitive;
-                if ((primitive != 4 && primitive != 6 && primitive != 8 && primitive != 13) || draw.count == 0 ||
+                if ((primitive != 1 && primitive != 4 && primitive != 5 && primitive != 6 && primitive != 8 && primitive != 13) ||
+                    draw.count == 0 || (primitive == 5 && draw.count < 3) ||
                     draw.vertexShader->code.empty() || draw.pixelShader->code.empty())
                 {
                     skipped++;
@@ -1017,6 +1020,12 @@ namespace gpu
                 if (sets[setIndex].samples > 1)
                     state.alphaTest &= ~0x10u; // alpha-to-mask: lo hace la cobertura por alfa del pipeline
                 state.alphaRef = AsFloat(draw.registers[kRegAlphaRef]);
+                // Tamaños de punto en 12.4 de coma fija, como radio (Xenia: diámetro = valor * 2 / 16).
+                const uint32_t pointSize = draw.registers[kRegPointSize], pointMinMax = draw.registers[kRegPointMinMax];
+                state.pointSize[0] = (pointSize >> 16) / 8.0f;
+                state.pointSize[1] = (pointSize & 0xFFFF) / 8.0f;
+                state.pointMinMax[0] = (pointMinMax & 0xFFFF) / 8.0f;
+                state.pointMinMax[1] = (pointMinMax >> 16) / 8.0f;
 
                 const uint32_t* fetchConstants = &draw.registers[kRegFetchConstants];
                 [encoder setVertexBuffer:memory offset:0 atIndex:0];
@@ -1057,7 +1066,8 @@ namespace gpu
                     [encoder setFragmentSamplerState:memo.sampler atIndex:slot];
                 }
 
-                const uint32_t vertices = primitive == 13 ? draw.count / 4 * 6 : primitive == 8 ? draw.count / 3 * 6 : draw.count;
+                const uint32_t vertices = primitive == 13 ? draw.count / 4 * 6 : primitive == 8 ? draw.count / 3 * 6 :
+                                          primitive == 5 ? (draw.count - 2) * 3 : primitive == 1 ? draw.count * 6 : draw.count;
                 [encoder drawPrimitives:primitive == 6 ? MTLPrimitiveTypeTriangleStrip : MTLPrimitiveTypeTriangle
                     vertexStart:0 vertexCount:vertices];
                 draws++;

@@ -17,7 +17,7 @@ struct DrawState
 {
     uint primitive; uint indexSize; uint indexBase; uint indexEndian; uint indexOffset; uint vte;
     float viewportScale[4]; float viewportOffset[4]; float targetSize[2]; float windowOffset[2]; uint bools[8];
-    uint alphaTest; float alphaRef;
+    uint alphaTest; float alphaRef; float pointSize[2]; float pointMinMax[2];
 };
 
 // Prueba alfa de Xenos (fija, no del shader). Las funciones van en el orden de las de profundidad.
@@ -260,7 +260,7 @@ inline bool bool_constant(constant DrawState& st, uint index) { return (st.bools
                         return "opos";
                     if (reg < 16)
                         return "o[" + std::to_string(reg) + "]";
-                    return "odiscard"; // 63 (tamaño de punto, etc.): se ignora
+                    return "odiscard"; // 63: x = tamaño de punto (lo demás se ignora)
                 }
                 if (reg < 4)
                     return "oc[" + std::to_string(reg) + "]";
@@ -647,7 +647,7 @@ inline bool bool_constant(constant DrawState& st, uint index) { return (st.bools
                     // El shader del juego va en una función aparte (<entrada>_run): las listas de
                     // rectángulos necesitan ejecutarlo para tres vértices y deducir el cuarto.
                     out << "static VSOut " << entry << "_run(uint index, device const uint* mem, constant float4* c,\n"
-                        << "    constant uint* fc, constant DrawState& st)\n{\n";
+                        << "    constant uint* fc, constant DrawState& st, thread float& pointSize)\n{\n";
                     out << R"MSL(    if (st.indexSize == 2)
     {
         uint address = st.indexBase + index * 2;
@@ -687,6 +687,8 @@ inline bool bool_constant(constant DrawState& st, uint index) { return (st.bools
     window.xy += float2(st.windowOffset[0], st.windowOffset[1]); // PA_SC_WINDOW_OFFSET (tiling)
     float2 clip = float2(window.x / st.targetSize[0] * 2.0f - 1.0f, 1.0f - window.y / st.targetSize[1] * 2.0f);
 
+    pointSize = odiscard.x;
+
     VSOut result;
     result.position = float4(clip * wOut, window.z * wOut, wOut);
     result.i0 = o[0]; result.i1 = o[1]; result.i2 = o[2]; result.i3 = o[3];
@@ -698,11 +700,29 @@ inline bool bool_constant(constant DrawState& st, uint index) { return (st.bools
 )MSL";
                     out << "vertex VSOut " << entry << "(uint vid [[vertex_id]], device const uint* mem [[buffer(0)]],\n"
                         << "    constant float4* c [[buffer(1)]], constant uint* fc [[buffer(2)]], constant DrawState& st [[buffer(3)]])\n{\n";
-                    out << R"MSL(    // Listas de quads: dos triángulos por quad (0 1 2, 0 2 3).
+                    out << R"MSL(    float pointSize;
+    // Listas de quads: dos triángulos por quad (0 1 2, 0 2 3).
     if (st.primitive == 13)
     {
         const uint corners[6] = { 0, 1, 2, 0, 2, 3 };
-        return )MSL" << entry << R"MSL(_run((vid / 6) * 4 + corners[vid % 6], mem, c, fc, st);
+        return )MSL" << entry << R"MSL(_run((vid / 6) * 4 + corners[vid % 6], mem, c, fc, st, pointSize);
+    }
+    // Abanicos de triángulos: (0, k + 1, k + 2).
+    if (st.primitive == 5)
+    {
+        uint k = vid % 3;
+        return )MSL" << entry << R"MSL(_run(k == 0 ? 0 : vid / 3 + k, mem, c, fc, st, pointSize);
+    }
+    // Listas de puntos: un cuadrado por punto (dos triángulos), del tamaño que exporta el shader
+    // (limitado por PA_SU_POINT_MINMAX) o, si no exporta ninguno, el de PA_SU_POINT_SIZE.
+    if (st.primitive == 1)
+    {
+        const float2 corners[6] = { float2(-1, -1), float2(1, -1), float2(1, 1), float2(-1, -1), float2(1, 1), float2(-1, 1) };
+        VSOut v = )MSL" << entry << R"MSL(_run(vid / 6, mem, c, fc, st, pointSize);
+        float2 size = pointSize > 0.0f ? float2(clamp(pointSize, st.pointMinMax[0], st.pointMinMax[1]))
+                                       : float2(st.pointSize[0], st.pointSize[1]);
+        v.position.xy += corners[vid % 6] * size / float2(st.targetSize[0], st.targetSize[1]) * v.position.w;
+        return v;
     }
     // Listas de rectángulos: 3 esquinas por rectángulo. El primer triángulo son las tres; el
     // segundo usa la cuarta, P + Q - R, donde R es la esquina en ángulo recto (la opuesta al
@@ -711,10 +731,10 @@ inline bool bool_constant(constant DrawState& st, uint index) { return (st.bools
     {
         uint rect = vid / 6, k = vid % 6;
         if (k < 3)
-            return )MSL" << entry << R"MSL(_run(rect * 3 + k, mem, c, fc, st);
+            return )MSL" << entry << R"MSL(_run(rect * 3 + k, mem, c, fc, st, pointSize);
         VSOut v[3];
         for (uint i = 0; i < 3; i++)
-            v[i] = )MSL" << entry << R"MSL(_run(rect * 3 + i, mem, c, fc, st);
+            v[i] = )MSL" << entry << R"MSL(_run(rect * 3 + i, mem, c, fc, st, pointSize);
         float2 p0 = v[0].position.xy / v[0].position.w, p1 = v[1].position.xy / v[1].position.w,
                p2 = v[2].position.xy / v[2].position.w;
         float d01 = distance_squared(p0, p1), d12 = distance_squared(p1, p2), d02 = distance_squared(p0, p2);
@@ -734,7 +754,7 @@ inline bool bool_constant(constant DrawState& st, uint index) { return (st.bools
         result.i14 = v[a].i14 + v[b].i14 - v[r].i14; result.i15 = v[a].i15 + v[b].i15 - v[r].i15;
         return result;
     }
-    return )MSL" << entry << R"MSL(_run(vid, mem, c, fc, st);
+    return )MSL" << entry << R"MSL(_run(vid, mem, c, fc, st, pointSize);
 }
 )MSL";
                 }
