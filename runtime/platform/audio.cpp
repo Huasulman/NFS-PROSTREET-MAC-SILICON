@@ -29,6 +29,41 @@ namespace platform
         bool gRunning = false;
         AudioComponentInstance gUnit = nullptr;
 
+        // PROSTREET_AUDIO_DUMP=archivo.wav: graba la mezcla estéreo (también sin salida de sonido).
+        // La cabecera se rellena al final de cada bloque, así que el archivo vale aunque se corte.
+        FILE* gDump = nullptr;
+        uint32_t gDumpBytes = 0;
+
+        void WriteDump(const float* stereo)
+        {
+            static bool opened = false;
+            if (!opened)
+            {
+                opened = true;
+                if (const char* path = std::getenv("PROSTREET_AUDIO_DUMP"))
+                    gDump = std::fopen(path, "wb");
+            }
+            if (!gDump)
+                return;
+            int16_t samples[kAudioFrameSamples * 2];
+            for (uint32_t i = 0; i < kAudioFrameSamples * 2; i++)
+                samples[i] = int16_t(std::lround(stereo[i] * 32767.0f));
+            std::fseek(gDump, 44 + long(gDumpBytes), SEEK_SET);
+            std::fwrite(samples, sizeof(samples), 1, gDump);
+            gDumpBytes += sizeof(samples);
+            // Cabecera WAV: PCM de 16 bits, 2 canales, 48 kHz.
+            auto put32 = [](uint8_t* p, uint32_t v) { std::memcpy(p, &v, 4); };
+            auto put16 = [](uint8_t* p, uint16_t v) { std::memcpy(p, &v, 2); };
+            uint8_t header[44];
+            std::memcpy(header, "RIFF", 4); put32(header + 4, 36 + gDumpBytes); std::memcpy(header + 8, "WAVEfmt ", 8);
+            put32(header + 16, 16); put16(header + 20, 1); put16(header + 22, 2); put32(header + 24, 48000);
+            put32(header + 28, 48000 * 4); put16(header + 32, 4); put16(header + 34, 16);
+            std::memcpy(header + 36, "data", 4); put32(header + 40, gDumpBytes);
+            std::fseek(gDump, 0, SEEK_SET);
+            std::fwrite(header, sizeof(header), 1, gDump);
+            std::fflush(gDump);
+        }
+
         // Pide CoreAudio: se rellena con lo que haya en la cola, o silencio si no llega.
         OSStatus Render(void*, AudioUnitRenderActionFlags*, const AudioTimeStamp*, UInt32, UInt32 frames,
             AudioBufferList* buffers)
@@ -107,7 +142,8 @@ namespace platform
 
     void SubmitAudioFrame(const float* planar)
     {
-        if (!gRunning)
+        static const bool dumping = std::getenv("PROSTREET_AUDIO_DUMP") != nullptr;
+        if (!gRunning && !dumping)
             return;
         // 5.1 (delantero izquierdo y derecho, centro, graves, trasero izquierdo y derecho) a estéreo.
         // Se suman hasta tres canales por lado: la mezcla baja un 25 % para no saturar.
@@ -141,6 +177,9 @@ namespace platform
                 frames = 0;
             }
         }
+        WriteDump(stereo);
+        if (!gRunning)
+            return;
         std::lock_guard lock(gLock);
         if (gCount == kRingFrames) // la salida no da abasto: se pierde el más antiguo
         {
