@@ -1,16 +1,51 @@
 # ProStreet Recomp
 
-Recompilación estática de *Need for Speed ProStreet* (Xbox 360, USA, Title ID `45410822`)
-para macOS en Apple Silicon, con [XenonRecomp](https://github.com/hedge-dev/XenonRecomp).
+Recompilación estática de *Need for Speed ProStreet* (Xbox 360, USA, Title ID `45410822`) para
+macOS en Apple Silicon. El código PowerPC del juego se traduce a C++ con
+[XenonRecomp](https://github.com/hedge-dev/XenonRecomp) y se ejecuta de forma nativa sobre un
+runtime propio: kernel de la consola, GPU (traducida a Metal), audio (XMA con FFmpeg), mando y
+ventana de macOS.
 
-Este repositorio contiene solo herramientas y configuración. **No incluye ni debe incluir**
-archivos del juego ni el código C++ generado a partir de él: cada persona usa su propia copia.
+> **Este repositorio no incluye nada del juego.** Ni la ISO, ni sus archivos, ni el código C++
+> generado a partir de ellos. Hace falta tu propia copia original del juego. *Need for Speed* y
+> *ProStreet* son marcas de Electronic Arts; este proyecto no está afiliado a EA ni a Microsoft.
 
-## Preparar el entorno
+## Estado
+
+El juego se puede jugar (menús, modo carrera, carreras) con imagen y sonido:
+
+- **Gráficos**: traductor de shaders de Xenos a MSL y renderer en Metal. Sombras, reflejos (mapas
+  cúbicos), animación de personajes, transparencias, mipmaps, texturas 3D, *predicated tiling*,
+  sombras de contacto, humo y chispas. **Antialiasing MSAA 4x** y **escala de resolución 1x / 1,5x**
+  (1280×720 / 1920×1080), las dos cambiables en caliente desde el menú *Gráficos*.
+- **Rendimiento**: ~60 fps en carrera en un M1 Pro. Los shaders se compilan en segundo plano (sin
+  tirones) y las texturas solo se reconvierten cuando el juego escribe en su memoria.
+- **Audio**: decodificador XMA (FFmpeg) y salida por CoreAudio (la mezcla 5.1 del juego, a estéreo).
+- **Entrada**: mandos compatibles con macOS (Xbox, PlayStation...) y teclado.
+- **Partidas guardadas** en `data/content/`.
+
+Problemas conocidos:
+
+- Sin juego en línea (los servidores oficiales ya no existen; el juego ve que no hay conexión).
+- Al entrar en la carga de una carrera puede oírse un golpe breve en el audio.
+- Las texturas de los vídeos se convierten en la CPU (funciona, pero cuesta algo de rendimiento).
+
+## Requisitos
+
+- Mac con Apple Silicon y macOS 13 o posterior.
+- Tu copia del juego en ISO (Xbox 360, versión USA).
+- Herramientas de Homebrew:
 
 ```sh
-brew install cmake ninja llvm ccache ghidra
+brew install cmake ninja llvm ccache ffmpeg
+brew install ghidra   # opcional: solo para analizar el binario
+```
 
+## Compilar
+
+### 1. XenonRecomp
+
+```sh
 # XenonRecomp (commit ddd128b) con los parches de este proyecto
 git clone --recursive https://github.com/hedge-dev/XenonRecomp.git tools/XenonRecomp
 git -C tools/XenonRecomp checkout ddd128b
@@ -25,98 +60,117 @@ cmake -S tools/XenonRecomp -B tools/XenonRecomp/build -G Ninja -DCMAKE_BUILD_TYP
 cmake --build tools/XenonRecomp/build
 ```
 
-## Recompilar
+### 2. Extraer y recompilar el juego
 
 ```sh
-# 1. Extraer el juego de tu ISO
+# Extraer el juego de tu ISO (queda en game/)
 python3 -I tools/xiso_extract.py extract "<tu ISO>.iso" game
 
-# 2. Recompilar a C++ (salida en ppc/)
+# Volcar la imagen descifrada del XEX (analysis/default_image.bin), con las bibliotecas de XenonRecomp
+LLVM=/opt/homebrew/opt/llvm XR=tools/XenonRecomp
+$LLVM/bin/clang++ -std=c++20 -O2 -include cstdlib -I$XR/XenonUtils -I$XR/thirdparty/simde -I$XR/thirdparty/disasm \
+  tools/xex_dump/xex_dump.cpp $XR/build/XenonUtils/libXenonUtils.a $XR/build/thirdparty/disasm/libdisasm.a \
+  -o tools/xex_dump/xex_dump
+mkdir -p analysis
+tools/xex_dump/xex_dump game/default.xex analysis/default_image.bin
+
+# Recompilar a C++ (salida en ppc/)
 python3 -I tools/find_missing_switches.py analysis/default_image.bin config/ProStreet_switch_tables.toml
 mkdir -p ppc
 tools/XenonRecomp/build/XenonRecomp/XenonRecomp config/ProStreet.toml tools/XenonRecomp/XenonUtils/ppc_context.h
-
-# 3. Probar las instrucciones VMX añadidas
-tests/run_vmx_tests.sh
-
-# 4. Comprobar que los solapamientos entre funciones son solo los esperados
-python3 -I tools/check_overlaps.py
 ```
 
-## Ejecutar (runtime)
+### 3. Runtime
 
 ```sh
-runtime/build.sh                       # genera los imports y compila (≈1,5 min la primera vez)
-runtime/build/prostreet                # desde la raíz del proyecto
-PROSTREET_TRACE=1 runtime/build/prostreet   # muestra también las llamadas implementadas
-PROSTREET_GPU_TRACE=1 runtime/build/prostreet   # muestra cada paquete PM4 que procesa la GPU
-PROSTREET_GPU_DRAWS=1 runtime/build/prostreet   # muestra los registros de cada dibujo / resolve
-PROSTREET_DUMP=carpeta runtime/build/prostreet  # guarda un PNG cada 60 fotogramas (PROSTREET_DUMP_EVERY)
-PROSTREET_NO_WINDOW=1 runtime/build/prostreet   # sin ventana (pruebas automáticas)
-PROSTREET_SHADERS=carpeta runtime/build/prostreet  # guarda cada shader distinto (vs_*.bin / ps_*.bin)
+runtime/build.sh    # genera los imports y compila (unos minutos la primera vez)
 ```
 
-El runtime (`runtime/`) reserva los 4 GB del invitado, carga `analysis/default_image.bin`,
-rellena la tabla de funciones y los imports, y llama al punto de entrada. Cada import que aún no
-está implementado aparece como `[falta] Nombre r3=... lr=...` y devuelve 0.
+## Jugar
 
-## Herramientas
+```sh
+runtime/build/prostreet   # desde la raíz del proyecto
+```
 
-| Archivo | Uso |
+O crea una app para abrirlo desde Finder o el Dock (debe quedarse en la carpeta del proyecto;
+la imagen del icono es opcional):
+
+```sh
+tools/make_app.sh [icono.png]   # crea ProStreet.app; el registro queda en data/ultima_partida.log
+```
+
+### Controles
+
+Con mando, los de la consola. Con teclado:
+
+| Tecla | Botón | Tecla | Botón |
+|---|---|---|---|
+| W / S | Acelerar (RT) / frenar (LT) | A / D | Volante |
+| Flechas | Cruceta | Intro / Espacio | A |
+| Esc / Borrar | B | X / Y | X / Y |
+| Q / E | LB / RB | P | START |
+| Tab | BACK | I J K L | Cámara (stick derecho) |
+
+### Menú Gráficos
+
+| Opción | Atajo |
+|---|---|
+| Resolución 1x (1280×720) | ⌘1 |
+| Resolución 1,5x (1920×1080) | ⌘2 |
+| Antialiasing (MSAA 4x) | ⌥⌘A |
+| Pantalla completa | ⌃⌘F |
+
+Las opciones se recuerdan entre partidas.
+
+## Variables de entorno
+
+Para jugar no hace falta ninguna. Útiles para pruebas y depuración:
+
+| Variable | Efecto |
+|---|---|
+| `PROSTREET_SCALE=1.5` | Escala de resolución al empezar (manda sobre el menú) |
+| `PROSTREET_NO_MSAA=1` | Sin antialiasing |
+| `PROSTREET_LANGUAGE=n` | Idioma de la consola (1 inglés, 3 alemán, 4 francés, 5 español —por defecto—, 6 italiano...) |
+| `PROSTREET_NO_WINDOW=1` | Sin ventana (pruebas automáticas) |
+| `PROSTREET_NO_AUDIO=1` | Sin salida de sonido |
+| `PROSTREET_PRESS="A@30,RT@40-60"` | Pulsa botones en esos segundos (`RT@40-60`: mantener) |
+| `PROSTREET_DUMP=carpeta` | Guarda un PNG cada 60 fotogramas (`PROSTREET_DUMP_EVERY=n`) |
+| `PROSTREET_AUDIO_DUMP=mezcla.wav` | Graba el sonido en un WAV |
+| `PROSTREET_SHADERS=carpeta` | Guarda cada shader distinto (`vs_*.bin` / `ps_*.bin`) |
+| `PROSTREET_SYNC_SHADERS=1` | Compila los shaders en el acto (más tirones, pero determinista) |
+| `PROSTREET_TRACE=1` | Registro detallado (kernel, texturas, pipelines) |
+| `PROSTREET_GPU_TRACE=1` | Cada paquete PM4 que procesa la GPU |
+
+## Cómo está hecho
+
+| Carpeta | Contenido |
+|---|---|
+| `config/` | Configuración de XenonRecomp: funciones, tablas de saltos y límites corregidos |
+| `patches/` | Instrucciones añadidas a XenonRecomp (VMX128, empaquetado D3D...) |
+| `runtime/kernel/` | `xboxkrnl.exe` y `xam.xex`: memoria, hilos, sincronización, archivos, XMA, guardado |
+| `runtime/gpu/` | Procesador de comandos PM4, traductor de shaders y renderer en Metal |
+| `runtime/platform/` | Ventana, mando y teclado, salida de sonido |
+| `tools/` | Extracción de la ISO, análisis del XEX, desensambladores de PowerPC y de shaders, Ghidra |
+| `tests/` | Pruebas de las instrucciones VMX añadidas y del traductor de shaders |
+
+| Herramienta | Uso |
 |---|---|
 | `tools/xiso_extract.py` | Lista o extrae el sistema de archivos XDVDFS de la ISO |
 | `tools/xex_info.py` | Muestra la cabecera del XEX (cifrado, XDK, imports) |
 | `tools/xex_dump/` | Vuelca la imagen descifrada y busca las funciones save/rest de registros |
-| `tools/fix_switch_bounds.py` | Corrige los límites de funciones con tablas de saltos o saltos de cola a la siguiente (+ `config/manual_functions.tsv`) |
-| `tools/check_overlaps.py` | Lista las funciones generadas que se solapan con la siguiente y las clasifica |
-| `tools/ghidra/` | Crea el proyecto de Ghidra con funciones, imports y marcadores |
-| `tools/disasm/` | Desensambla un rango con contexto (inicios de función, `.pdata`, saltos, switch) |
-| `tests/gen_vmx_tests.py` | Prueba fragmentos reales del código generado contra una referencia |
-| `patches/xenonrecomp-prostreet.patch` | Instrucciones añadidas a XenonRecomp |
-| `tools/find_missing_switches.py` | Añade al TOML las tablas de saltos absolutas que XenonAnalyse no detecta |
-| `tools/xenos_disasm.py` | Desensambla shaders de Xenos capturados con `PROSTREET_SHADERS` |
-| `tools/gen_imports.py` | Genera los stubs de los 334 imports y la tabla de slots (`runtime/generated/`) |
+| `tools/find_missing_switches.py` | Añade al TOML las tablas de saltos que XenonAnalyse no detecta |
+| `tools/fix_switch_bounds.py` | Corrige los límites de funciones con tablas de saltos |
+| `tools/check_overlaps.py` | Lista las funciones generadas que se solapan con la siguiente |
+| `tools/gen_imports.py` | Genera los stubs de los imports y su tabla (`runtime/generated/`) |
+| `tools/xenos_disasm.py` | Desensambla los shaders capturados con `PROSTREET_SHADERS` |
+| `tools/disasm/` | Desensambla un rango de PowerPC con contexto |
+| `tools/ghidra/` | Crea el proyecto de Ghidra (ver `docs/GUIA_GHIDRA.md`) |
+| `tools/make_app.sh` | Crea `ProStreet.app` |
 
-## Estado
+## Créditos
 
-- [x] Juego extraído y XEX analizado (XDK 2.0.6132, sin RTTI)
-- [x] Funciones save/rest de registros localizadas
-- [x] Límites de funciones con switch: 156 → 0 con errores
-- [x] Todas las instrucciones reconocidas (12 tipos añadidos, probados: 580.000 casos)
-- [x] Sin `__builtin_debugtrap`: `vcmpbfp(128)` implementada; `vupkd3d128` tipos 3 y 5 y `vpkd3d128` tipo 3 (half floats)
-- [x] `setjmp` (`0x82A28DB0`) y `longjmp` (`0x82A26C50`) localizados
-- [x] Proyecto de Ghidra automático (`tools/ghidra/create_project.sh`, ver `docs/GUIA_GHIDRA.md`)
-- [x] Funciones generadas que se solapan con la siguiente: 102 → 34, todas explicadas (`tools/check_overlaps.py`)
-  - 58 eran el handler (`__C_specific_handler`, `0x82ADBA14`) y la tabla de scopes que hay delante
-    de cada función con `__try/__except`: se saltan con `invalid_instructions`
-  - 2 seguían un salto de cola condicional a la función siguiente: recortados por `fix_switch_bounds.py`
-  - 33 restantes son manejadores `__finally` con dos entradas (la de `.pdata`, usada al desenrollar,
-    salta al cuerpo de la otra, que la función padre llama con `bl`) y 1 es `neg r12,r3` que cae en
-    `__chkstk`: el código compartido se duplica en las dos funciones, lo cual es correcto
-- [x] Runtime mínimo: arranca la CRT, reserva memoria (montón y 334 MB físicos), TLS dinámico
-- [x] Hilos reales (8: `RenderThread`, 4 × `Job Manager - Job Thread`, ...), eventos, semáforos,
-  mutantes, temporizadores, esperas, secciones críticas, spinlocks y tiempo
-- [x] Sistema de archivos: `D:\`/`GAME:\` → `game/` (solo lectura), otras unidades → `data/`;
-  lee `ZDIR.BIN`, `NAMES.HOO` y todos los `.BIN`
-- [x] 34 tablas de saltos que XenonAnalyse no detectaba (`tools/find_missing_switches.py`)
-- [x] Notificaciones de XAM, registro del cliente de audio, nombres de hilo (15 hilos, con `RWAudioCore Dac`)
-- [x] Barreras de memoria (`sync`, `lwsync`, `eieio`) como barreras reales: necesarias en ARM64
-- [x] Memoria física vista en `0xA0000000` y `0xC0000000` a la vez (mismo bloque compartido)
-- [x] Pila por defecto del XEX (256 KB) con página de guarda en cada hilo
-- [x] **GPU sin dibujo** (`runtime/gpu/`): procesador de comandos PM4 (vallas, scratch, esperas,
-  interrupciones, búferes indirectos), VSync a 60 Hz en su propio hilo, `VdSwap`. El juego carga
-  sus datos y **presenta 60 fotogramas por segundo** (aún sin imagen)
-- [ ] Mando (`XamInputGetState`...): el juego consulta la entrada en bucle
-- [x] Ventana de macOS con Metal que muestra el front buffer de cada `VdSwap` (convertido del
-  formato en mosaico de Xenos); captura a PNG con `PROSTREET_DUMP`. De momento, negro: el juego
-  borra a negro y aún no se interpretan los dibujos
-- [x] Captura de shaders (`PROSTREET_SHADERS=carpeta`) y desensamblador de microcódigo de Xenos
-  (`tools/xenos_disasm.py`): 8 shaders en la primera escena, con solo 10 instrucciones distintas
-- [x] **Primera imagen**: traductor de shaders de Xenos a MSL (`runtime/gpu/shader_translator`),
-  renderer en Metal (`runtime/gpu/renderer.mm`) con EDRAM como textura, vértices e índices leídos
-  directamente de la memoria del juego, texturas DXT1/3/5, 8888, 8 y 8_8, mezcla de color y
-  resolves. Se ven el vídeo del logo de EA y el aviso de seguridad con su texto
-- [ ] Renderer: profundidad, MSAA y *predicated tiling*, listas de rectángulos, más formatos de
-  textura (p. ej. 24_8), mipmaps, rendimiento (los resolves hacen lecturas síncronas)
-- [ ] Resto del kernel (`xboxkrnl.exe`) y `xam.xex`
-- [ ] Gráficos, audio, input
+- [XenonRecomp](https://github.com/hedge-dev/XenonRecomp) (hedge-dev): el recompilador estático.
+- [Xenia](https://github.com/xenia-project/xenia): la documentación de su código (formatos de la
+  GPU Xenos, mosaico de texturas, contextos XMA, comportamiento del kernel) ha sido la referencia
+  para buena parte del runtime. Licencia BSD de 3 cláusulas.
+- [FFmpeg](https://ffmpeg.org): decodificación de XMA (enlazado dinámicamente desde Homebrew, LGPL).
