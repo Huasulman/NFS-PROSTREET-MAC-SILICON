@@ -1,5 +1,29 @@
 # ProStreet Recomp
 
+**Need for Speed ProStreet running natively on Mac with Apple Silicon (ARM64: M1, M2, M3, M4).**
+
+## English
+
+A static recompilation of *Need for Speed ProStreet* (Xbox 360) for macOS on Apple Silicon. The
+game's PowerPC code is translated to C++ with [XenonRecomp](https://github.com/hedge-dev/XenonRecomp)
+and runs natively on ARM64, with no emulator: a custom runtime reimplements the Xbox 360 kernel,
+the Xenos GPU (shaders translated to Metal), XMA audio (via FFmpeg), controllers and the macOS window.
+
+- **Playable**: menus, career mode and races, with graphics and sound, at ~60 fps on an M1 Pro.
+- **Graphics**: shadows, reflections, character animation, smoke and sparks, **4x MSAA**
+  anti-aliasing and **1.5x resolution scaling** (1920×1080), switchable from the *Gráficos* menu.
+- **Input**: Xbox / PlayStation controllers supported by macOS, and keyboard.
+- **Saves** are stored in `data/content/`.
+
+> **This repository contains no game files.** No ISO, no game data and no C++ generated from it.
+> You need your own original copy of the game (Xbox 360, USA). *Need for Speed* and *ProStreet* are
+> trademarks of Electronic Arts; this project is not affiliated with EA or Microsoft.
+
+The build steps below (in Spanish) are mostly shell commands: install the Homebrew tools, build
+XenonRecomp, extract your ISO, recompile and run `runtime/build.sh`. The code is MIT-licensed.
+
+## Español
+
 Recompilación estática de *Need for Speed ProStreet* (Xbox 360, USA, Title ID `45410822`) para
 macOS en Apple Silicon. El código PowerPC del juego se traduce a C++ con
 [XenonRecomp](https://github.com/hedge-dev/XenonRecomp) y se ejecuta de forma nativa sobre un
