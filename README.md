@@ -174,3 +174,8 @@ Para jugar no hace falta ninguna. Útiles para pruebas y depuración:
   GPU Xenos, mosaico de texturas, contextos XMA, comportamiento del kernel) ha sido la referencia
   para buena parte del runtime. Licencia BSD de 3 cláusulas.
 - [FFmpeg](https://ffmpeg.org): decodificación de XMA (enlazado dinámicamente desde Homebrew, LGPL).
+
+## Licencia
+
+El código de este repositorio se publica bajo la [licencia MIT](LICENSE). No cubre el juego ni
+nada derivado de él, que siguen siendo de sus propietarios.
