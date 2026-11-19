@@ -34,4 +34,24 @@ namespace platform
     void PollControllers();
     void SetKey(uint16_t keyCode, bool down);
     void ReleaseAllKeys();
+
+    // --- Teclado configurable (menú Controles) ---------------------------------------------------
+    // Cada acción del mando (un botón, un gatillo o una dirección de un stick) tiene hasta dos
+    // teclas (códigos virtuales de macOS). Una tecla solo puede estar en una acción. Las
+    // asignaciones se guardan en las preferencias de la app.
+    constexpr uint16_t kNoKey = 0xFFFF;
+    constexpr uint32_t kKeySlots = 2; // principal y alternativa
+
+    struct KeyAction
+    {
+        const char* id;   // nombre estable, para las preferencias
+        const char* name; // lo que se muestra
+    };
+
+    uint32_t KeyActionCount();
+    const KeyAction& GetKeyAction(uint32_t action);
+    uint16_t BoundKey(uint32_t action, uint32_t slot);
+    // Asigna `keyCode` (o kNoKey para dejarla vacía). Si otra acción la tenía, se le quita.
+    void BindKey(uint32_t action, uint32_t slot, uint16_t keyCode);
+    void ResetKeyBindings();
 }

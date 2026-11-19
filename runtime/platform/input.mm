@@ -1,5 +1,6 @@
 // Entrada: mando (GameController) y teclado → mando de Xbox 360. Ver input.h.
 
+#import <Foundation/Foundation.h>
 #import <GameController/GameController.h>
 
 #include <algorithm>
@@ -123,29 +124,113 @@ namespace platform
             kKeyLeft = 123, kKeyRight = 124, kKeyDown = 125, kKeyUp = 126,
         };
 
-        // Teclado (con gLock tomado):
-        //   flechas: cruceta          W / S: acelerar (RT) / frenar (LT)   A / D: volante (stick izq.)
-        //   Intro / Espacio: A        Esc / Borrar: B                      X, Y: X, Y
-        //   Q / E: LB / RB            P: START                             Tab: BACK
-        //   I J K L: stick derecho (cámara)
+        // Qué hace cada acción en el mando.
+        enum class Effect : uint8_t
+        {
+            Button, RightTrigger, LeftTrigger, LeftX, LeftY, RightX, RightY,
+        };
+
+        struct ActionInfo
+        {
+            KeyAction action;
+            Effect effect;
+            int16_t value;         // botón (Button) o dirección del stick (+1 / -1)
+            uint16_t defaults[kKeySlots];
+        };
+
+        // Por defecto:
+        //   W / S: acelerar (RT) / frenar (LT)   A / D: volante (stick izq.)   flechas: cruceta
+        //   Intro / Espacio: A    Esc / Borrar: B    X, Y: X, Y    Q / E: LB / RB
+        //   P: START    Tab: BACK    I J K L: stick derecho (cámara)
+        const ActionInfo kActions[] = {
+            {{"rt", "Acelerar (RT)"}, Effect::RightTrigger, 0, {kKeyW, kNoKey}},
+            {{"lt", "Frenar / marcha atrás (LT)"}, Effect::LeftTrigger, 0, {kKeyS, kNoKey}},
+            {{"steer_left", "Girar a la izquierda"}, Effect::LeftX, -1, {kKeyA, kNoKey}},
+            {{"steer_right", "Girar a la derecha"}, Effect::LeftX, 1, {kKeyD, kNoKey}},
+            {{"left_up", "Stick izquierdo arriba"}, Effect::LeftY, 1, {kNoKey, kNoKey}},
+            {{"left_down", "Stick izquierdo abajo"}, Effect::LeftY, -1, {kNoKey, kNoKey}},
+            {{"a", "A (aceptar)"}, Effect::Button, int16_t(kA), {kKeyReturn, kKeySpace}},
+            {{"b", "B (atrás)"}, Effect::Button, int16_t(kB), {kKeyEscape, kKeyDelete}},
+            {{"x", "X"}, Effect::Button, int16_t(kX), {kKeyX, kNoKey}},
+            {{"y", "Y"}, Effect::Button, int16_t(kY), {kKeyY, kNoKey}},
+            {{"lb", "LB"}, Effect::Button, int16_t(kLeftShoulder), {kKeyQ, kNoKey}},
+            {{"rb", "RB"}, Effect::Button, int16_t(kRightShoulder), {kKeyE, kNoKey}},
+            {{"start", "START"}, Effect::Button, int16_t(kStart), {kKeyP, kNoKey}},
+            {{"back", "BACK"}, Effect::Button, int16_t(kBack), {kKeyTab, kNoKey}},
+            {{"dpad_up", "Cruceta arriba"}, Effect::Button, int16_t(kDpadUp), {kKeyUp, kNoKey}},
+            {{"dpad_down", "Cruceta abajo"}, Effect::Button, int16_t(kDpadDown), {kKeyDown, kNoKey}},
+            {{"dpad_left", "Cruceta izquierda"}, Effect::Button, int16_t(kDpadLeft), {kKeyLeft, kNoKey}},
+            {{"dpad_right", "Cruceta derecha"}, Effect::Button, int16_t(kDpadRight), {kKeyRight, kNoKey}},
+            {{"camera_up", "Cámara arriba (stick der.)"}, Effect::RightY, 1, {kKeyI, kNoKey}},
+            {{"camera_down", "Cámara abajo (stick der.)"}, Effect::RightY, -1, {kKeyK, kNoKey}},
+            {{"camera_left", "Cámara izquierda (stick der.)"}, Effect::RightX, -1, {kKeyJ, kNoKey}},
+            {{"camera_right", "Cámara derecha (stick der.)"}, Effect::RightX, 1, {kKeyL, kNoKey}},
+            {{"ls", "Clic del stick izquierdo (LS)"}, Effect::Button, int16_t(kLeftThumb), {kNoKey, kNoKey}},
+            {{"rs", "Clic del stick derecho (RS)"}, Effect::Button, int16_t(kRightThumb), {kNoKey, kNoKey}},
+        };
+        constexpr uint32_t kActionCount = sizeof(kActions) / sizeof(kActions[0]);
+
+        // Teclas asignadas (con gLock). Se cargan de las preferencias la primera vez.
+        uint16_t gBindings[kActionCount][kKeySlots];
+        bool gBindingsLoaded = false;
+        NSString* const kBindingsDefault = @"KeyBindings";
+
+        void LoadBindings()
+        {
+            if (gBindingsLoaded)
+                return;
+            gBindingsLoaded = true;
+            NSDictionary* saved = [NSUserDefaults.standardUserDefaults dictionaryForKey:kBindingsDefault];
+            for (uint32_t a = 0; a < kActionCount; a++)
+            {
+                NSArray* keys = saved[[NSString stringWithUTF8String:kActions[a].action.id]];
+                for (uint32_t slot = 0; slot < kKeySlots; slot++)
+                {
+                    gBindings[a][slot] = kActions[a].defaults[slot];
+                    if ([keys isKindOfClass:[NSArray class]] && slot < keys.count && [keys[slot] isKindOfClass:[NSNumber class]])
+                        gBindings[a][slot] = [keys[slot] unsignedShortValue];
+                }
+            }
+        }
+
+        void SaveBindings()
+        {
+            NSMutableDictionary* saved = [NSMutableDictionary dictionary];
+            for (uint32_t a = 0; a < kActionCount; a++)
+                saved[[NSString stringWithUTF8String:kActions[a].action.id]] = @[ @(gBindings[a][0]), @(gBindings[a][1]) ];
+            [NSUserDefaults.standardUserDefaults setObject:saved forKey:kBindingsDefault];
+        }
+
+        // Teclado (con gLock tomado), según las teclas asignadas.
         Gamepad KeyboardGamepad()
         {
+            LoadBindings();
             Gamepad pad;
-            static const struct { uint16_t key; uint16_t button; } kButtons[] = {
-                {kKeyUp, kDpadUp}, {kKeyDown, kDpadDown}, {kKeyLeft, kDpadLeft}, {kKeyRight, kDpadRight},
-                {kKeyReturn, kA}, {kKeySpace, kA}, {kKeyEscape, kB}, {kKeyDelete, kB}, {kKeyX, kX}, {kKeyY, kY},
-                {kKeyQ, kLeftShoulder}, {kKeyE, kRightShoulder}, {kKeyP, kStart}, {kKeyTab, kBack},
-            };
-            for (const auto& entry : kButtons)
-                if (gKeys[entry.key])
-                    pad.buttons |= entry.button;
-            if (gKeys[kKeyW])
-                pad.rightTrigger = 255;
-            if (gKeys[kKeyS])
-                pad.leftTrigger = 255;
-            pad.thumbLX = int16_t((gKeys[kKeyD] ? 32767 : 0) - (gKeys[kKeyA] ? 32767 : 0));
-            pad.thumbRX = int16_t((gKeys[kKeyL] ? 32767 : 0) - (gKeys[kKeyJ] ? 32767 : 0));
-            pad.thumbRY = int16_t((gKeys[kKeyI] ? 32767 : 0) - (gKeys[kKeyK] ? 32767 : 0));
+            int leftX = 0, leftY = 0, rightX = 0, rightY = 0;
+            for (uint32_t a = 0; a < kActionCount; a++)
+            {
+                bool down = false;
+                for (uint16_t key : gBindings[a])
+                    down |= key < sizeof(gKeys) && gKeys[key];
+                if (!down)
+                    continue;
+                const ActionInfo& info = kActions[a];
+                switch (info.effect)
+                {
+                case Effect::Button: pad.buttons |= uint16_t(info.value); break;
+                case Effect::RightTrigger: pad.rightTrigger = 255; break;
+                case Effect::LeftTrigger: pad.leftTrigger = 255; break;
+                case Effect::LeftX: leftX += info.value; break;
+                case Effect::LeftY: leftY += info.value; break;
+                case Effect::RightX: rightX += info.value; break;
+                case Effect::RightY: rightY += info.value; break;
+                }
+            }
+            auto axis = [](int direction) { return int16_t(std::clamp(direction, -1, 1) * 32767); };
+            pad.thumbLX = axis(leftX);
+            pad.thumbLY = axis(leftY);
+            pad.thumbRX = axis(rightX);
+            pad.thumbRY = axis(rightY);
             return pad;
         }
 
@@ -224,5 +309,45 @@ namespace platform
         gamepad = pad;
         packet = gPacket;
         return true;
+    }
+
+    uint32_t KeyActionCount()
+    {
+        return kActionCount;
+    }
+
+    const KeyAction& GetKeyAction(uint32_t action)
+    {
+        return kActions[action].action;
+    }
+
+    uint16_t BoundKey(uint32_t action, uint32_t slot)
+    {
+        std::lock_guard lock(gLock);
+        LoadBindings();
+        return gBindings[action][slot];
+    }
+
+    void BindKey(uint32_t action, uint32_t slot, uint16_t keyCode)
+    {
+        std::lock_guard lock(gLock);
+        LoadBindings();
+        if (keyCode != kNoKey)
+            for (auto& keys : gBindings)
+                for (uint16_t& key : keys)
+                    if (key == keyCode)
+                        key = kNoKey;
+        gBindings[action][slot] = keyCode;
+        SaveBindings();
+    }
+
+    void ResetKeyBindings()
+    {
+        std::lock_guard lock(gLock);
+        gBindingsLoaded = true;
+        for (uint32_t a = 0; a < kActionCount; a++)
+            for (uint32_t slot = 0; slot < kKeySlots; slot++)
+                gBindings[a][slot] = kActions[a].defaults[slot];
+        [NSUserDefaults.standardUserDefaults removeObjectForKey:kBindingsDefault];
     }
 }

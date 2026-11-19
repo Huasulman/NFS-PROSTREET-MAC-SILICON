@@ -12,7 +12,8 @@ the Xenos GPU (shaders translated to Metal), XMA audio (via FFmpeg), controllers
 - **Playable**: menus, career mode and races, with graphics and sound, at ~60 fps on an M1 Pro.
 - **Graphics**: shadows, reflections, character animation, smoke and sparks, **4x MSAA**
   anti-aliasing and **1.5x resolution scaling** (1920×1080), switchable from the *Gráficos* menu.
-- **Input**: Xbox / PlayStation controllers supported by macOS, and keyboard.
+- **Input**: Xbox / PlayStation controllers supported by macOS, and a fully remappable keyboard
+  (*Controles* menu).
 - **Saves** are stored in `data/content/`.
 
 > **This repository contains no game files.** No ISO, no game data and no C++ generated from it.
@@ -45,7 +46,8 @@ El juego se puede jugar (menús, modo carrera, carreras) con imagen y sonido:
 - **Rendimiento**: ~60 fps en carrera en un M1 Pro. Los shaders se compilan en segundo plano (sin
   tirones) y las texturas solo se reconvierten cuando el juego escribe en su memoria.
 - **Audio**: decodificador XMA (FFmpeg) y salida por CoreAudio (la mezcla 5.1 del juego, a estéreo).
-- **Entrada**: mandos compatibles con macOS (Xbox, PlayStation...) y teclado.
+- **Entrada**: mandos compatibles con macOS (Xbox, PlayStation...) y teclado, con las teclas
+  configurables desde el menú *Controles*.
 - **Partidas guardadas** en `data/content/`.
 
 Problemas conocidos:
@@ -125,7 +127,7 @@ tools/make_app.sh [icono.png]   # crea ProStreet.app; el registro queda en data/
 
 ### Controles
 
-Con mando, los de la consola. Con teclado:
+Con mando, los de la consola. Con teclado, por defecto:
 
 | Tecla | Botón | Tecla | Botón |
 |---|---|---|---|
@@ -134,6 +136,9 @@ Con mando, los de la consola. Con teclado:
 | Esc / Borrar | B | X / Y | X / Y |
 | Q / E | LB / RB | P | START |
 | Tab | BACK | I J K L | Cámara (stick derecho) |
+
+Las teclas se pueden cambiar en el menú **Controles → Configurar teclado…** (⌘K): cada acción
+admite dos teclas (también Shift, Control u Option), y los cambios se recuerdan.
 
 ### Menú Gráficos
 

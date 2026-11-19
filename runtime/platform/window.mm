@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <string>
 
+#include "controls.h"
 #include "input.h"
 #include "window.h"
 #include "../gpu/presenter.h"
@@ -111,6 +112,14 @@ namespace gpu
     platform::SetKey(event.keyCode, false);
 }
 
+// Shift, Control y Option no llegan como keyDown/keyUp: se pueden asignar a una acción (Controles).
+- (void)flagsChanged:(NSEvent*)event
+{
+    bool down;
+    if (platform::IsAssignableModifier(event.keyCode, event.modifierFlags, down))
+        platform::SetKey(event.keyCode, down);
+}
+
 @end
 
 @interface ProStreetDelegate : NSObject <NSApplicationDelegate, NSWindowDelegate>
@@ -125,7 +134,8 @@ static const float kScales[] = { 1.0f, 1.5f };
 static NSString* const kScaleDefault = @"ResolutionScale";
 static NSString* const kMsaaDefault = @"Antialiasing";
 
-// Barra de menús: la aplicación (ocultar, salir) y Gráficos (resolución, pantalla completa).
+// Barra de menús: la aplicación (ocultar, salir), Gráficos (resolución, antialiasing, pantalla
+// completa) y Controles (teclas de cada acción del mando).
 - (void)buildMenu
 {
     NSMenu* bar = [[NSMenu alloc] init];
@@ -156,6 +166,14 @@ static NSString* const kMsaaDefault = @"Antialiasing";
     fullScreen.keyEquivalentModifierMask = NSEventModifierFlagCommand | NSEventModifierFlagControl;
     graphicsItem.submenu = graphics;
 
+    NSMenuItem* controlsItem = [bar addItemWithTitle:@"Controles" action:nil keyEquivalent:@""];
+    NSMenu* controls = [[NSMenu alloc] initWithTitle:@"Controles"];
+    NSMenuItem* configure = [controls addItemWithTitle:@"Configurar teclado…" action:@selector(configureControls:) keyEquivalent:@"k"];
+    configure.target = self;
+    NSMenuItem* reset = [controls addItemWithTitle:@"Restaurar controles predeterminados" action:@selector(resetControls:) keyEquivalent:@""];
+    reset.target = self;
+    controlsItem.submenu = controls;
+
     NSApp.mainMenu = bar;
 }
 
@@ -164,6 +182,16 @@ static NSString* const kMsaaDefault = @"Antialiasing";
     const float scale = kScales[sender.tag];
     gpu::SetResolutionScale(scale);
     [NSUserDefaults.standardUserDefaults setFloat:scale forKey:kScaleDefault];
+}
+
+- (void)configureControls:(NSMenuItem*)sender
+{
+    platform::ShowControlsWindow();
+}
+
+- (void)resetControls:(NSMenuItem*)sender
+{
+    platform::ResetKeyBindings();
 }
 
 - (void)toggleAntialiasing:(NSMenuItem*)sender
